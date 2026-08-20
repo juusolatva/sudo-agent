@@ -21,11 +21,6 @@ pub struct CustomAgent {
     keys: Arc<Mutex<Vec<KeyEntry>>>,
 }
 
-// #[async_trait]
-//pub trait ApprovalProvider: Send + Sync {
-//    async fn request_approval(&self, server_identity: &str, key_fp: &str) -> Result<bool, Error>;
-//}
-
 // `CustomAgent` implements `Session` (and is `Clone`), so `ssh-agent-lib` picks it up
 // as an `Agent` automatically: a fresh clone handles each accepted connection.
 #[async_trait]
