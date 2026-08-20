@@ -53,7 +53,7 @@ impl Session for CustomAgent {
 
 #[tokio::main]
 async fn main() -> Result<(), AgentError> {
-    let socket_path = "/tmp/my_custom_agent.sock";
+    let socket_path = "/tmp/sudo_agent.sock";
     let agent = CustomAgent {
         keys: Arc::new(Mutex::new(Vec::new())),
     };
