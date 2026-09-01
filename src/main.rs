@@ -21,8 +21,8 @@ pub struct CustomAgent {
     keys: Arc<Mutex<Vec<KeyEntry>>>,
 }
 
-// `CustomAgent` implements `Session` (and is `Clone`), so `ssh-agent-lib` picks it up
-// as an `Agent` automatically: a fresh clone handles each accepted connection.
+// 'CustomAgent' implements 'Session' (and is 'Clone'), so 'ssh-agent-lib' picks it up
+// as an 'Agent' automatically: a fresh clone handles each accepted connection.
 #[async_trait]
 impl Session for CustomAgent {
     async fn request_identities(&mut self) -> Result<Vec<Identity>, AgentError> {
