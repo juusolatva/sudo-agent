@@ -1,17 +1,19 @@
+mod socket;
+
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
 use async_trait::async_trait;
-use ssh_agent_lib::agent::{listen, Session};
+use ssh_agent_lib::agent::{Session, listen};
 use ssh_agent_lib::error::AgentError;
-use ssh_agent_lib::proto::message::Identity;
 use ssh_agent_lib::proto::SignRequest;
-use ssh_key::{PublicKey, Signature};
-#[cfg(unix)]
-use tokio::net::UnixListener as Listener;
+use ssh_agent_lib::proto::message::Identity;
+use ssh_key::{PrivateKey, Signature};
 
 struct KeyEntry {
-    public_key: PublicKey,
-    // Add raw private key bytes / signature handling here
+    /// Decrypted at load time; `ssh-key` zeroizes the key material on drop.
+    private_key: PrivateKey,
     loaded_at: Instant,
     ttl: Duration,
 }
@@ -34,8 +36,8 @@ impl Session for CustomAgent {
             .iter()
             .filter(|k| now.duration_since(k.loaded_at) < k.ttl)
             .map(|k| Identity {
-                credential: k.public_key.key_data().clone().into(),
-                comment: "custom-agent-key".into(),
+                credential: k.private_key.public_key().key_data().clone().into(),
+                comment: k.private_key.comment().into(),
             })
             .collect();
 
@@ -51,17 +53,41 @@ impl Session for CustomAgent {
     }
 }
 
+/// Parses `--socket <path>`, the only argument supported so far.
+fn socket_override() -> Result<Option<PathBuf>, AgentError> {
+    let mut args = std::env::args_os().skip(1);
+    let mut socket = None;
+    while let Some(arg) = args.next() {
+        if arg == "--socket" {
+            let path = args.next().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "--socket needs a path")
+            })?;
+            socket = Some(PathBuf::from(path));
+        } else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("unknown argument: {}", arg.to_string_lossy()),
+            )
+            .into());
+        }
+    }
+    Ok(socket)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), AgentError> {
-    let socket_path = "/tmp/sudo_agent.sock";
+    let socket_path = match socket_override()? {
+        Some(path) => path,
+        None => socket::default_path()?,
+    };
     let agent = CustomAgent {
         keys: Arc::new(Mutex::new(Vec::new())),
     };
 
-    let _ = std::fs::remove_file(socket_path); // remove stale socket if present
-
-    println!("Agent listening on {}", socket_path);
-    listen(Listener::bind(socket_path)?, agent).await?;
+    let listener = socket::bind(&socket_path)?;
+    println!("Agent listening on {}", socket_path.display());
+    println!("export SSH_AUTH_SOCK='{}'", socket_path.display());
+    listen(listener, agent).await?;
 
     Ok(())
 }

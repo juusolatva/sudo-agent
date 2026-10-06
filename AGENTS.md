@@ -12,7 +12,8 @@ Guidance and repository conventions for AI coding agents working on `sudo-agent`
 
 - **Status**: Minimal working skeleton.
   - Rust 2024 edition (`ssh-agent-lib` 0.6.0, `ssh-key` 0.6.7, `tokio` 1.x, `async-trait`).
-  - Socket listener binds to `/tmp/sudo_agent.sock` (cleaning up stale sockets on startup).
+  - Socket listener binds to `$XDG_RUNTIME_DIR/sudo-agent/agent.sock`, falling back to `${XDG_CACHE_HOME:-~/.cache}/sudo-agent/agent-<hostname>.sock`, or `--socket <path>` (see `src/socket.rs`). Directory is `0700` (verified), socket `0600`; a stale socket is removed only if nothing answers on it.
+  - `KeyEntry` holds the decrypted `ssh_key::PrivateKey` (zeroized on drop by `ssh-key`).
   - `request_identities()` filters expired keys based on TTL.
   - `sign()` is currently stubbed with `todo!()`.
   - In-memory `keys` list is not yet populated (no key-loading mechanism yet).
@@ -42,8 +43,9 @@ Agents modifying or extending this codebase must strictly preserve the following
 
 ## Project Structure
 
-- `Cargo.toml`: Package definition and dependencies (`ssh-agent-lib`, `ssh-key`, `tokio`, `async-trait`).
-- `src/main.rs`: Entry point containing `CustomAgent` (implements `Session`), `KeyEntry`, socket setup, and listener loop.
+- `Cargo.toml`: Package definition and dependencies (`ssh-agent-lib`, `ssh-key`, `tokio`, `async-trait`, `libc`; `ssh-key` with `crypto` + `encryption`).
+- `src/main.rs`: Entry point containing `CustomAgent` (implements `Session`), `KeyEntry`, argument parsing, and listener loop.
+- `src/socket.rs`: Socket path selection (XDG runtime dir with cache-dir fallback), private-directory checks, stale-socket handling, and binding.
 - `TODO.md`: Detailed roadmap (Now, Next, Someday) and in-depth rationales for core design decisions.
 
 ## Common Development Commands
