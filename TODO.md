@@ -84,41 +84,91 @@ has to stay yes/no.
 
 Committed direction, comes after "Now" — not yet scheduled, but intended.
 
+### Background daemon (do these in order)
+
+Goal: the agent runs on its own, independent of any terminal (closing a
+terminal must not kill it or drop keys), and reacts only when a request
+needs an answer. Design, agreed 2026-10-07:
+
+- **Two sockets.**
+  - `agent.sock` is the one that gets forwarded. It only lists identities
+    and signs (approval-gated), plus at most a read-only status query.
+  - `control.sock` is never forwarded. It speaks the full agent protocol
+    (add/remove keys, lock) plus our own commands (status, stop, approve).
+
+  Nothing on a server can add keys or answer approvals through forwarding.
+  This also covers servers where forwarding the full agent is a concern.
+- **Keys are added from a client, not at daemon startup.** The daemon has no
+  terminal to ask for a passphrase, so `ssh-add` (or `sudo-agent add`)
+  decrypts the key and sends it over `control.sock`. The daemon never prompts
+  for passphrases. `ssh-add -t` lifetimes become the TTL, still tracked and
+  enforced inside the agent (invariant 1), optionally capped by a configured
+  maximum.
+- **Approvals are answered by pinentry (desktop popup) or by
+  `sudo-agent approve` in any terminal.** Those two are the focus. Today's
+  foreground mode, with its prompt on the daemon's own terminal, stays as a
+  backup as long as it causes no problems. Routing: an attached `approve`
+  client is asked first; otherwise pinentry if a desktop session is
+  available; otherwise deny and log.
+
+Steps:
+
+1. [ ] **Daemon + control socket + `ssh-add` + status.**
+   - Split the binary into `sudo-agent serve` and client subcommands.
+   - Add `control.sock`, which accepts `AddIdentity`/`AddIdConstrained`
+     (lifetime → TTL), `RemoveIdentity`, `RemoveAllIdentities` and lock.
+   - Keep `--key` on `serve` for foreground use. Until steps 2–3 land,
+     approvals still use the foreground terminal prompt, so nothing
+     regresses.
+   - `~/.bashrc`'s `ssh-load` (`rbw` → `SSH_ASKPASS` → `ssh-add -t 240m`)
+     should work against `control.sock` almost unchanged.
+   - **`sudo-agent status`**: loaded keys and time left on each. It replaces
+     `ssh-status` and its `.ssh_expiry` file, which only guess the TTL from
+     outside the agent. Locally it goes over `control.sock`. On a server, a
+     read-only vendor extension on `agent.sock` (`ssh-agent-lib` supports
+     `extension()`) answers "how long is left" through the forwarded
+     `SSH_AUTH_SOCK`, which is the "surface the TTL remotely" goal from
+     invariant 1. Anyone who can reach that socket can already list the
+     keys, so exposing the TTL there is acceptable.
+2. [ ] **pinentry approvals.**
+   - Spawn `pinentry` only when a request arrives and speak its Assuan
+     protocol: `CONFIRM` for yes/no, `SETDESC`/`SETPROMPT` for the
+     request details.
+   - Talk to it directly, with no crate dependency; the `pinentry` package
+     comes with GnuPG on most desktops.
+   - `SETTIMEOUT` gives this backend the approval timeout, once a length
+     is chosen.
+   - Check before trusting it: whether a popup that grabs the keyboard
+     while you're typing can be approved by a stray Enter or Space (the
+     GUI version of the type-ahead problem the terminal prompt already
+     handles).
+   - A daemon started by systemd needs `DISPLAY`/`WAYLAND_DISPLAY` and
+     `DBUS_SESSION_BUS_ADDRESS` in its environment. Most desktops import
+     them into the user manager; Cinnamon on the laptop does.
+3. [ ] **systemd user unit** (`sudo-agent.service`) and docs for
+   `systemctl --user enable --now sudo-agent`.
+   - Logs go to `journalctl --user -u sudo-agent` for free (stderr).
+   - Restarting it drops all keys, which is intended.
+   - `setsid -f sudo-agent serve` is the documented fallback for machines
+     without systemd. No self-daemonizing (double fork).
+4. [ ] **`sudo-agent approve`**: a terminal client that connects to
+   `control.sock`, shows pending requests and takes `y/N`, with the same
+   type-ahead flush as the foreground prompt.
+   - This is the terminal backend from now on (invariant 3). It works from
+     any terminal, including when SSH'd into the laptop with no desktop.
+
+### Other
+
 - [ ] **Configuration file** covering at least:
   - Whether approval confirmation happens on the **local** machine or on the
     **remote** machine being `sudo`'d on.
   - Warning thresholds/behavior as a key's TTL approaches expiry.
-  - Grows as other items below land (which secrets backend, which prompt
-    backend).
-- [ ] **Non-terminal pinentry backends** (GUI pinentry, desktop notification)
-      layered onto the terminal-first prompt from "Now." A pinentry spawned
-      only when a request arrives would leave the terminal free the rest of
-      the time (see "Run in the background").
-- [ ] **Run in the background.** Today the agent has to own a foreground
-      terminal because that's where approvals are asked. Ways out, still
-      undecided:
-  - an on-demand pinentry for approvals (above): GUI pinentry needs a
-    desktop session, `pinentry-curses`/`-tty` still need a terminal;
-  - a systemd user service, with a GUI or notification prompt;
-  - a small `sudo-agent approve` client that answers pending requests from
-    whatever terminal you're in.
-
-  The terminal backend must keep working either way (invariant 3).
-- [ ] **`sudo-agent status`**: report the loaded keys and time left on each.
-      This replaces `~/.bashrc`'s `ssh-status` and its `.ssh_expiry`
-      timestamp file, which only guess the TTL from outside the agent.
-  - Query the running agent through a vendor extension message over the
-    same socket (`ssh-agent-lib` supports `extension()`). That way it also
-    works on a server through the forwarded `SSH_AUTH_SOCK`, which is the
-    "surface the TTL remotely" goal from invariant 1.
-  - Anyone who can reach the socket could read the TTL that way; that's
-    acceptable, since they can already list the keys.
-- [ ] **Secrets-manager-backed passphrase fetch**, replacing manual entry.
-      `~/.bashrc`'s `ssh-load`/`ssh-askpass-rbw` already does this today for
-      stock `ssh-add`, via `rbw` (Bitwarden CLI) + `SSH_ASKPASS` — the goal
-      is for `sudo-agent` to replace and improve on that workaround (native
-      fetch tied to the same pinentry-style prompt used for approvals), not
-      just reimplement it as-is.
+  - Grows as other items land: which approval backend (pinentry / `approve`
+    client / foreground), maximum TTL, approval timeout.
+- [ ] **Native secrets-manager passphrase fetch.** Mostly covered by step 1,
+      since `ssh-load` with `rbw` + `SSH_ASKPASS` + `ssh-add` keeps working
+      against `control.sock`. A native fetch in `sudo-agent add` (no askpass
+      shim) is optional polish on top.
 - [ ] **Show the forwarding chain in the approval prompt.** Today a request
       over a forwarded agent only shows the local client (`ssh -A bastion`),
       so multi-hop requests and login-vs-forwarded use look identical. Handle

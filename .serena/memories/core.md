@@ -2,7 +2,7 @@
 
 PAM-aware SSH agent daemon (Rust) gating `sudo` (via `pam_ssh_agent_auth`) on agent-side key TTL + per-sign yes/no approval.
 Authoritative design docs: `AGENTS.md` (invariants, scope, conventions) and `TODO.md` (Now/Next/Someday roadmap + rationale).
-Status: core loop done; remaining "Now" item is the manual `pam_ssh_agent_auth` test, run from a server with the agent forwarded from the laptop (`docs/manual-e2e.md`, AGENTS.md "Machines & Manual Testing"). Read them before design-level changes; don't duplicate them here.
+Status: core loop done and verified against real `pam_ssh_agent_auth` (`docs/manual-e2e.md`). Remaining "Now" gaps are in TODO.md; after them comes the background-daemon plan (two sockets: forwarded `agent.sock` list+sign only, `control.sock` for add/status/approve; pinentry + `sudo-agent approve` backends). See AGENTS.md "Planned Architecture".
 
 ## Source map
 - `src/main.rs` — clap `Args` (`--key`, `--ttl`, `--socket`), startup key loading, expiry reaper, `listen()`.

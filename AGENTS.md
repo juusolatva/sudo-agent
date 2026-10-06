@@ -26,15 +26,16 @@ Guidance and repository conventions for AI coding agents working on `sudo-agent`
   2. ~~Implement a terminal-based prompt abstraction (pinentry style) usable for both load-time passphrase entry and sign-time approval.~~ Done.
   3. ~~Implement key loading into `keys` (manual passphrase entry on load; no secrets-manager integration yet).~~ Done.
   4. ~~Manual end-to-end verification (`pam_ssh_agent_auth` challenging the running agent via `SSH_AUTH_SOCK`).~~ Done; procedure and results in `docs/manual-e2e.md`. Re-run it after changes to `sign()`, prompting or logging.
-  - Optional, in-scope hardening: socket-level integration tests (spawn the listener on a temp socket, drive it with `ssh_agent_lib::client`, script answers with `ScriptedPrompter`). Known non-blocking gaps are listed in `TODO.md` under "Now".
-- **Scope Discipline**: Do **not** jump ahead to "Next" or "Someday" features (config files, GUI/desktop notifications, secrets manager integration, destination restriction) until the core "Now" loop is fully functional.
+  - Remaining: the known gaps listed in `TODO.md` under "Now" (stale prompts; whether Ctrl-C at a prompt should deny instead of shutting down). The approval timeout is **deferred on purpose** (length undecided, easier testing without it); don't add one unprompted. Optional hardening: socket-level integration tests (spawn the listener on a temp socket, drive it with `ssh_agent_lib::client`, script answers with `ScriptedPrompter`).
+- **After "Now": background daemon** (`TODO.md` → Next → "Background daemon"), in the listed order: (1) `serve` + client subcommands, `control.sock`, keys added with `ssh-add`, `sudo-agent status`; (2) pinentry approvals; (3) systemd user unit; (4) `sudo-agent approve` terminal client. See [Planned Architecture](#planned-architecture-background-daemon).
+- **Scope Discipline**: Do **not** jump ahead to other "Next" or "Someday" features (config files, desktop notifications, native secrets-manager fetch, forwarding chain, destination restriction) before the "Now" gaps and the background-daemon steps they depend on. Work through the background-daemon steps one at a time.
 
 ## Core Architectural Invariants
 
 Agents modifying or extending this codebase must strictly preserve the following architectural principles:
 
 1. **TTL Stays Inside the Agent**:
-   - Do not rely on client-side `ssh-add -t`.
+   - Do not rely on client-side `ssh-add -t`. Once keys can be added with `ssh-add`, a `-t` lifetime may *set* a key's TTL, but the agent itself tracks and enforces it (and may cap it).
    - The expiration timer must be tracked inside `sudo-agent` so that key expiration status can be queried and surfaced remotely (e.g. warning remote users that a key is approaching expiry before or during `sudo`).
 2. **Approval Prompt is Yes/No, Never Passphrase Re-entry**:
    - The key passphrase is required **once**, only when decrypting the key into agent memory at load time.
@@ -42,9 +43,23 @@ Agents modifying or extending this codebase must strictly preserve the following
 3. **Pluggable Prompt Abstraction with Terminal First**:
    - Design a single prompt abstraction supporting two kinds of interaction: secret input (passphrase at load) and binary confirmation (yes/no on sign).
    - Start with a terminal-based backend. It must remain functional even after other backends (GUI, desktop notifications) are introduced.
+   - Planned backends: **pinentry** (desktop popup, spawned per request) and **`sudo-agent approve`** (terminal client on `control.sock`) are the focus. Once the approve client exists it is the terminal backend that must keep working; the daemon's own foreground prompt (today's `TerminalPrompter`) stays as a backup as long as it causes no problems.
+   - Once the daemon loads keys via `ssh-add`, the passphrase part is the client's job; the daemon itself only ever asks yes/no.
 4. **No Automated PAM Configuration Writing**:
    - Do not write automated PAM configuration mutators. Incorrect PAM modifications risk locking users out of root access on live systems, and PAM tooling differs across Linux distributions.
    - Setup must remain manual documentation (exact stanzas to paste) and non-destructive dry-run validation (`--check` flag).
+
+## Planned Architecture (background daemon)
+
+Agreed design for the "Background daemon" steps in `TODO.md`. Keep new code compatible with it even before it lands:
+
+- **Two sockets, different trust.**
+  - `agent.sock` is the forwarded one. It serves **only** `request_identities`, approval-gated `sign`, and at most a read-only status extension.
+  - `control.sock` is never forwarded. It takes the full protocol (add/remove keys, lock) plus our own commands (status, stop, approve).
+  - Never let `agent.sock` add or remove keys, lock or unlock, or answer approvals. Anything reachable through forwarding must be harmless to a hostile server.
+- **The daemon is independent of terminals.** It runs as `sudo-agent serve` (systemd user service, or `setsid -f`), so closing a terminal never kills it. Logs go to stderr, which ends up in the journal under systemd.
+- **Approval routing**: an attached `sudo-agent approve` client first, then pinentry when a desktop session is available, otherwise deny and log. Foreground mode (`serve` holding a terminal) remains the backup.
+- **Keys are added from a client**: `ssh-add` / `sudo-agent add` over `control.sock`. The daemon starts with no keys, and restarting it drops them all (intended).
 
 ## Machines & Manual Testing
 
