@@ -94,10 +94,10 @@ any `Refused …` lines from the laptop.
 
 ## Results
 
-**2026-10-07, `palvelin`** (openSUSE Tumbleweed, `pam_ssh_agent_auth`
+**2026-10-07, `server-a`** (openSUSE Tumbleweed, `pam_ssh_agent_auth`
 0.10.4, Ed25519 key, OpenSSH 10.2 on the laptop):
 
-- The connection used `SSH_AUTH_SOCK=<sudo-agent socket> ssh palvelin`, with
+- The connection used `SSH_AUTH_SOCK=<sudo-agent socket> ssh server-a`, with
   forwarding from `~/.ssh/config`. The login itself was approved through the
   prompt, as expected for that variant.
 - The forwarded socket was `~/.ssh/agent/s.*.sshd.*`; `ssh-add -l` on the
@@ -114,7 +114,7 @@ any `Refused …` lines from the laptop.
   - Rechecked on a pty with two concurrent `ssh-keygen -Y sign` requests;
     still to be re-run against a server.
 
-**Not yet tried:** `vakoilu` (Debian, `libpam-ssh-agent-auth` 0.10.3).
+**Not yet tried:** `server-b` (Debian, `libpam-ssh-agent-auth` 0.10.3).
 Expected to behave the same; worth one case 1 run.
 
 ## Troubleshooting
