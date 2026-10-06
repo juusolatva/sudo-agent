@@ -4,8 +4,8 @@
 
 The current priority is the core loop end-to-end, nothing else:
 
-- [ ] Implement `sign()` for real: check TTL, gate on approval, sign, return.
-- [ ] A pinentry-style prompt used for **both** the key passphrase (on load)
+- [x] Implement `sign()` for real: check TTL, gate on approval, sign, return.
+- [x] A pinentry-style prompt used for **both** the key passphrase (on load)
       and per-signature approval (on sign) — one prompt abstraction, two call
       sites, but two different kinds of prompt: the passphrase prompt asks
       for a secret (once, at load time); the approval prompt is a plain
@@ -14,13 +14,30 @@ The current priority is the core loop end-to-end, nothing else:
       keep working in-terminal even after other backends exist), shaped so a
       GUI/other backend can be swapped in later without touching the calling
       code.
-- [ ] A way to load a key into `keys` (currently nothing populates it —
+- [x] A way to load a key into `keys` (currently nothing populates it —
       `AddIdentity` handling, or a simple CLI/config-driven load at
       startup). Passphrase entry is manual for now — no secrets-manager
       integration needed yet.
 - [ ] Manual end-to-end test: agent running, `ssh-add -l` / `SSH_AUTH_SOCK`
       pointed at its socket, `sudo` configured via `pam_ssh_agent_auth` to
       challenge it, confirm a full elevate-with-approval cycle works.
+      Procedure: `docs/manual-e2e.md` (agent on the laptop, `sudo` on a
+      server with the agent forwarded).
+
+Known gaps from implementing the above. None of them blocks the end-to-end
+test, but they should be fixed before calling the core loop done:
+
+- [ ] **No approval timeout**: an unanswered prompt waits forever, and
+      later requests queue behind it. It should auto-deny after a while.
+- [ ] **Stale prompts**: if the client gives up (e.g. Ctrl-C on the remote
+      `sudo`), its prompt stays on the terminal. Answering it is harmless
+      (the signature goes nowhere), but it should be cancelled instead.
+- [ ] **Ctrl-C at the agent's own prompt kills the daemon** (the terminal
+      sends SIGINT to the whole foreground process group). It should deny
+      that request instead.
+- [ ] **Socket isn't removed on shutdown**: the stale-socket check cleans it
+      up on the next start, but a clean exit (SIGINT/SIGTERM) should remove
+      it.
 
 ## Why TTL lives in the agent, not in `ssh-add -t`
 
@@ -74,6 +91,19 @@ Committed direction, comes after "Now" — not yet scheduled, but intended.
       is for `sudo-agent` to replace and improve on that workaround (native
       fetch tied to the same pinentry-style prompt used for approvals), not
       just reimplement it as-is.
+- [ ] **Show the forwarding chain in the approval prompt.** Today a request
+      over a forwarded agent only shows the local client (`ssh -A bastion`),
+      so multi-hop requests and login-vs-forwarded use look identical. Handle
+      `session-bind@openssh.com` (OpenSSH ≥ 8.9; `ssh-agent-lib` decodes it
+      as `SessionBind` and has `verify_signature()`), record the verified
+      host-key chain + `is_forwarding` per connection, and show it in the
+      prompt with names from `~/.ssh/known_hosts` where unhashed
+      (fingerprints otherwise). Caveats to surface, not hide: only the first
+      hop is verified by the local client — later hops are as trustworthy as
+      the hosts before them; a pre-8.9 hop ends the chain ("unknown beyond
+      X"); the remote *process* (sudo vs. anything else) is never visible.
+      Display only, no enforcement — the groundwork for the destination
+      restriction under "Someday", not a substitute for it.
 
 ## Someday (only if bothered — not committed, fine to drop)
 
