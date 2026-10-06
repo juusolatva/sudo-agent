@@ -12,7 +12,9 @@ categories = ["command-line-utilities", "authentication"]
 
 [dependencies]
 async-trait = "0.1.92"
-ssh-agent-lib = "0.6.0"
 libc = "0.2"
+rpassword = "7.5.4" # betterleaks:allow (crate name trips generic-password)
+ssh-agent-lib = "0.6.0"
 ssh-key = { version = "0.6.7", features = ["crypto", "encryption"] }
 tokio = { version = "1.53.1", features = ["full"] }
+zeroize = "1.9.1"

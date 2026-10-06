@@ -16,6 +16,7 @@ Guidance and repository conventions for AI coding agents working on `sudo-agent`
   - `KeyEntry` holds the decrypted `ssh_key::PrivateKey` (zeroized on drop by `ssh-key`).
   - `request_identities()` filters expired keys based on TTL.
   - `sign()` is currently stubbed with `todo!()`.
+  - Prompt abstraction exists (`src/prompt.rs`: `Prompter` trait + `TerminalPrompter`) but is not yet called from key loading or `sign()`; `main.rs` carries a temporary `#[expect(dead_code)]` on `mod prompt` to remove once it is wired up.
   - In-memory `keys` list is not yet populated (no key-loading mechanism yet).
 - **Immediate Focus ("Now")**: Focus strictly on the end-to-end core loop:
   1. Implement `sign()`: verify TTL, trigger approval prompt, sign challenge, and return signature.
@@ -43,8 +44,9 @@ Agents modifying or extending this codebase must strictly preserve the following
 
 ## Project Structure
 
-- `Cargo.toml`: Package definition and dependencies (`ssh-agent-lib`, `ssh-key`, `tokio`, `async-trait`, `libc`; `ssh-key` with `crypto` + `encryption`).
+- `Cargo.toml`: Package definition and dependencies (`ssh-agent-lib`, `ssh-key`, `tokio`, `async-trait`, `libc`, `rpassword`, `zeroize`; `ssh-key` with `crypto` + `encryption`).
 - `src/main.rs`: Entry point containing `CustomAgent` (implements `Session`), `KeyEntry`, argument parsing, and listener loop.
+- `src/prompt.rs`: `Prompter` trait (secret input + yes/no confirm) and the `/dev/tty` `TerminalPrompter` backend. Prompts are serialized; approval requires typed `y`/`yes` + Enter and discards type-ahead first.
 - `src/socket.rs`: Socket path selection (XDG runtime dir with cache-dir fallback), private-directory checks, stale-socket handling, and binding.
 - `TODO.md`: Detailed roadmap (Now, Next, Someday) and in-depth rationales for core design decisions.
 

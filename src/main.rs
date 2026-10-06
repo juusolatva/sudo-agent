@@ -1,3 +1,8 @@
+#[expect(
+    dead_code,
+    reason = "called from key loading and sign(), not wired up yet"
+)]
+mod prompt;
 mod socket;
 
 use std::path::PathBuf;
