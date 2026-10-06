@@ -41,8 +41,12 @@ struct Args {
     keys: Vec<PathBuf>,
 
     /// How long loaded keys stay usable, e.g. 90s, 15m or 8h.
-    #[arg(long, value_name = "DURATION", default_value = "15m", value_parser = keys::parse_ttl)]
+    #[arg(long, value_name = "DURATION", default_value = "15m", value_parser = keys::parse_duration)]
     ttl: Duration,
+
+    /// How long an approval prompt waits for an answer before denying.
+    #[arg(long, value_name = "DURATION", default_value = "2m", value_parser = keys::parse_duration)]
+    approval_timeout: Duration,
 
     /// Socket path [default: $XDG_RUNTIME_DIR/sudo-agent/agent.sock]
     #[arg(long, value_name = "PATH")]
@@ -76,7 +80,7 @@ async fn run(args: Args) -> Result<(), AgentError> {
 
     // One prompter for passphrases now and approvals later, so they share the
     // terminal one prompt at a time.
-    let prompter: Arc<dyn Prompter> = Arc::new(TerminalPrompter::default());
+    let prompter: Arc<dyn Prompter> = Arc::new(TerminalPrompter::new(args.approval_timeout));
     let mut loaded: Vec<KeyEntry> = Vec::new();
     for path in &args.keys {
         let entry = keys::load(path, args.ttl, prompter.as_ref()).await?;
@@ -92,7 +96,7 @@ async fn run(args: Args) -> Result<(), AgentError> {
             "Loaded {} ({}), usable for {}",
             path.display(),
             public_key.fingerprint(HashAlg::Sha256),
-            keys::format_ttl(args.ttl)
+            keys::format_duration(args.ttl)
         );
         loaded.push(entry);
     }

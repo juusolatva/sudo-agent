@@ -105,27 +105,28 @@ fn key_error(path: &Path, error: ssh_key::Error) -> io::Error {
     )
 }
 
-/// Parses a TTL like `90s`, `15m` or `8h`.
-pub fn parse_ttl(s: &str) -> Result<Duration, String> {
+/// Parses a duration like `90s`, `15m` or `8h` (TTLs, timeouts).
+pub fn parse_duration(s: &str) -> Result<Duration, String> {
     let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
     let (number, unit) = s.split_at(split);
     let number: u64 = number
         .parse()
-        .map_err(|_| format!("invalid TTL {s:?}: expected e.g. 90s, 15m or 8h"))?;
+        .map_err(|_| format!("invalid duration {s:?}: expected e.g. 90s, 15m or 8h"))?;
     let seconds = match unit {
         "s" => number,
         "m" => number.saturating_mul(60),
         "h" => number.saturating_mul(60 * 60),
-        _ => return Err(format!("invalid TTL unit in {s:?}: use s, m or h")),
+        _ => return Err(format!("invalid duration unit in {s:?}: use s, m or h")),
     };
     if seconds == 0 {
-        return Err("TTL must be greater than zero".to_owned());
+        return Err("duration must be greater than zero".to_owned());
     }
     Ok(Duration::from_secs(seconds))
 }
 
-/// Formats a TTL the way [`parse_ttl`] accepts it, in the largest exact unit.
-pub fn format_ttl(ttl: Duration) -> String {
+/// Formats a duration the way [`parse_duration`] accepts it, in the largest
+/// exact unit.
+pub fn format_duration(ttl: Duration) -> String {
     match ttl.as_secs() {
         s if s % 3600 == 0 => format!("{}h", s / 3600),
         s if s % 60 == 0 => format!("{}m", s / 60),
@@ -227,14 +228,14 @@ mod tests {
 
     #[test]
     fn ttl_parsing() {
-        assert_eq!(parse_ttl("90s"), Ok(Duration::from_secs(90)));
-        assert_eq!(parse_ttl("15m"), Ok(Duration::from_secs(900)));
-        assert_eq!(parse_ttl("8h"), Ok(Duration::from_secs(8 * 3600)));
+        assert_eq!(parse_duration("90s"), Ok(Duration::from_secs(90)));
+        assert_eq!(parse_duration("15m"), Ok(Duration::from_secs(900)));
+        assert_eq!(parse_duration("8h"), Ok(Duration::from_secs(8 * 3600)));
         for bad in ["", "15", "m", "0m", "1.5h", "-5m", "15 m", "15min", "1d"] {
-            assert!(parse_ttl(bad).is_err(), "{bad:?} should be rejected");
+            assert!(parse_duration(bad).is_err(), "{bad:?} should be rejected");
         }
         for ttl in ["90s", "15m", "8h", "61s", "90m"] {
-            assert_eq!(format_ttl(parse_ttl(ttl).unwrap()), ttl);
+            assert_eq!(format_duration(parse_duration(ttl).unwrap()), ttl);
         }
     }
 

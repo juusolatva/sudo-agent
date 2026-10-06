@@ -28,18 +28,20 @@ The current priority is the core loop end-to-end, nothing else:
 Known gaps from implementing the above. None of them blocks the end-to-end
 test, but they should be fixed before calling the core loop done:
 
-- [ ] **No approval timeout**: an unanswered prompt waits forever, and
-      later requests queue behind it. It should auto-deny after a while.
-      Deferred on purpose: the right length is still undecided, and manual
-      testing is easier without one.
+- [x] **Approval timeout**: an unanswered prompt is denied after
+      `--approval-timeout` (default `2m`), and the terminal is freed for the
+      next request. 2 minutes is a compromise for the foreground prompt.
+      Revisit per backend once the others exist: pinentry 30–60 s, the
+      `sudo-agent approve` client maybe up to 5 min.
 - [ ] **Stale prompts**: if the client gives up (e.g. Ctrl-C on the remote
-      `sudo`), its prompt stays on the terminal. Answering it is harmless
-      (the signature goes nowhere), but it should be cancelled instead.
+      `sudo`), its prompt stays on the terminal until answered or timed out.
+      Answering it is harmless (the signature goes nowhere), but it should
+      be cancelled as soon as the client disconnects.
 - [ ] **Ctrl-C at the agent's own prompt shuts the agent down** (cleanly
       now: keys dropped, socket removed, the waiting client gets a
       failure). Open question: should Ctrl-C at a prompt deny just that
-      request instead? That needs cancellable prompts, the same mechanism as
-      the timeout and stale-prompt items.
+      request instead? The prompt now waits with `poll()` and can give up,
+      which a cancel signal could reuse (also for stale prompts).
 - [x] **Socket removed on shutdown**: SIGINT/SIGTERM/SIGHUP and startup
       failures remove it (only if the file is still the one this process
       bound). The one exception is a kill during passphrase entry, where the
@@ -136,8 +138,8 @@ Steps:
      request details.
    - Talk to it directly, with no crate dependency; the `pinentry` package
      comes with GnuPG on most desktops.
-   - `SETTIMEOUT` gives this backend the approval timeout, once a length
-     is chosen.
+   - `SETTIMEOUT` gives this backend its own approval timeout (30–60 s
+     likely suits a popup better than the terminal's 2 min).
    - Check before trusting it: whether a popup that grabs the keyboard
      while you're typing can be approved by a stray Enter or Space (the
      GUI version of the type-ahead problem the terminal prompt already

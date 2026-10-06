@@ -127,15 +127,11 @@ impl Session for Connection {
         };
 
         let message = format!("Signature request from {}\n  key: {key}\nAllow?", self.peer);
-        let approved = self
-            .agent
-            .prompter
-            .confirm(&message)
-            .await
-            .unwrap_or_else(|e| {
-                log!("Approval prompt failed: {e}");
-                false
-            });
+        let approved = match self.agent.prompter.confirm(&message).await {
+            Ok(approved) => approved,
+            // Timed out or the prompt failed: both count as a denial.
+            Err(e) => return self.refuse(&format!("not approved: {e}")),
+        };
         if !approved {
             return self.refuse("denied");
         }
