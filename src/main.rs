@@ -1,3 +1,15 @@
+/// Like `eprintln!`, but emits the whole line in a single `write()`. The
+/// kernel never interleaves one write to a terminal with another, so a line
+/// logged while a prompt is on screen lands whole instead of splitting it.
+/// Use it for anything printed while requests are being served.
+macro_rules! log {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let line = format!("{}\n", format_args!($($arg)*));
+        let _ = std::io::stderr().write_all(line.as_bytes());
+    }};
+}
+
 mod agent;
 mod keys;
 mod prompt;
@@ -43,7 +55,7 @@ fn spawn_expiry_reaper(store: Arc<Mutex<Vec<KeyEntry>>>) {
         loop {
             tick.tick().await;
             for comment in keys::purge_expired(&store, keys::now()) {
-                eprintln!("Key expired and was removed: {comment}");
+                log!("Key expired and was removed: {comment}");
             }
         }
     });

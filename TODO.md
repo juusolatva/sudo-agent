@@ -18,11 +18,12 @@ The current priority is the core loop end-to-end, nothing else:
       `AddIdentity` handling, or a simple CLI/config-driven load at
       startup). Passphrase entry is manual for now — no secrets-manager
       integration needed yet.
-- [ ] Manual end-to-end test: agent running, `ssh-add -l` / `SSH_AUTH_SOCK`
+- [x] Manual end-to-end test: agent running, `ssh-add -l` / `SSH_AUTH_SOCK`
       pointed at its socket, `sudo` configured via `pam_ssh_agent_auth` to
       challenge it, confirm a full elevate-with-approval cycle works.
-      Procedure: `docs/manual-e2e.md` (agent on the laptop, `sudo` on a
-      server with the agent forwarded).
+      Procedure and results: `docs/manual-e2e.md` (agent on the laptop,
+      `sudo` on a server with the agent forwarded). Passed 2026-10-07 on
+      openSUSE with `pam_ssh_agent_auth` 0.10.4.
 
 Known gaps from implementing the above. None of them blocks the end-to-end
 test, but they should be fixed before calling the core loop done:

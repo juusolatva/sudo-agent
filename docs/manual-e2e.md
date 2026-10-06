@@ -53,7 +53,8 @@ so you'll get one approval prompt for the login as well.
 Run these in the forwarded session. None of them changes anything.
 
 ```sh
-echo "$SSH_AUTH_SOCK"          # set, e.g. /tmp/ssh-XXXX/agent.NNNN
+echo "$SSH_AUTH_SOCK"          # set: ~/.ssh/agent/s.*.sshd.* on recent
+                               # OpenSSH, /tmp/ssh-XXXX/agent.NNNN on older
 ssh-add -l                     # lists the key with sudo-agent's fingerprint;
                                # listing never prompts
 grep -n pam_ssh_agent_auth /etc/pam.d/sudo   # note the file= argument
@@ -77,17 +78,44 @@ Record the key type. Ed25519 is what this test expects. With an RSA key,
 
 The user runs these in the server SSH session (sudo may need a tty). Start
 each one with `sudo -k` so a cached sudo timestamp can't skip authentication.
+(On hosts with a zero sudo timestamp timeout, like the servers used here,
+every `sudo` authenticates anyway.)
 
 | # | Action | Expected on laptop | Expected on server |
 |---|--------|--------------------|--------------------|
 | 1 | `sudo -k; sudo -v`, answer **y** | Prompt names the `ssh … <server>` process, the key, and time left; then `Approved signature request …` | Succeeds with **no password prompt** |
 | 2 | `sudo -k; sudo -v`, answer **n** (or Enter) | `Refused signature request …: denied` | Falls back to the password prompt (or fails if there's no fallback) |
-| 3 | Restart the agent with `--ttl 1m`, reconnect, wait > 1 min, then `sudo -k; sudo -v` | `Key expired and was removed: …`, **no** prompt | `ssh-add -l` shows no identities; sudo falls back to the password |
-| 4 | Two sessions run `sudo -k; sudo -v` at the same time | Prompts appear one after another, never interleaved | Each succeeds once approved |
-| 5 | Reconnect with `ssh -o ForwardAgent=no <server>`, then `sudo -k; sudo -v` | Nothing | Password prompt: proves the PAM path really goes through the agent (and not through your normal agent if it's forwarded by `~/.ssh/config`) |
+| 3 | Restart the agent with `--ttl 1m` (no need to reconnect: the forwarded channel reconnects to the socket path for every request), wait > 1 min, then `sudo -k; sudo -v` | `Key expired and was removed: …`, **no** prompt | `ssh-add -l` shows no identities; sudo falls back to the password |
+| 4 | Two sessions run `sudo -k; sudo -v` at the same time | Prompts appear one after another; each request's `Approved`/`Refused` line comes before the next prompt, nothing interleaved | Each succeeds once approved |
+| 5 | Stop the agent (Ctrl-C), then `sudo -k; sudo -v` | Nothing (agent is gone) | Password prompt: proves `sudo` really authenticates through `sudo-agent`, not some other forwarded agent |
 
 Report: the pam_ssh_agent_auth version, key type, the exact prompt text, and
 any `Refused …` lines from the laptop.
+
+## Results
+
+**2026-10-07, `palvelin`** (openSUSE Tumbleweed, `pam_ssh_agent_auth`
+0.10.4, Ed25519 key, OpenSSH 10.2 on the laptop):
+
+- The connection used `SSH_AUTH_SOCK=<sudo-agent socket> ssh palvelin`, with
+  forwarding from `~/.ssh/config`. The login itself was approved through the
+  prompt, as expected for that variant.
+- The forwarded socket was `~/.ssh/agent/s.*.sshd.*`; `ssh-add -l` on the
+  server showed the laptop key's fingerprint.
+- Cases 1, 2, 3 and 5 passed. `sudo -v` succeeded with no password after
+  approval, and fell back to the password after denial, after expiry, and
+  with the agent stopped.
+- Case 4 worked, but the laptop terminal was garbled: request 1's
+  `Refused …` line was printed in pieces interleaved with request 2's
+  prompt, and request 2's "expires in" was computed before it queued.
+  - The fix serves requests one at a time, from lookup to logged outcome
+    (`SudoAgent::requests`), and writes each log line and each prompt in a
+    single `write()` (`log!`).
+  - Rechecked on a pty with two concurrent `ssh-keygen -Y sign` requests;
+    still to be re-run against a server.
+
+**Not yet tried:** `vakoilu` (Debian, `libpam-ssh-agent-auth` 0.10.3).
+Expected to behave the same; worth one case 1 run.
 
 ## Troubleshooting
 

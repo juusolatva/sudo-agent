@@ -82,7 +82,8 @@ fn ask_yes_no(
     output: &mut impl Write,
     message: &str,
 ) -> io::Result<bool> {
-    write!(output, "{message} [y/N] ")?;
+    // One write, so a concurrently logged line can't land inside the prompt.
+    output.write_all(format!("{message} [y/N] ").as_bytes())?;
     output.flush()?;
 
     let mut answer = String::new();

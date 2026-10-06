@@ -25,11 +25,22 @@ const MAX_COMMAND_CHARS: usize = 200;
 pub struct SudoAgent {
     keys: Arc<Mutex<Vec<KeyEntry>>>,
     prompter: Arc<dyn Prompter>,
+    /// Serves signature requests one at a time, in arrival order (tokio's
+    /// mutex is fair), from key lookup to logged outcome. Unlike `keys`, this
+    /// is meant to be held while prompting: it guards the user's attention,
+    /// not key material. It keeps a queued request's prompt from appearing
+    /// before the previous outcome is logged, and its details from going
+    /// stale while it waits.
+    requests: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl SudoAgent {
     pub fn new(keys: Arc<Mutex<Vec<KeyEntry>>>, prompter: Arc<dyn Prompter>) -> Self {
-        Self { keys, prompter }
+        Self {
+            keys,
+            prompter,
+            requests: Arc::default(),
+        }
     }
 
     /// Describes the requested key for the approval prompt, or says why the
@@ -81,7 +92,7 @@ struct Connection {
 
 impl Connection {
     fn refuse(&self, reason: &str) -> Result<Signature, AgentError> {
-        eprintln!("Refused signature request from {}: {reason}", self.peer);
+        log!("Refused signature request from {}: {reason}", self.peer);
         Err(AgentError::Failure)
     }
 }
@@ -107,6 +118,8 @@ impl Session for Connection {
     }
 
     async fn sign(&mut self, request: SignRequest) -> Result<Signature, AgentError> {
+        let _turn = self.agent.requests.lock().await;
+
         let key_data = request.credential.key_data();
         let key = match self.agent.describe(key_data, request.flags) {
             Ok(key) => key,
@@ -120,7 +133,7 @@ impl Session for Connection {
             .confirm(&message)
             .await
             .unwrap_or_else(|e| {
-                eprintln!("Approval prompt failed: {e}");
+                log!("Approval prompt failed: {e}");
                 false
             });
         if !approved {
@@ -129,7 +142,7 @@ impl Session for Connection {
 
         match self.agent.sign_with(key_data, &request.data) {
             Ok(signature) => {
-                eprintln!("Approved signature request from {}", self.peer);
+                log!("Approved signature request from {}", self.peer);
                 Ok(signature)
             }
             Err(reason) => self.refuse(&reason),
@@ -345,6 +358,51 @@ mod tests {
         };
 
         assert!(matches!(conn.sign(request).await, Err(AgentError::Failure)));
+    }
+
+    /// Approves after a pause, recording the most prompts ever open at once.
+    #[derive(Default)]
+    struct SlowApprover {
+        open: std::sync::atomic::AtomicUsize,
+        max_open: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Prompter for SlowApprover {
+        async fn passphrase(&self, _: &str) -> io::Result<zeroize::Zeroizing<String>> {
+            unreachable!()
+        }
+        async fn confirm(&self, _: &str) -> io::Result<bool> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let open = self.open.fetch_add(1, SeqCst) + 1;
+            self.max_open.fetch_max(open, SeqCst);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            self.open.fetch_sub(1, SeqCst);
+            Ok(true)
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_requests_are_served_one_at_a_time() {
+        let key = entry("shared", Duration::from_secs(60));
+        let (first, second) = (request(&key), request(&key));
+        let prompter = Arc::new(SlowApprover::default());
+        let agent = SudoAgent::new(Arc::new(Mutex::new(vec![key])), prompter.clone());
+        let mut a = Connection {
+            agent: agent.clone(),
+            peer: Peer::default(),
+        };
+        let mut b = Connection {
+            agent,
+            peer: Peer::default(),
+        };
+
+        let (a, b) = tokio::join!(a.sign(first), b.sign(second));
+        assert!(a.is_ok() && b.is_ok());
+        assert_eq!(
+            prompter.max_open.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
     }
 
     #[test]
