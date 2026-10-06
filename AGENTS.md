@@ -13,11 +13,11 @@ Guidance and repository conventions for AI coding agents working on `sudo-agent`
 - **Status**: Minimal working skeleton.
   - Rust 2024 edition (`ssh-agent-lib` 0.6.0, `ssh-key` 0.6.7, `tokio` 1.x, `async-trait`).
   - Socket listener binds to `$XDG_RUNTIME_DIR/sudo-agent/agent.sock`, falling back to `${XDG_CACHE_HOME:-~/.cache}/sudo-agent/agent-<hostname>.sock`, or `--socket <path>` (see `src/socket.rs`). Directory is `0700` (verified), socket `0600`; a stale socket is removed only if nothing answers on it.
-  - `KeyEntry` holds the decrypted `ssh_key::PrivateKey` (zeroized on drop by `ssh-key`).
-  - `request_identities()` filters expired keys based on TTL.
+  - Keys are loaded at startup via `--key <PATH>` (repeatable) and `--ttl <DURATION>` (default `15m`), parsed with `clap`; encrypted keys prompt for the passphrase (3 attempts, empty aborts). See `src/keys.rs`.
+  - `KeyEntry` holds the decrypted `ssh_key::PrivateKey` (zeroized on drop by `ssh-key`) and an `expires_at` deadline on `CLOCK_BOOTTIME` (`keys::now()`), so suspend time counts against the TTL. Do not use `Instant` for TTLs (`CLOCK_MONOTONIC` pauses during suspend).
+  - A background reaper drops expired keys every second; `request_identities()` also filters them.
   - `sign()` is currently stubbed with `todo!()`.
-  - Prompt abstraction exists (`src/prompt.rs`: `Prompter` trait + `TerminalPrompter`) but is not yet called from key loading or `sign()`; `main.rs` carries a temporary `#[expect(dead_code)]` on `mod prompt` to remove once it is wired up.
-  - In-memory `keys` list is not yet populated (no key-loading mechanism yet).
+  - Prompt abstraction (`src/prompt.rs`: `Prompter` trait + `TerminalPrompter`) is used for passphrases; `confirm()` is not yet called from `sign()`, so `main.rs` carries a temporary `#[expect(dead_code)]` on `mod prompt` to remove once it is. Tests use `prompt::testing::ScriptedPrompter`.
 - **Immediate Focus ("Now")**: Focus strictly on the end-to-end core loop:
   1. Implement `sign()`: verify TTL, trigger approval prompt, sign challenge, and return signature.
   2. Implement a terminal-based prompt abstraction (pinentry style) usable for both load-time passphrase entry and sign-time approval.
@@ -44,8 +44,9 @@ Agents modifying or extending this codebase must strictly preserve the following
 
 ## Project Structure
 
-- `Cargo.toml`: Package definition and dependencies (`ssh-agent-lib`, `ssh-key`, `tokio`, `async-trait`, `libc`, `rpassword`, `zeroize`; `ssh-key` with `crypto` + `encryption`).
-- `src/main.rs`: Entry point containing `CustomAgent` (implements `Session`), `KeyEntry`, argument parsing, and listener loop.
+- `Cargo.toml`: Package definition and dependencies (`ssh-agent-lib`, `ssh-key`, `tokio`, `async-trait`, `clap`, `libc`, `rpassword`, `zeroize`; dev: `tempfile`; `ssh-key` with `crypto` + `encryption`).
+- `src/main.rs`: Entry point containing `CustomAgent` (implements `Session`), CLI arguments, startup key loading, the expiry reaper, and listener loop.
+- `src/keys.rs`: `KeyEntry`, the `CLOCK_BOOTTIME` clock, key loading/decryption, expiry purging, and TTL parsing/formatting.
 - `src/prompt.rs`: `Prompter` trait (secret input + yes/no confirm) and the `/dev/tty` `TerminalPrompter` backend. Prompts are serialized; approval requires typed `y`/`yes` + Enter and discards type-ahead first.
 - `src/socket.rs`: Socket path selection (XDG runtime dir with cache-dir fallback), private-directory checks, stale-socket handling, and binding.
 - `TODO.md`: Detailed roadmap (Now, Next, Someday) and in-depth rationales for core design decisions.

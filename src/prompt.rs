@@ -140,3 +140,57 @@ mod tests {
         let _: Arc<dyn Prompter> = Arc::new(TerminalPrompter::default());
     }
 }
+
+/// A [`Prompter`] that answers from a script, for tests.
+#[cfg(test)]
+pub mod testing {
+    use super::*;
+    use std::collections::VecDeque;
+
+    #[derive(Default)]
+    pub struct ScriptedPrompter {
+        passphrases: Mutex<VecDeque<String>>,
+        confirms: Mutex<VecDeque<bool>>,
+        asked: Mutex<Vec<String>>,
+    }
+
+    impl ScriptedPrompter {
+        pub fn with_passphrases<'a>(answers: impl IntoIterator<Item = &'a str>) -> Self {
+            let prompter = Self::default();
+            prompter
+                .passphrases
+                .lock()
+                .unwrap()
+                .extend(answers.into_iter().map(str::to_owned));
+            prompter
+        }
+
+        pub fn with_confirms(answers: impl IntoIterator<Item = bool>) -> Self {
+            let prompter = Self::default();
+            prompter.confirms.lock().unwrap().extend(answers);
+            prompter
+        }
+
+        /// Every message prompted so far, in order.
+        pub fn asked(&self) -> Vec<String> {
+            self.asked.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl Prompter for ScriptedPrompter {
+        async fn passphrase(&self, message: &str) -> io::Result<Zeroizing<String>> {
+            self.asked.lock().unwrap().push(message.to_owned());
+            let answer = self.passphrases.lock().unwrap().pop_front();
+            answer.map(Zeroizing::new).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::UnexpectedEof, "no scripted passphrase")
+            })
+        }
+
+        /// Denies once the script runs out, like a real prompt would on EOF.
+        async fn confirm(&self, message: &str) -> io::Result<bool> {
+            self.asked.lock().unwrap().push(message.to_owned());
+            Ok(self.confirms.lock().unwrap().pop_front().unwrap_or(false))
+        }
+    }
+}
