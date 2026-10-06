@@ -16,8 +16,10 @@ Guidance and repository conventions for AI coding agents working on `sudo-agent`
   - Keys are loaded at startup via `--key <PATH>` (repeatable) and `--ttl <DURATION>` (default `15m`), parsed with `clap`; encrypted keys prompt for the passphrase (3 attempts, empty aborts). See `src/keys.rs`.
   - `KeyEntry` holds the decrypted `ssh_key::PrivateKey` (zeroized on drop by `ssh-key`) and an `expires_at` deadline on `CLOCK_BOOTTIME` (`keys::now()`), so suspend time counts against the TTL. Do not use `Instant` for TTLs (`CLOCK_MONOTONIC` pauses during suspend).
   - A background reaper drops expired keys every second; `request_identities()` also filters them.
-  - `sign()` is currently stubbed with `todo!()`.
-  - Prompt abstraction (`src/prompt.rs`: `Prompter` trait + `TerminalPrompter`) is used for passphrases; `confirm()` is not yet called from `sign()`, so `main.rs` carries a temporary `#[expect(dead_code)]` on `mod prompt` to remove once it is. Tests use `prompt::testing::ScriptedPrompter`.
+  - `sign()` (`src/agent.rs`) looks up the requested key and checks its TTL under the lock, releases the lock, asks `Prompter::confirm()` (prompt errors count as denial), then re-locks and re-checks expiry before signing. Unknown/expired keys and unsupported requests are refused *before* prompting. Every approval/refusal is logged to stderr.
+  - `SudoAgent` implements `Agent<UnixListener>` manually (not the clone-per-connection blanket impl) so each `Connection` records its peer via `SO_PEERCRED` (pid, uid, `/proc/<pid>/cmdline`). Peer-supplied text is passed through `sanitize()` before reaching the terminal; keep doing that for anything new shown in prompts.
+  - RSA keys sign only with SHA-512 (`ssh-key` limitation), so RSA requests without the `rsa-sha2-512` flag are refused; Ed25519 is the recommended key type.
+  - Prompt abstraction (`src/prompt.rs`: `Prompter` trait + `TerminalPrompter`) serves both passphrases and approvals through one shared `Arc<dyn Prompter>`. Tests use `prompt::testing::ScriptedPrompter`.
 - **Immediate Focus ("Now")**: Focus strictly on the end-to-end core loop:
   1. Implement `sign()`: verify TTL, trigger approval prompt, sign challenge, and return signature.
   2. Implement a terminal-based prompt abstraction (pinentry style) usable for both load-time passphrase entry and sign-time approval.
@@ -44,8 +46,9 @@ Agents modifying or extending this codebase must strictly preserve the following
 
 ## Project Structure
 
-- `Cargo.toml`: Package definition and dependencies (`ssh-agent-lib`, `ssh-key`, `tokio`, `async-trait`, `clap`, `libc`, `rpassword`, `zeroize`; dev: `tempfile`; `ssh-key` with `crypto` + `encryption`).
-- `src/main.rs`: Entry point containing `CustomAgent` (implements `Session`), CLI arguments, startup key loading, the expiry reaper, and listener loop.
+- `Cargo.toml`: Package definition and dependencies (`ssh-agent-lib`, `ssh-key`, `tokio`, `async-trait`, `clap`, `libc`, `rpassword`, `signature`, `zeroize`; dev: `tempfile`; `ssh-key` with `crypto` + `encryption`).
+- `src/main.rs`: Entry point: CLI arguments, startup key loading, the expiry reaper, and the listener loop.
+- `src/agent.rs`: `SudoAgent` (per-connection `Agent` factory) and `Connection` (implements `Session`: identities + approval-gated `sign()`), peer identification, and prompt sanitizing.
 - `src/keys.rs`: `KeyEntry`, the `CLOCK_BOOTTIME` clock, key loading/decryption, expiry purging, and TTL parsing/formatting.
 - `src/prompt.rs`: `Prompter` trait (secret input + yes/no confirm) and the `/dev/tty` `TerminalPrompter` backend. Prompts are serialized; approval requires typed `y`/`yes` + Enter and discards type-ahead first.
 - `src/socket.rs`: Socket path selection (XDG runtime dir with cache-dir fallback), private-directory checks, stale-socket handling, and binding.
@@ -76,6 +79,6 @@ cargo fmt
 ## Coding Conventions & Guidelines
 
 - **Rust Edition & Idioms**: Target Rust 2024 edition. Use idiomatic Rust error handling, integrating with `ssh_agent_lib::error::AgentError`.
-- **Async Runtime**: Built on `tokio` (multi-threaded runtime). `CustomAgent` implements `ssh_agent_lib::agent::Session`. Because `CustomAgent` is `Clone`, `ssh-agent-lib`'s blanket implementation treats it as an `Agent` where each accepted socket connection gets a fresh clone.
-- **Concurrency & Locking**: Keys in `CustomAgent` are guarded by an `Arc<Mutex<Vec<KeyEntry>>>`. Keep mutex lock guards scoped as tightly as possible; never hold locks across async points or while waiting for user interaction/prompt approval.
+- **Async Runtime**: Built on `tokio` (multi-threaded runtime). `SudoAgent` implements `ssh_agent_lib::agent::Agent<UnixListener>`; `listen()` calls its `new_session()` for each accepted socket, which returns a `Connection` (the `Session`) sharing the key store and prompter. `SudoAgent` must not implement `Session` itself, or it would collide with `ssh-agent-lib`'s clone-per-connection blanket impl.
+- **Concurrency & Locking**: Keys in `SudoAgent` are guarded by an `Arc<Mutex<Vec<KeyEntry>>>`. Keep mutex lock guards scoped as tightly as possible; never hold locks across async points or while waiting for user interaction/prompt approval.
 - **Git & Commits**: Never commit changes automatically unless explicitly requested by the user.

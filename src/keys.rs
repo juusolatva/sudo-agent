@@ -133,6 +133,15 @@ pub fn format_ttl(ttl: Duration) -> String {
     }
 }
 
+/// Formats time left before expiry, to the second, e.g. `1h05m`, `14m30s`, `45s`.
+pub fn format_remaining(left: Duration) -> String {
+    match left.as_secs() {
+        s if s >= 3600 => format!("{}h{:02}m", s / 3600, s % 3600 / 60),
+        s if s >= 60 => format!("{}m{:02}s", s / 60, s % 60),
+        s => format!("{s}s"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,5 +236,14 @@ mod tests {
         for ttl in ["90s", "15m", "8h", "61s", "90m"] {
             assert_eq!(format_ttl(parse_ttl(ttl).unwrap()), ttl);
         }
+    }
+
+    #[test]
+    fn remaining_formatting() {
+        let secs = Duration::from_secs;
+        assert_eq!(format_remaining(Duration::from_millis(900)), "0s");
+        assert_eq!(format_remaining(secs(45)), "45s");
+        assert_eq!(format_remaining(secs(870)), "14m30s");
+        assert_eq!(format_remaining(secs(3900)), "1h05m");
     }
 }

@@ -15,6 +15,7 @@ async-trait = "0.1.92"
 clap = { version = "4.6.7", features = ["derive"] }
 libc = "0.2"
 rpassword = "7.5.4" # betterleaks:allow (crate name trips generic-password)
+signature = "2.2.0"
 ssh-agent-lib = "0.6.0"
 ssh-key = { version = "0.6.7", features = ["crypto", "encryption"] }
 tokio = { version = "1.53.1", features = ["full"] }

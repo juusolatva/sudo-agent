@@ -1,5 +1,5 @@
+mod agent;
 mod keys;
-#[expect(dead_code, reason = "confirm() is wired into sign() in the next step")]
 mod prompt;
 mod socket;
 
@@ -8,16 +8,14 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use async_trait::async_trait;
 use clap::Parser;
-use ssh_agent_lib::agent::{Session, listen};
+use ssh_agent_lib::agent::listen;
 use ssh_agent_lib::error::AgentError;
-use ssh_agent_lib::proto::SignRequest;
-use ssh_agent_lib::proto::message::Identity;
-use ssh_key::{HashAlg, Signature};
+use ssh_key::HashAlg;
 
+use crate::agent::SudoAgent;
 use crate::keys::KeyEntry;
-use crate::prompt::TerminalPrompter;
+use crate::prompt::{Prompter, TerminalPrompter};
 
 /// PAM-aware SSH agent for time-bound, human-approved sudo.
 #[derive(Parser)]
@@ -35,42 +33,6 @@ struct Args {
     /// Socket path [default: $XDG_RUNTIME_DIR/sudo-agent/agent.sock]
     #[arg(long, value_name = "PATH")]
     socket: Option<PathBuf>,
-}
-
-#[derive(Clone)]
-pub struct CustomAgent {
-    keys: Arc<Mutex<Vec<KeyEntry>>>,
-}
-
-// 'CustomAgent' implements 'Session' (and is 'Clone'), so 'ssh-agent-lib' picks it up
-// as an 'Agent' automatically: a fresh clone handles each accepted connection.
-#[async_trait]
-impl Session for CustomAgent {
-    async fn request_identities(&mut self) -> Result<Vec<Identity>, AgentError> {
-        let keys = self.keys.lock().unwrap();
-        let now = keys::now();
-
-        // The reaper removes expired keys within a second; filter here too so
-        // none is ever offered past its deadline.
-        let valid_identities = keys
-            .iter()
-            .filter(|k| !k.is_expired(now))
-            .map(|k| Identity {
-                credential: k.private_key.public_key().key_data().clone().into(),
-                comment: k.private_key.comment().into(),
-            })
-            .collect();
-
-        Ok(valid_identities)
-    }
-
-    async fn sign(&mut self, _sign_request: SignRequest) -> Result<Signature, AgentError> {
-        // Here is where you can intercept signing calls!
-        // 1. Check key expiration
-        // 2. Trigger desktop notification / approval prompt
-        // 3. Sign and return signature
-        todo!("Implement signing logic")
-    }
 }
 
 /// Drops keys as their TTL runs out, so expired key material doesn't linger
@@ -95,10 +57,12 @@ async fn run(args: Args) -> Result<(), AgentError> {
     // Bind before asking for passphrases, so a socket problem doesn't waste them.
     let listener = socket::bind(&socket_path)?;
 
-    let prompter = TerminalPrompter::default();
+    // One prompter for passphrases now and approvals later, so they share the
+    // terminal one prompt at a time.
+    let prompter: Arc<dyn Prompter> = Arc::new(TerminalPrompter::default());
     let mut loaded: Vec<KeyEntry> = Vec::new();
     for path in &args.keys {
-        let entry = keys::load(path, args.ttl, &prompter).await?;
+        let entry = keys::load(path, args.ttl, prompter.as_ref()).await?;
         let public_key = entry.private_key.public_key();
         if loaded
             .iter()
@@ -121,7 +85,7 @@ async fn run(args: Args) -> Result<(), AgentError> {
 
     println!("Agent listening on {}", socket_path.display());
     println!("export SSH_AUTH_SOCK='{}'", socket_path.display());
-    listen(listener, CustomAgent { keys: store }).await?;
+    listen(listener, SudoAgent::new(store, prompter)).await?;
 
     Ok(())
 }
