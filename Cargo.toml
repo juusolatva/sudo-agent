@@ -9,6 +9,9 @@ repository = "https://github.com/juusolatva/sudo-agent"
 readme = "README.md"
 keywords = ["ssh", "sudo", "pam", "security", "agent"]
 categories = ["command-line-utilities", "authentication"]
+# Ship only what's needed to build and read about the crate; development notes
+# (AGENTS.md, TODO.md, docs/, .serena/) stay in the repository.
+include = ["src/**/*.rs", "Cargo.toml", "Cargo.lock", "LICENSE", "README.md"]
 
 [dependencies]
 async-trait = "0.1.92"
