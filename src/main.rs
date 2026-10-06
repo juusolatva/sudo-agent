@@ -15,6 +15,7 @@ mod keys;
 mod prompt;
 mod socket;
 
+use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
@@ -24,6 +25,7 @@ use clap::Parser;
 use ssh_agent_lib::agent::listen;
 use ssh_agent_lib::error::AgentError;
 use ssh_key::HashAlg;
+use tokio::signal::unix::{SignalKind, signal};
 
 use crate::agent::SudoAgent;
 use crate::keys::KeyEntry;
@@ -66,8 +68,11 @@ async fn run(args: Args) -> Result<(), AgentError> {
         Some(path) => path,
         None => socket::default_path()?,
     };
-    // Bind before asking for passphrases, so a socket problem doesn't waste them.
-    let listener = socket::bind(&socket_path)?;
+    // Bind before asking for passphrases, so a socket problem doesn't waste
+    // them. Every return from here on removes the socket file again (via
+    // `socket_file`'s drop), except being killed during passphrase entry; the
+    // next start cleans that up as a stale socket.
+    let (listener, socket_file) = socket::bind(&socket_path)?;
 
     // One prompter for passphrases now and approvals later, so they share the
     // terminal one prompt at a time.
@@ -92,19 +97,62 @@ async fn run(args: Args) -> Result<(), AgentError> {
         loaded.push(entry);
     }
 
+    // Installed only now: during passphrase entry the terminal has echo off,
+    // and the default SIGINT action is the safer way out of that.
+    let shutdown = shutdown_signal()?;
+
     let store = Arc::new(Mutex::new(loaded));
     spawn_expiry_reaper(Arc::clone(&store));
 
     println!("Agent listening on {}", socket_path.display());
     println!("export SSH_AUTH_SOCK='{}'", socket_path.display());
-    listen(listener, SudoAgent::new(store, prompter)).await?;
+    let result = tokio::select! {
+        result = listen(listener, SudoAgent::new(Arc::clone(&store), prompter)) => result,
+        signal = shutdown => {
+            // Ctrl-C echoes "^C" with no newline (possibly after a prompt).
+            let newline = if signal == "SIGINT" { "\n" } else { "" };
+            log!("{newline}Received {signal}, shutting down");
+            Ok(())
+        }
+    };
 
-    Ok(())
+    // Drop (and so zeroize) the keys now rather than relying on destructors
+    // running at exit: main doesn't wait for in-flight tasks.
+    store.lock().unwrap().clear();
+    drop(socket_file);
+    result
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    match run(Args::parse()).await {
+/// Resolves on the first signal that should stop the agent cleanly: SIGINT
+/// (Ctrl-C), SIGTERM, or SIGHUP (its terminal went away).
+fn shutdown_signal() -> io::Result<impl Future<Output = &'static str>> {
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut hangup = signal(SignalKind::hangup())?;
+    Ok(async move {
+        tokio::select! {
+            _ = interrupt.recv() => "SIGINT",
+            _ = terminate.recv() => "SIGTERM",
+            _ = hangup.recv() => "SIGHUP",
+        }
+    })
+}
+
+fn main() -> ExitCode {
+    let args = Args::parse();
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("sudo-agent: failed to start the async runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let result = runtime.block_on(run(args));
+    // An approval prompt may still be blocked reading the terminal; dropping
+    // the runtime normally would wait for it, so don't.
+    runtime.shutdown_background();
+
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             match e {

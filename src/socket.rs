@@ -46,11 +46,12 @@ pub fn default_path() -> io::Result<PathBuf> {
 }
 
 /// Binds the agent socket at `path`, replacing a stale socket left behind by a
-/// previous run, and restricts it to the owner (`0600`).
+/// previous run, and restricts it to the owner (`0600`). The socket file is
+/// removed again when the returned [`SocketFile`] is dropped.
 ///
 /// Refuses to start if another agent is still answering on `path`, or if
 /// `path` exists but isn't a socket.
-pub fn bind(path: &Path) -> io::Result<UnixListener> {
+pub fn bind(path: &Path) -> io::Result<(UnixListener, SocketFile)> {
     if path.as_os_str().len() >= SUN_PATH_LEN {
         return Err(io::Error::new(
             ErrorKind::InvalidInput,
@@ -64,8 +65,38 @@ pub fn bind(path: &Path) -> io::Result<UnixListener> {
 
     remove_stale(path)?;
     let listener = UnixListener::bind(path)?;
+    let file = SocketFile::new(path)?;
     fs::set_permissions(path, Permissions::from_mode(0o600))?;
-    Ok(listener)
+    Ok((listener, file))
+}
+
+/// The socket file this process bound; removed on drop.
+pub struct SocketFile {
+    path: PathBuf,
+    /// `(st_dev, st_ino)` at bind time. If something else has since replaced
+    /// the file (e.g. another instance started after this one's was deleted),
+    /// it is left alone.
+    id: (u64, u64),
+}
+
+impl SocketFile {
+    fn new(path: &Path) -> io::Result<Self> {
+        let meta = fs::symlink_metadata(path)?;
+        Ok(Self {
+            path: path.to_owned(),
+            id: (meta.dev(), meta.ino()),
+        })
+    }
+}
+
+impl Drop for SocketFile {
+    fn drop(&mut self) {
+        let ours =
+            fs::symlink_metadata(&self.path).is_ok_and(|meta| (meta.dev(), meta.ino()) == self.id);
+        if ours {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
 }
 
 fn remove_stale(path: &Path) -> io::Result<()> {
@@ -139,4 +170,31 @@ fn hostname() -> Option<String> {
     let host = fs::read_to_string("/proc/sys/kernel/hostname").ok()?;
     let host = host.trim();
     (!host.is_empty() && !host.contains('/')).then(|| host.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn socket_file_is_removed_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.sock");
+        let (listener, file) = bind(&path).unwrap();
+        assert!(path.exists());
+        drop(listener);
+        drop(file);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn replaced_socket_file_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.sock");
+        let (_listener, file) = bind(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, "someone else's").unwrap();
+        drop(file);
+        assert!(path.exists());
+    }
 }
