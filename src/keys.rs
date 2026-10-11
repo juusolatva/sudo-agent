@@ -55,7 +55,8 @@ pub fn purge_expired(keys: &Mutex<Vec<KeyEntry>>, now: Duration) -> Vec<String> 
 /// Reads an OpenSSH private key, asking for its passphrase if it is
 /// encrypted. The TTL starts once the key is decrypted.
 pub async fn load(path: &Path, ttl: Duration, prompter: &dyn Prompter) -> io::Result<KeyEntry> {
-    let pem = std::fs::read(path)
+    let pem = tokio::fs::read(path)
+        .await
         .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
     let key = PrivateKey::from_openssh(pem).map_err(|e| key_error(path, e))?;
     let private_key = if key.is_encrypted() {
