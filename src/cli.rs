@@ -11,11 +11,7 @@ use crate::keys;
 
 /// PAM-aware SSH agent for time-bound, human-approved sudo.
 #[derive(Parser)]
-#[command(
-    version,
-    args_conflicts_with_subcommands = true,
-    subcommand_negates_reqs = true
-)]
+#[command(version, args_conflicts_with_subcommands = true)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -33,16 +29,19 @@ enum Command {
 
 #[derive(Args)]
 pub struct ServeArgs {
-    /// OpenSSH private key to load (repeatable). Its passphrase is asked for
-    /// once, at startup.
-    #[arg(long = "key", value_name = "PATH", required = true)]
+    /// OpenSSH private key to load at startup (repeatable); its passphrase is
+    /// asked for here. Keys can also be added later with ssh-add through the
+    /// control socket.
+    #[arg(long = "key", value_name = "PATH")]
     pub keys: Vec<PathBuf>,
 
-    /// How long loaded keys stay usable, e.g. 90s, 15m or 8h.
+    /// How long keys stay usable, e.g. 90s, 15m or 8h: those loaded with
+    /// --key, and those added with ssh-add without -t.
     #[arg(long, value_name = "DURATION", default_value = "15m", value_parser = keys::parse_duration)]
     pub ttl: Duration,
 
-    /// Longest TTL a key may have; a longer --ttl is an error.
+    /// Longest TTL a key may have: a longer --ttl is an error, a longer
+    /// ssh-add -t is cut down to it.
     #[arg(long, value_name = "DURATION", default_value = "8h", value_parser = keys::parse_duration)]
     pub max_ttl: Duration,
 
@@ -54,6 +53,12 @@ pub struct ServeArgs {
     /// [default: $XDG_RUNTIME_DIR/sudo-agent/agent.sock]
     #[arg(long, alias = "socket", value_name = "PATH")]
     pub agent_socket: Option<PathBuf>,
+
+    /// Control socket, for ssh-add; never forward it
+    /// [env: SUDO_AGENT_CONTROL_SOCKET]
+    /// [default: $XDG_RUNTIME_DIR/sudo-agent/control.sock]
+    #[arg(long, value_name = "PATH")]
+    pub control_socket: Option<PathBuf>,
 }
 
 /// Parses the command line, exiting with a usage error if it's invalid.
@@ -115,11 +120,18 @@ mod tests {
     }
 
     #[test]
-    fn a_key_is_required() {
+    fn keys_are_optional() {
+        // Keys can be added later with ssh-add.
         for args in [&[][..], &["serve"][..]] {
-            let error = parse(args).err().expect("missing --key");
-            assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+            assert!(parse(args).unwrap().keys.is_empty(), "{args:?}");
         }
+    }
+
+    #[test]
+    fn control_socket_flag() {
+        let parsed = parse(&["serve", "--control-socket", "/tmp/c.sock"]).unwrap();
+        assert_eq!(parsed.control_socket, Some(PathBuf::from("/tmp/c.sock")));
+        assert_eq!(parsed.agent_socket, None);
     }
 
     #[test]

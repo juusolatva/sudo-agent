@@ -12,6 +12,7 @@ macro_rules! log {
 
 mod agent;
 mod cli;
+mod control;
 mod keys;
 mod prompt;
 mod server;
@@ -29,8 +30,9 @@ use tokio::signal::unix::{SignalKind, signal};
 
 use crate::agent::SudoAgent;
 use crate::cli::ServeArgs;
-use crate::keys::KeyEntry;
+use crate::keys::{KeyEntry, TtlPolicy};
 use crate::prompt::{Prompter, TerminalPrompter};
+use crate::server::Listeners;
 
 /// Drops keys as their TTL runs out, so expired key material doesn't linger
 /// in memory.
@@ -53,16 +55,30 @@ fn spawn_expiry_reaper(store: Arc<Mutex<Vec<KeyEntry>>>) {
 }
 
 async fn run(args: ServeArgs) -> Result<(), AgentError> {
-    let socket_path = socket::choose_path(
+    let agent_path = socket::choose_path(
         args.agent_socket,
         env::var_os(socket::AGENT_SOCKET_ENV),
-        socket::default_path,
+        || socket::default_path("agent"),
     )?;
+    let control_path = socket::choose_path(
+        args.control_socket,
+        env::var_os(socket::CONTROL_SOCKET_ENV),
+        || socket::default_path("control"),
+    )?;
+    if agent_path == control_path {
+        let message = format!(
+            "the agent and control sockets must differ, both are {}",
+            agent_path.display()
+        );
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, message).into());
+    }
     // Bind before asking for passphrases, so a socket problem doesn't waste
-    // them. Every return from here on removes the socket file again (via
-    // `socket_file`'s drop), except being killed during passphrase entry; the
-    // next start cleans that up as a stale socket.
-    let (listener, socket_file) = socket::bind(&socket_path)?;
+    // them. Every return from here on removes the socket files again (via
+    // the `SocketFile`s' drop), except being killed during passphrase entry;
+    // the next start cleans that up as stale sockets. Binding refuses while
+    // another agent answers on either path: one instance per user.
+    let (agent_listener, agent_file) = socket::bind(&agent_path)?;
+    let (control_listener, control_file) = socket::bind(&control_path)?;
 
     // One prompter for passphrases now and approvals later, so they share the
     // terminal one prompt at a time.
@@ -95,8 +111,18 @@ async fn run(args: ServeArgs) -> Result<(), AgentError> {
     let store = Arc::new(Mutex::new(loaded));
     spawn_expiry_reaper(Arc::clone(&store));
 
-    println!("Agent listening on {}", socket_path.display());
-    println!("export SSH_AUTH_SOCK='{}'", socket_path.display());
+    println!("Agent listening on {}", agent_path.display());
+    println!(
+        "Control socket on {} (for ssh-add; never forward it)",
+        control_path.display()
+    );
+    if args.keys.is_empty() {
+        println!(
+            "No keys loaded yet; add one with: SSH_AUTH_SOCK='{}' ssh-add <key>",
+            control_path.display()
+        );
+    }
+    println!("export SSH_AUTH_SOCK='{}'", agent_path.display());
     let shutdown = async {
         let signal = shutdown.await;
         // Ctrl-C echoes "^C" with no newline (possibly after a prompt).
@@ -104,12 +130,21 @@ async fn run(args: ServeArgs) -> Result<(), AgentError> {
         log!("{newline}Received {signal}, shutting down");
     };
     let agent = SudoAgent::new(Arc::clone(&store), prompter);
-    let result = server::serve(listener, agent, shutdown).await;
+    let listeners = Listeners {
+        agent: agent_listener,
+        control: control_listener,
+    };
+    let ttl = TtlPolicy {
+        default: args.ttl,
+        max: args.max_ttl,
+    };
+    let result = server::serve(listeners, agent, ttl, shutdown).await;
 
     // Drop (and so zeroize) the keys now rather than relying on destructors
     // running at exit: main doesn't wait for in-flight tasks.
     store.lock().unwrap().clear();
-    drop(socket_file);
+    drop(agent_file);
+    drop(control_file);
     result
 }
 

@@ -24,6 +24,32 @@ impl KeyEntry {
     }
 }
 
+/// How long keys added over `control.sock` stay usable.
+#[derive(Clone, Copy, Debug)]
+pub struct TtlPolicy {
+    /// For keys added without a lifetime (`ssh-add` without `-t`).
+    pub default: Duration,
+    /// No key may be usable for longer (`--max-ttl`).
+    pub max: Duration,
+}
+
+impl TtlPolicy {
+    /// The TTL for a key added with the `requested` lifetime, and whether it
+    /// had to be capped. No lifetime, or a lifetime of zero (which OpenSSH's
+    /// own agent reads as "no limit"), means the default: a key never stays
+    /// until removed.
+    pub fn ttl(&self, requested: Option<Duration>) -> (Duration, bool) {
+        let ttl = requested
+            .filter(|lifetime| !lifetime.is_zero())
+            .unwrap_or(self.default);
+        if ttl > self.max {
+            (self.max, true)
+        } else {
+            (ttl, false)
+        }
+    }
+}
+
 /// Current time on `CLOCK_BOOTTIME`. Unlike `Instant` (`CLOCK_MONOTONIC` on
 /// Linux), this keeps counting while the machine is suspended, so a key's TTL
 /// can't be stretched by closing the laptop lid.
@@ -225,6 +251,20 @@ mod tests {
         let at = keys.lock().unwrap()[0].expires_at;
         assert_eq!(purge_expired(&keys, at), ["short"]);
         assert_eq!(keys.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ttl_policy() {
+        let policy = TtlPolicy {
+            default: Duration::from_secs(15 * 60),
+            max: Duration::from_secs(8 * 3600),
+        };
+        let hours = |h: u64| Duration::from_secs(h * 3600);
+        assert_eq!(policy.ttl(Some(hours(4))), (hours(4), false));
+        assert_eq!(policy.ttl(Some(hours(8))), (hours(8), false));
+        assert_eq!(policy.ttl(Some(hours(12))), (hours(8), true));
+        assert_eq!(policy.ttl(None), (policy.default, false));
+        assert_eq!(policy.ttl(Some(Duration::ZERO)), (policy.default, false));
     }
 
     #[test]

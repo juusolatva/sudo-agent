@@ -1,4 +1,4 @@
-//! Serving the agent on its socket until shutdown, apart from how the keys
+//! Serving the agent on its sockets until shutdown, apart from how the keys
 //! got loaded and what stops the process.
 
 use std::future::Future;
@@ -8,17 +8,32 @@ use ssh_agent_lib::error::AgentError;
 use tokio::net::UnixListener;
 
 use crate::agent::SudoAgent;
+use crate::control::ControlAgent;
+use crate::keys::TtlPolicy;
 
-/// Serves `agent` on `listener` until accepting fails or `shutdown`
-/// resolves. Connections still being served then are left to the runtime's
+/// The agent's listening sockets.
+pub struct Listeners {
+    /// `agent.sock`, the one forwarded: listing and approval-gated signing
+    /// only.
+    pub agent: UnixListener,
+    /// `control.sock`, never forwarded: also adding and removing keys.
+    pub control: UnixListener,
+}
+
+/// Serves `agent` on both sockets until accepting fails on either or
+/// `shutdown` resolves. Keys added over `control.sock` get their TTL from
+/// `ttl`. Connections still being served then are left to the runtime's
 /// shutdown.
 pub async fn serve(
-    listener: UnixListener,
+    listeners: Listeners,
     agent: SudoAgent,
+    ttl: TtlPolicy,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), AgentError> {
+    let control = ControlAgent::new(agent.clone(), ttl);
     tokio::select! {
-        result = listen(listener, agent) => result,
+        result = listen(listeners.agent, agent) => result,
+        result = listen(listeners.control, control) => result,
         () = shutdown => Ok(()),
     }
 }
@@ -50,39 +65,69 @@ mod tests {
 
     const CHALLENGE: &[u8] = b"pam_ssh_agent_auth challenge";
 
-    /// An agent served on a socket in a temporary directory.
+    /// A TTL policy for tests that don't look at TTLs.
+    const LONG: TtlPolicy = TtlPolicy {
+        default: Duration::from_secs(15 * 60),
+        max: Duration::from_secs(8 * 3600),
+    };
+
+    /// An agent served on both sockets in a temporary directory.
     struct Running {
         _dir: tempfile::TempDir,
         path: PathBuf,
+        control_path: PathBuf,
         stop: Option<oneshot::Sender<()>>,
         served: JoinHandle<Result<(), AgentError>>,
     }
 
     impl Running {
         fn start(keys: Vec<KeyEntry>, prompter: Arc<dyn Prompter>) -> Self {
+            Self::with_ttl(keys, prompter, LONG)
+        }
+
+        fn with_ttl(keys: Vec<KeyEntry>, prompter: Arc<dyn Prompter>, ttl: TtlPolicy) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("agent.sock");
-            let (listener, socket_file) = socket::bind(&path).unwrap();
+            let control_path = dir.path().join("control.sock");
+            let (agent_listener, agent_file) = socket::bind(&path).unwrap();
+            let (control_listener, control_file) = socket::bind(&control_path).unwrap();
+            let listeners = Listeners {
+                agent: agent_listener,
+                control: control_listener,
+            };
             let agent = SudoAgent::new(Arc::new(Mutex::new(keys)), prompter);
             let (stop, stopped) = oneshot::channel::<()>();
             let served = tokio::spawn(async move {
                 let shutdown = async {
                     let _ = stopped.await;
                 };
-                let result = serve(listener, agent, shutdown).await;
-                drop(socket_file);
+                let result = serve(listeners, agent, ttl, shutdown).await;
+                drop((agent_file, control_file));
                 result
             });
             Self {
                 _dir: dir,
                 path,
+                control_path,
                 stop: Some(stop),
                 served,
             }
         }
 
+        /// A client of `agent.sock`.
         async fn client(&self) -> Client<UnixStream> {
             Client::new(UnixStream::connect(&self.path).await.unwrap())
+        }
+
+        /// A client of `control.sock`.
+        async fn control(&self) -> Client<UnixStream> {
+            Client::new(UnixStream::connect(&self.control_path).await.unwrap())
+        }
+
+        /// Comments of the keys listed on `agent.sock`.
+        async fn listed(&self) -> Vec<String> {
+            let identities = self.client().await.request_identities().await.unwrap();
+            identities.into_iter().map(|i| i.comment).collect()
         }
 
         /// Stops serving; the temporary directory stays until `self` drops.
@@ -94,6 +139,24 @@ mod tests {
 
     fn public(entry: &KeyEntry) -> KeyData {
         entry.private_key.public_key().key_data().clone()
+    }
+
+    /// What `ssh-add` sends for `entry`, with `constraints` (`-t`, `-c`, `-h`).
+    fn add_request(entry: &KeyEntry, constraints: Vec<KeyConstraint>) -> Request {
+        let identity = AddIdentity {
+            credential: PrivateCredential::Key {
+                privkey: entry.private_key.key_data().clone(),
+                comment: entry.private_key.comment().to_owned(),
+            },
+        };
+        if constraints.is_empty() {
+            Request::AddIdentity(identity)
+        } else {
+            Request::AddIdConstrained(AddIdentityConstrained {
+                identity,
+                constraints,
+            })
+        }
     }
 
     fn sign_request(key: &KeyData) -> SignRequest {
@@ -246,5 +309,252 @@ mod tests {
         running.stop().await.unwrap();
         assert!(!path.exists());
         assert!(UnixStream::connect(&path).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn shutdown_removes_the_control_socket_too() {
+        let mut running = Running::start(Vec::new(), Arc::new(ScriptedPrompter::default()));
+        let path = running.control_path.clone();
+        assert!(path.exists());
+        running.stop().await.unwrap();
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn key_added_over_control_is_served_on_the_agent_socket() {
+        let key = entry("laptop", Duration::ZERO);
+        let public = public(&key);
+        let prompter = Arc::new(ScriptedPrompter::with_confirms([true, true]));
+        let running = Running::start(Vec::new(), prompter.clone());
+        let mut control = running.control().await;
+
+        let response = control.handle(add_request(&key, vec![])).await;
+        assert!(matches!(response, Ok(Response::Success)));
+        assert_eq!(running.listed().await, ["laptop"]);
+
+        // Signing works on both sockets, approval-gated on both.
+        let signature = running
+            .client()
+            .await
+            .sign(sign_request(&public))
+            .await
+            .unwrap();
+        public.verify(CHALLENGE, &signature).unwrap();
+        let signature = control.sign(sign_request(&public)).await.unwrap();
+        public.verify(CHALLENGE, &signature).unwrap();
+        assert_eq!(prompter.asked().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn lifetime_sets_the_ttl() {
+        let short = TtlPolicy {
+            default: Duration::from_millis(300),
+            max: Duration::from_secs(3600),
+        };
+        let running = Running::with_ttl(Vec::new(), Arc::new(ScriptedPrompter::default()), short);
+        let key = entry("one-second", Duration::ZERO);
+        let add = add_request(&key, vec![KeyConstraint::Lifetime(1)]);
+        assert!(matches!(
+            running.control().await.handle(add).await,
+            Ok(Response::Success)
+        ));
+
+        // Past the default, within the lifetime.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(running.listed().await, ["one-second"]);
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(running.listed().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn lifetime_above_the_cap_is_cut_down() {
+        let capped = TtlPolicy {
+            default: Duration::from_millis(100),
+            max: Duration::from_millis(300),
+        };
+        let running = Running::with_ttl(Vec::new(), Arc::new(ScriptedPrompter::default()), capped);
+        let key = entry("asked-for-an-hour", Duration::ZERO);
+        let add = add_request(&key, vec![KeyConstraint::Lifetime(3600)]);
+        assert!(matches!(
+            running.control().await.handle(add).await,
+            Ok(Response::Success)
+        ));
+
+        assert_eq!(running.listed().await.len(), 1);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(running.listed().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn no_lifetime_or_zero_gets_the_default() {
+        let short = TtlPolicy {
+            default: Duration::from_millis(300),
+            max: Duration::from_secs(3600),
+        };
+        let running = Running::with_ttl(Vec::new(), Arc::new(ScriptedPrompter::default()), short);
+        let mut control = running.control().await;
+        let plain = entry("plain", Duration::ZERO);
+        let zero = entry("zero", Duration::ZERO);
+        let add_plain = add_request(&plain, vec![]);
+        let add_zero = add_request(&zero, vec![KeyConstraint::Lifetime(0)]);
+        assert!(matches!(
+            control.handle(add_plain).await,
+            Ok(Response::Success)
+        ));
+        assert!(matches!(
+            control.handle(add_zero).await,
+            Ok(Response::Success)
+        ));
+
+        assert_eq!(running.listed().await.len(), 2);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(running.listed().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn re_adding_a_key_replaces_it_and_restarts_its_ttl() {
+        let short = TtlPolicy {
+            default: Duration::from_millis(300),
+            max: Duration::from_secs(3600),
+        };
+        let running = Running::with_ttl(Vec::new(), Arc::new(ScriptedPrompter::default()), short);
+        let mut control = running.control().await;
+        let mut key = entry("first", Duration::ZERO);
+        assert!(matches!(
+            control.handle(add_request(&key, vec![])).await,
+            Ok(Response::Success)
+        ));
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        key.private_key.set_comment("second");
+        assert!(matches!(
+            control.handle(add_request(&key, vec![])).await,
+            Ok(Response::Success)
+        ));
+        // One entry, not two.
+        assert_eq!(running.listed().await, ["second"]);
+
+        // The first TTL would have run out by now.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(running.listed().await, ["second"]);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(running.listed().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn confirm_constraint_is_accepted_restrictions_are_not() {
+        let running = Running::start(Vec::new(), Arc::new(ScriptedPrompter::default()));
+        let mut control = running.control().await;
+        let extension = |name: &str| {
+            KeyConstraint::Extension(Extension {
+                name: name.into(),
+                details: Vec::new().into(),
+            })
+        };
+
+        let confirmed = entry("confirmed", Duration::ZERO);
+        let add = add_request(&confirmed, vec![KeyConstraint::Confirm]);
+        assert!(matches!(control.handle(add).await, Ok(Response::Success)));
+
+        for name in [
+            "restrict-destination-v00@openssh.com",
+            "something@example.com",
+        ] {
+            let restricted = entry("restricted", Duration::ZERO);
+            let add = add_request(
+                &restricted,
+                vec![KeyConstraint::Lifetime(60), extension(name)],
+            );
+            let response = control.handle(add).await;
+            assert!(
+                matches!(response, Ok(Response::Failure)),
+                "{name}: {response:?}"
+            );
+        }
+        assert_eq!(running.listed().await, ["confirmed"]);
+    }
+
+    #[tokio::test]
+    async fn remove_and_remove_all() {
+        let one = entry("one", Duration::from_secs(60));
+        let one_public = public(&one);
+        let two = entry("two", Duration::from_secs(60));
+        let running = Running::start(vec![one, two], Arc::new(ScriptedPrompter::default()));
+        let mut control = running.control().await;
+        let remove = || {
+            Request::RemoveIdentity(RemoveIdentity {
+                credential: one_public.clone().into(),
+            })
+        };
+
+        assert!(matches!(
+            control.handle(remove()).await,
+            Ok(Response::Success)
+        ));
+        assert_eq!(running.listed().await, ["two"]);
+        // Removing a key that isn't loaded fails, as with OpenSSH's agent.
+        assert!(matches!(
+            control.handle(remove()).await,
+            Ok(Response::Failure)
+        ));
+        let remove_all = control.handle(Request::RemoveAllIdentities).await;
+        assert!(matches!(remove_all, Ok(Response::Success)));
+        assert!(running.listed().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn control_does_not_lock_yet() {
+        let running = Running::start(Vec::new(), Arc::new(ScriptedPrompter::default()));
+        let mut control = running.control().await;
+        for request in [Request::Lock("pw".into()), Request::Unlock("pw".into())] {
+            assert!(matches!(
+                control.handle(request).await,
+                Ok(Response::Failure)
+            ));
+        }
+    }
+
+    /// What `ssh` sends before forwarding a connection (or using it for a
+    /// login): from then on the connection gets nothing.
+    #[tokio::test]
+    async fn session_bind_refuses_the_control_connection_for_good() {
+        let loaded = entry("loaded", Duration::from_secs(60));
+        let loaded_public = public(&loaded);
+        let prompter = Arc::new(ScriptedPrompter::with_confirms([true]));
+        let running = Running::start(vec![loaded], prompter.clone());
+        let mut forwarded = running.control().await;
+
+        let bind = Request::Extension(Extension {
+            name: "session-bind@openssh.com".into(),
+            details: Vec::new().into(),
+        });
+        assert!(matches!(
+            forwarded.handle(bind).await,
+            Ok(Response::Failure)
+        ));
+
+        let other = entry("other", Duration::ZERO);
+        let requests = [
+            ("list", Request::RequestIdentities),
+            ("sign", Request::SignRequest(sign_request(&loaded_public))),
+            ("add", add_request(&other, vec![])),
+            ("remove all", Request::RemoveAllIdentities),
+        ];
+        for (name, request) in requests {
+            let response = forwarded.handle(request).await;
+            assert!(
+                matches!(response, Ok(Response::Failure)),
+                "{name} should be refused, got {response:?}"
+            );
+        }
+        assert_eq!(running.listed().await, ["loaded"]);
+        assert!(prompter.asked().is_empty());
+
+        // Other connections are unaffected.
+        let add = add_request(&other, vec![]);
+        assert!(matches!(
+            running.control().await.handle(add).await,
+            Ok(Response::Success)
+        ));
     }
 }

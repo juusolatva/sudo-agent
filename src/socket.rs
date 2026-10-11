@@ -1,9 +1,9 @@
-//! Agent socket placement and setup.
+//! Socket placement and setup, for `agent.sock` and `control.sock`.
 //!
-//! The default location is `$XDG_RUNTIME_DIR/sudo-agent/agent.sock` (per-user,
-//! `0700`, tmpfs, cleared on logout). When that isn't set (`su`, containers,
-//! WSL, non-systemd sessions) we fall back to
-//! `${XDG_CACHE_HOME:-$HOME/.cache}/sudo-agent/agent-<hostname>.sock`; the
+//! The default location is `$XDG_RUNTIME_DIR/sudo-agent/<name>.sock`
+//! (per-user, `0700`, tmpfs, cleared on logout). When that isn't set (`su`,
+//! containers, WSL, non-systemd sessions) we fall back to
+//! `${XDG_CACHE_HOME:-$HOME/.cache}/sudo-agent/<name>-<hostname>.sock`; the
 //! hostname suffix keeps machines sharing an NFS home from clobbering each
 //! other's sockets.
 
@@ -24,6 +24,10 @@ const SUN_PATH_LEN: usize = 108;
 /// `--agent-socket`).
 pub const AGENT_SOCKET_ENV: &str = "SUDO_AGENT_SOCKET";
 
+/// Environment variable naming the control socket (overridden by
+/// `--control-socket`).
+pub const CONTROL_SOCKET_ENV: &str = "SUDO_AGENT_CONTROL_SOCKET";
+
 /// Picks a socket path: `flag` if given, else `env_value` if set and
 /// non-empty (an empty variable counts as unset), else `default()`.
 pub fn choose_path(
@@ -38,23 +42,27 @@ pub fn choose_path(
     }
 }
 
-/// Returns the default socket path, creating its parent directory with mode
-/// `0700` and verifying ownership/permissions if it already exists.
-pub fn default_path() -> io::Result<PathBuf> {
+/// Returns the default path of the `name` socket (`agent` or `control`),
+/// creating its parent directory with mode `0700` and verifying
+/// ownership/permissions if it already exists.
+pub fn default_path(name: &str) -> io::Result<PathBuf> {
     let (dir, file_name) = match env_dir("XDG_RUNTIME_DIR") {
-        Some(runtime) => (runtime.join(APP_DIR), "agent.sock".to_owned()),
+        Some(runtime) => (runtime.join(APP_DIR), format!("{name}.sock")),
         None => {
             let cache = env_dir("XDG_CACHE_HOME")
                 .or_else(|| env_dir("HOME").map(|home| home.join(".cache")))
                 .ok_or_else(|| {
                     io::Error::new(
                         ErrorKind::NotFound,
-                        "none of XDG_RUNTIME_DIR, XDG_CACHE_HOME or HOME is set; use --agent-socket",
+                        format!(
+                            "none of XDG_RUNTIME_DIR, XDG_CACHE_HOME or HOME is set; \
+                             use --{name}-socket"
+                        ),
                     )
                 })?;
             let file_name = match hostname() {
-                Some(host) => format!("agent-{host}.sock"),
-                None => "agent.sock".to_owned(),
+                Some(host) => format!("{name}-{host}.sock"),
+                None => format!("{name}.sock"),
             };
             (cache.join(APP_DIR), file_name)
         }

@@ -11,7 +11,10 @@ use signature::Signer;
 use ssh_agent_lib::agent::{Agent, Session};
 use ssh_agent_lib::error::AgentError;
 use ssh_agent_lib::proto::message::Identity;
-use ssh_agent_lib::proto::{SignRequest, signature::RSA_SHA2_512};
+use ssh_agent_lib::proto::{
+    AddIdentity, AddIdentityConstrained, AddSmartcardKeyConstrained, RemoveIdentity, SignRequest,
+    SmartcardKey, signature::RSA_SHA2_512,
+};
 use ssh_key::public::KeyData;
 use ssh_key::{Algorithm, HashAlg, Signature};
 use tokio::io::Interest;
@@ -99,20 +102,47 @@ impl SudoAgent {
             tokio::time::sleep(left.min(Duration::from_secs(1))).await;
         }
     }
+
+    /// Loads `entry`. A loaded key with the same public key is replaced, which
+    /// restarts its TTL; returns whether that happened.
+    pub fn add(&self, entry: KeyEntry) -> bool {
+        let mut keys = self.keys.lock().unwrap();
+        let key_data = entry.private_key.public_key().key_data();
+        let before = keys.len();
+        keys.retain(|k| k.private_key.public_key().key_data() != key_data);
+        let replaced = keys.len() != before;
+        keys.push(entry);
+        replaced
+    }
+
+    /// Removes (and so zeroizes) the key, returning its comment if it was
+    /// loaded.
+    pub fn remove(&self, key_data: &KeyData) -> Option<String> {
+        let mut keys = self.keys.lock().unwrap();
+        let index = keys
+            .iter()
+            .position(|k| k.private_key.public_key().key_data() == key_data)?;
+        Some(keys.remove(index).private_key.comment().to_owned())
+    }
+
+    /// Removes (and so zeroizes) every key, returning how many there were.
+    pub fn remove_all(&self) -> usize {
+        let mut keys = self.keys.lock().unwrap();
+        let count = keys.len();
+        keys.clear();
+        count
+    }
 }
 
 impl Agent<UnixListener> for SudoAgent {
     fn new_session(&mut self, socket: &UnixStream) -> impl Session {
-        Connection {
-            agent: self.clone(),
-            peer: Peer::of(socket),
-            client: socket.as_fd().try_clone_to_owned().ok(),
-        }
+        Connection::new(self.clone(), socket)
     }
 }
 
 /// One client connection, e.g. `pam_ssh_agent_auth` inside a `sudo` process.
-struct Connection {
+/// Serves listing and approval-gated signing, on either socket.
+pub struct Connection {
     agent: SudoAgent,
     peer: Peer,
     /// A duplicate of the client's socket, watched for the client hanging up
@@ -122,6 +152,30 @@ struct Connection {
 }
 
 impl Connection {
+    pub fn new(agent: SudoAgent, socket: &UnixStream) -> Self {
+        Self {
+            agent,
+            peer: Peer::of(socket),
+            client: socket.as_fd().try_clone_to_owned().ok(),
+        }
+    }
+
+    pub fn agent(&self) -> &SudoAgent {
+        &self.agent
+    }
+
+    pub fn peer(&self) -> &Peer {
+        &self.peer
+    }
+
+    fn refuse_management(&self, what: &str) -> Result<(), AgentError> {
+        log!(
+            "Refused {what} from {}: agent.sock only lists and signs (keys are managed through control.sock)",
+            self.peer
+        );
+        Err(AgentError::Failure)
+    }
+
     fn refuse(&self, reason: &str) -> Result<Signature, AgentError> {
         log!("Refused signature request from {}: {reason}", self.peer);
         Err(AgentError::Failure)
@@ -130,6 +184,50 @@ impl Connection {
 
 #[async_trait]
 impl Session for Connection {
+    // Key management is refused here and logged: on the forwarded socket it
+    // means a server tried it. (`control.sock` overrides these.)
+    async fn add_identity(&mut self, _: AddIdentity) -> Result<(), AgentError> {
+        self.refuse_management("adding a key")
+    }
+
+    async fn add_identity_constrained(
+        &mut self,
+        _: AddIdentityConstrained,
+    ) -> Result<(), AgentError> {
+        self.refuse_management("adding a key")
+    }
+
+    async fn remove_identity(&mut self, _: RemoveIdentity) -> Result<(), AgentError> {
+        self.refuse_management("removing a key")
+    }
+
+    async fn remove_all_identities(&mut self) -> Result<(), AgentError> {
+        self.refuse_management("removing all keys")
+    }
+
+    async fn add_smartcard_key(&mut self, _: SmartcardKey) -> Result<(), AgentError> {
+        self.refuse_management("adding a smartcard key")
+    }
+
+    async fn add_smartcard_key_constrained(
+        &mut self,
+        _: AddSmartcardKeyConstrained,
+    ) -> Result<(), AgentError> {
+        self.refuse_management("adding a smartcard key")
+    }
+
+    async fn remove_smartcard_key(&mut self, _: SmartcardKey) -> Result<(), AgentError> {
+        self.refuse_management("removing a smartcard key")
+    }
+
+    async fn lock(&mut self, _: String) -> Result<(), AgentError> {
+        self.refuse_management("locking")
+    }
+
+    async fn unlock(&mut self, _: String) -> Result<(), AgentError> {
+        self.refuse_management("unlocking")
+    }
+
     async fn request_identities(&mut self) -> Result<Vec<Identity>, AgentError> {
         let keys = self.agent.keys.lock().unwrap();
         let now = keys::now();
@@ -242,7 +340,7 @@ fn unsupported(algorithm: Algorithm, flags: u32) -> Option<&'static str> {
 /// The process on the other end of the socket, from `SO_PEERCRED` at connect
 /// time. Informational only: the command line is whatever that process says.
 #[derive(Default)]
-struct Peer {
+pub struct Peer {
     pid: Option<i32>,
     uid: Option<u32>,
     command: Option<String>,
@@ -302,7 +400,7 @@ fn command_line(pid: i32) -> Option<String> {
 /// Escapes characters that could rewrite or disguise the prompt on a
 /// terminal: control characters (including ANSI escape sequences) and
 /// invisible or bidirectional-override formatting characters.
-fn sanitize(s: &str) -> String {
+pub fn sanitize(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         let disguising = matches!(
