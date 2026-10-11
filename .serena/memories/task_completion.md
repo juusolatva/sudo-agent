@@ -7,4 +7,4 @@ Run in order, fix failures:
 4. `cargo build`
 
 - If the change touches sign/prompt/key-loading paths, note that the manual e2e check in `mem:suggested_commands` is still required (can't be automated; tell the user rather than claiming it was verified).
-- Do not commit unless asked.
+- Never commit; leave changes for the user.

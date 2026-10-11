@@ -30,7 +30,8 @@ sudo-agent ── holds the decrypted key     sudo
 
 - **Passphrase once.** It's asked for once, when the key is loaded. After
   that, each signature only needs a `y`.
-- **TTL inside the agent.** Keys are dropped (and zeroized) when their time
+- **TTL inside the agent.** A key's TTL starts when it's loaded (once its
+  passphrase is accepted). Keys are dropped (and zeroized) when their time
   is up. The clock keeps counting while the machine is suspended.
 - **Every signature is approved.** The prompt shows which local process is
   asking and which key it wants, so a request you didn't start (for example
@@ -113,7 +114,8 @@ and distributions differ. `sudo-agent` never edits system configuration.
 Keep a root shell open while you change any of this.
 
 1. Install `pam_ssh_agent_auth`: `libpam-ssh-agent-auth` on Debian/Ubuntu,
-   `pam_ssh_agent_auth` on openSUSE. Tested with 0.10.4.
+   `pam_ssh_agent_auth` on openSUSE. Tested with 0.10.4 (openSUSE) and
+   0.10.3 (Debian).
 2. Put your public key in a root-owned file that you can't write to, e.g.
    `/etc/security/authorized_keys`. If the file is user-writable, anyone
    who gets your account can add a key and become root.

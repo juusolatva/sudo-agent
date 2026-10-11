@@ -14,7 +14,7 @@ Guidance and repository conventions for AI coding agents working on `sudo-agent`
   - Rust 2024 edition (`ssh-agent-lib` 0.6.0, `ssh-key` 0.6.7, `tokio` 1.x, `async-trait`).
   - Socket listener binds to `$XDG_RUNTIME_DIR/sudo-agent/agent.sock`, falling back to `${XDG_CACHE_HOME:-~/.cache}/sudo-agent/agent-<hostname>.sock`, or `--socket <path>` (see `src/socket.rs`). Directory is `0700` (verified), socket `0600`; a stale socket is removed only if nothing answers on it. `socket::bind` returns a `SocketFile` that removes the socket on drop (if the file is still the one it bound).
   - Shutdown: SIGINT/SIGTERM/SIGHUP end `run()` cleanly (keys cleared, socket removed). SIGINT while an approval prompt is open only denies it (`TerminalPrompter::interrupt()`); a second one within `STOP_WINDOW` (2 s) stops the agent anyway. The handlers are installed only after key loading, so Ctrl-C during passphrase entry keeps the default action, because echo is off at that point. `main` builds the runtime by hand and calls `shutdown_background()`, so exit never waits on a prompt blocked reading the terminal.
-  - Keys are loaded at startup via `--key <PATH>` (repeatable) and `--ttl <DURATION>` (default `15m`, at most `--max-ttl`, default `8h`; a longer `--ttl` is a startup error), parsed with `clap`; encrypted keys prompt for the passphrase (3 attempts, empty aborts). See `src/keys.rs`.
+  - Keys are loaded at startup via `--key <PATH>` (repeatable) and `--ttl <DURATION>` (default `15m`, at most `--max-ttl`, default `8h`; a longer `--ttl` is a startup error), parsed with `clap`; encrypted keys prompt for the passphrase (3 attempts, empty aborts). Each key's TTL starts when it is decrypted, so with several `--key`s the deadlines differ. See `src/keys.rs`.
   - `KeyEntry` holds the decrypted `ssh_key::PrivateKey` (zeroized on drop by `ssh-key`) and an `expires_at` deadline on `CLOCK_BOOTTIME` (`keys::now()`), so suspend time counts against the TTL. Do not use `Instant` for TTLs (`CLOCK_MONOTONIC` pauses during suspend).
   - A background reaper drops expired keys every second; `request_identities()` also filters them.
   - `sign()` (`src/agent.rs`) looks up the requested key and checks its TTL under the lock, releases the lock, asks `Prompter::confirm()` (prompt errors count as denial), then re-locks and re-checks expiry before signing. Unknown/expired keys and unsupported requests are refused *before* prompting. Every approval/refusal is logged to stderr.
@@ -76,10 +76,10 @@ Work on this project happens on two kinds of machine, and an agent must know whi
 ## Project Structure
 
 - `Cargo.toml`: Package definition and dependencies (`ssh-agent-lib`, `ssh-key`, `tokio`, `async-trait`, `clap`, `libc`, `rpassword`, `signature`, `tokio-util` (`CancellationToken`), `zeroize`; dev: `tempfile`; `ssh-key` with `crypto` + `encryption`).
-- `src/main.rs`: Entry point: CLI arguments, startup key loading, the expiry reaper, and the listener loop.
-- `src/agent.rs`: `SudoAgent` (per-connection `Agent` factory) and `Connection` (implements `Session`: identities + approval-gated `sign()`), peer identification, and prompt sanitizing.
+- `src/main.rs`: Entry point: CLI arguments, startup key loading, the expiry reaper, signal handling (Ctrl-C denies an open prompt), and the listener loop.
+- `src/agent.rs`: `SudoAgent` (per-connection `Agent` factory) and `Connection` (implements `Session`: identities + approval-gated `sign()`, withdrawing the prompt on client hang-up or key expiry), peer identification, and prompt sanitizing.
 - `src/keys.rs`: `KeyEntry`, the `CLOCK_BOOTTIME` clock, key loading/decryption, expiry purging, and TTL parsing/formatting.
-- `src/prompt.rs`: `Prompter` trait (secret input + yes/no confirm) and the `/dev/tty` `TerminalPrompter` backend. Prompts are serialized; approval requires typed `y`/`yes` + Enter and discards type-ahead first.
+- `src/prompt.rs`: `Prompter` trait (secret input + yes/no confirm) and the `/dev/tty` `TerminalPrompter` backend. Prompts are serialized; approval requires typed `y`/`yes` + Enter and discards type-ahead first. `confirm()` is cancellable (`CancellationToken`, a wake pipe polled next to the tty); `TerminalPrompter::interrupt()` serves Ctrl-C.
 - `src/socket.rs`: Socket path selection (XDG runtime dir with cache-dir fallback), private-directory checks, stale-socket handling, and binding.
 - `docs/manual-e2e.md`: Manual `pam_ssh_agent_auth` end-to-end test procedure (laptop agent ↔ forwarded server `sudo`).
 - `TODO.md`: Detailed roadmap (Now, Next, Someday) and in-depth rationales for core design decisions.
@@ -106,12 +106,15 @@ cargo fmt --check
 cargo fmt
 ```
 
+- **After `cargo publish` / `cargo package`** (even `--dry-run`), run `cargo clean -p sudo-agent`. Packaging rewrites the dev binary's fingerprint to track `target/package/…/src`, after which `cargo build` silently reuses a stale `target/debug/sudo-agent` (tests are unaffected, so it looks like code passes tests but fails when run).
+- **SonarQube Cloud** analyses pushed `main` (public project `juusolatva_sudo-agent`). Open issues: `curl -s 'https://sonarcloud.io/api/issues/search?componentKeys=juusolatva_sudo-agent&resolved=false'`.
+
 ## Coding Conventions & Guidelines
 
 - **Rust Edition & Idioms**: Target Rust 2024 edition. Use idiomatic Rust error handling, integrating with `ssh_agent_lib::error::AgentError`.
-- **Async Runtime**: Built on `tokio` (multi-threaded runtime). `SudoAgent` implements `ssh_agent_lib::agent::Agent<UnixListener>`; `listen()` calls its `new_session()` for each accepted socket, which returns a `Connection` (the `Session`) sharing the key store and prompter. `SudoAgent` must not implement `Session` itself, or it would collide with `ssh-agent-lib`'s clone-per-connection blanket impl.
+- **Async Runtime**: Built on `tokio` (multi-threaded runtime). No blocking file I/O inside `async fn`s: use `tokio::fs` or `spawn_blocking` (SonarQube rule `rust:S7493`). `SudoAgent` implements `ssh_agent_lib::agent::Agent<UnixListener>`; `listen()` calls its `new_session()` for each accepted socket, which returns a `Connection` (the `Session`) sharing the key store and prompter. `SudoAgent` must not implement `Session` itself, or it would collide with `ssh-agent-lib`'s clone-per-connection blanket impl.
 - **Concurrency & Locking**: Keys in `SudoAgent` are guarded by an `Arc<Mutex<Vec<KeyEntry>>>`. Keep mutex lock guards scoped as tightly as possible; never hold locks across async points or while waiting for user interaction/prompt approval. The one deliberate exception is `SudoAgent::requests` (a fair `tokio::sync::Mutex<()>`), held for a whole `sign()` so requests are served one at a time in arrival order; it guards no data, only the user's attention.
 - **Terminal output**: Anything printed while requests are served goes through the `log!` macro (`src/main.rs`), not `eprintln!`: it writes the whole line in one `write()`, so it can't split a prompt (which is also written in one `write()`). `eprintln!` is fine before listening starts (key loading) and for the final error in `main`.
 - **Testing**: Unit tests live next to the code (`#[cfg(test)] mod tests`). Never commit private keys as fixtures: generate them at test time (`PrivateKey::random(&mut OsRng, …)`) into a `tempfile::tempdir()`. Generating RSA keys in debug builds is slow; test RSA-specific logic without a real RSA key (see `agent::tests::rsa_needs_sha512_flag`).
 - **Secret scanning**: The user's pre-commit hook runs `betterleaks` and should stay strict. Silence a false positive with an inline marker on the flagged line, `# betterleaks:allow (<reason>)` (see `rpassword` in `Cargo.toml`), rather than loosening the scanner.
-- **Git & Commits**: Never commit changes automatically unless explicitly requested by the user.
+- **Git & Commits**: Never commit. The user makes all commits; a request to bump the version or publish is not permission to commit. Leave changes in the working tree and say they're ready.

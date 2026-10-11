@@ -5,5 +5,7 @@
 - Runtime output uses `log!` (single `write()` per line), not `eprintln!`, so log lines can't split prompts on the shared terminal.
 - Errors: return `AgentError` from `Session` methods; idiomatic `?` propagation; avoid new `unwrap()` outside lock poisoning.
 - Prompt code goes behind a backend-agnostic abstraction (secret input + yes/no confirm); callers must not depend on the terminal backend directly.
+- Every `Prompter::confirm()` backend must honour its `CancellationToken`: withdraw the question, *then* return `Err` (so the caller's log line follows the prompt).
+- No blocking file I/O inside `async fn`: `tokio::fs` or `spawn_blocking` (SonarQube `rust:S7493`).
 - Formatting: default `rustfmt` (no rustfmt.toml/clippy.toml); clippy defaults.
-- Git: never commit unless the user explicitly asks.
+- Git: never commit, not even for version bumps/publishing; the user makes all commits.
