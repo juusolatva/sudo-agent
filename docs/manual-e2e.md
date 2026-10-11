@@ -87,7 +87,10 @@ every `sudo` authenticates anyway.)
 | 2 | `sudo -k; sudo -v`, answer **n** (or Enter) | `Refused signature request …: denied` | Falls back to the password prompt (or fails if there's no fallback) |
 | 3 | Restart the agent with `--ttl 1m` (no need to reconnect: the forwarded channel reconnects to the socket path for every request), wait > 1 min, then `sudo -k; sudo -v` | `Key expired and was removed: …`, **no** prompt | `ssh-add -l` shows no identities; sudo falls back to the password |
 | 4 | Two sessions run `sudo -k; sudo -v` at the same time | Prompts appear one after another; each request's `Approved`/`Refused` line comes before the next prompt, nothing interleaved | Each succeeds once approved |
-| 5 | Stop the agent (Ctrl-C), then `sudo -k; sudo -v` | Nothing (agent is gone) | Password prompt: proves `sudo` really authenticates through `sudo-agent`, not some other forwarded agent |
+| 6 | `sudo -k; sudo -v`, then, while the laptop prompt is open, end the SSH connection with the `~.` escape (Enter, `~`, `.`) in the server session | The prompt line ends and `Refused …: client disconnected` follows at once; after reconnecting, the next prompt works normally | Connection closed (Ctrl-C would not do: `sudo` ignores it while `pam_ssh_agent_auth` waits) |
+| 7 | `sudo -k; sudo -v`, press Ctrl-C at the **laptop** prompt | `^C`, then `Refused …: not approved: cancelled with Ctrl-C`; the agent keeps running (a second Ctrl-C within 2 s would stop it) | Falls back to the password prompt |
+| 8 | Restart the agent with `--ttl 1m`, run `sudo -k; sudo -v` when ~10 s are left and don't answer | At expiry the prompt line ends, then `Refused …: key expired while waiting for approval`, then `Key expired and was removed: …`, each on its own line | Falls back to the password prompt |
+| 5 | Stop the agent (Ctrl-C with no prompt open), then `sudo -k; sudo -v` | Nothing (agent is gone) | Password prompt: proves `sudo` really authenticates through `sudo-agent`, not some other forwarded agent |
 
 Report: the pam_ssh_agent_auth version, key type, the exact prompt text, and
 any `Refused …` lines from the laptop.
@@ -114,8 +117,22 @@ any `Refused …` lines from the laptop.
   - Rechecked on a pty with two concurrent `ssh-keygen -Y sign` requests;
     still to be re-run against a server.
 
-**Not yet tried:** `server-b` (Debian, `libpam-ssh-agent-auth` 0.10.3).
-Expected to behave the same; worth one case 1 run.
+**2026-10-11, `server-a` and `server-b`** (`pam_ssh_agent_auth` 0.10.4-3.7
+on openSUSE Tumbleweed, `libpam-ssh-agent-auth` 0.10.3-11 on Debian; build
+with prompt cancellation and `--max-ttl`):
+
+- Cases 1, 2, 3, 4, 5 and 7 passed on both, as did stopping and restarting
+  the agent. Case 4's output is no longer garbled.
+- Case 6 as first written (Ctrl-C on the remote `sudo`) can't happen: `sudo`
+  ignores Ctrl-C while `pam_ssh_agent_auth` waits for the agent; only the
+  password prompt after a denial can be interrupted. Rewritten to close the
+  connection with `~.` instead.
+- A prompt shown just before its key expired stayed up until answered, and
+  the reaper's `Key expired and was removed` landed inside its line. Fixed:
+  the prompt is now withdrawn at expiry (case 8).
+- Re-test after those fixes: case 6 (closing the SSH connection) logged
+  `client disconnected` at once; case 8 withdrew the prompt at expiry and
+  `sudo` fell back to the password prompt by itself. Passed.
 
 ## Troubleshooting
 

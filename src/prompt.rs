@@ -5,12 +5,13 @@
 //! backend and must keep working once GUI/notification backends exist.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, ErrorKind, Read, Write};
+use std::io::{self, ErrorKind, PipeReader, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
 use crate::keys;
@@ -23,7 +24,12 @@ pub trait Prompter: Send + Sync {
     /// Asks a yes/no question. Anything but an explicit "yes" is `false`;
     /// callers must also treat `Err` as a denial. A backend that gives up
     /// waiting returns an `ErrorKind::TimedOut` error saying so.
-    async fn confirm(&self, message: &str) -> io::Result<bool>;
+    ///
+    /// Once `cancel` fires (e.g. the requesting client went away), the
+    /// backend withdraws the question and returns an error. It must not
+    /// return before the question is gone, so nothing printed afterwards
+    /// lands inside it.
+    async fn confirm(&self, message: &str, cancel: &CancellationToken) -> io::Result<bool>;
 }
 
 /// Prompts on the controlling terminal (`/dev/tty`), one prompt at a time.
@@ -33,6 +39,9 @@ pub struct TerminalPrompter {
     // terminal stays owned by whichever prompt is actually reading from it,
     // even if the request that started it has gone away.
     tty: Arc<Mutex<()>>,
+    /// Cancels the approval prompt currently on the terminal, if any; see
+    /// [`interrupt`](Self::interrupt). Set and cleared while holding `tty`.
+    open: Arc<Mutex<Option<CancellationToken>>>,
     /// How long an approval waits for an answer before it counts as denied.
     /// Passphrase prompts (startup only) don't time out.
     approval_timeout: Duration,
@@ -42,8 +51,21 @@ impl TerminalPrompter {
     pub fn new(approval_timeout: Duration) -> Self {
         Self {
             tty: Arc::default(),
+            open: Arc::default(),
             approval_timeout,
         }
+    }
+
+    /// Withdraws the approval prompt on the terminal, if one is open, which
+    /// denies that request. Returns whether there was one. Used for Ctrl-C,
+    /// which should answer the prompt rather than stop the agent.
+    pub fn interrupt(&self) -> bool {
+        let open = self
+            .open
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        open.inspect(CancellationToken::cancel).is_some()
     }
 
     async fn with_tty<T, F>(&self, f: F) -> io::Result<T>
@@ -69,51 +91,106 @@ impl Prompter for TerminalPrompter {
             .await
     }
 
-    async fn confirm(&self, message: &str) -> io::Result<bool> {
+    async fn confirm(&self, message: &str, cancel: &CancellationToken) -> io::Result<bool> {
+        if cancel.is_cancelled() {
+            return Err(io::Error::other("cancelled"));
+        }
+        // Fires on `cancel`, or on Ctrl-C while this prompt is open.
+        let stop = cancel.child_token();
+        // The prompt polls `wake` alongside the terminal; dropping `wake_up`
+        // hangs up the pipe, which ends the wait. This also happens if this
+        // future is dropped.
+        let (wake, wake_up) = io::pipe()?;
         let message = message.to_owned();
         let timeout = self.approval_timeout;
-        self.with_tty(move || {
-            let tty = OpenOptions::new().read(true).write(true).open("/dev/tty")?;
-            discard_pending_input(&tty)?;
-            let deadline = keys::now() + timeout;
-            let wait = || wait_readable(tty.as_fd(), deadline);
-            ask_yes_no(&mut &tty, &mut &tty, &message, wait)?.ok_or_else(|| {
-                io::Error::new(
-                    ErrorKind::TimedOut,
-                    format!("no answer within {}", keys::format_duration(timeout)),
-                )
-            })
+        let open = Arc::clone(&self.open);
+        let interruptible = stop.clone();
+        let prompt = self.with_tty(move || {
+            *open.lock().unwrap_or_else(PoisonError::into_inner) = Some(interruptible);
+            let answer = ask_on_tty(&message, &wake, timeout);
+            open.lock().unwrap_or_else(PoisonError::into_inner).take();
+            answer
+        });
+        tokio::pin!(prompt);
+        let answer = tokio::select! {
+            answer = &mut prompt => answer?,
+            () = stop.cancelled() => {
+                drop(wake_up);
+                // Let the prompt finish its line and release the terminal.
+                prompt.await?
+            }
+        };
+        answer.map_err(|no_answer| match no_answer {
+            NoAnswer::TimedOut => io::Error::new(
+                ErrorKind::TimedOut,
+                format!("no answer within {}", keys::format_duration(timeout)),
+            ),
+            NoAnswer::Cancelled if cancel.is_cancelled() => io::Error::other("cancelled"),
+            NoAnswer::Cancelled => io::Error::other("cancelled with Ctrl-C"),
         })
-        .await
     }
 }
 
+/// Why a prompt ended without an answer.
+#[derive(Debug, PartialEq)]
+enum NoAnswer {
+    TimedOut,
+    /// `wake` was hung up: the prompt was withdrawn.
+    Cancelled,
+}
+
+/// One approval prompt on `/dev/tty`, run while holding the terminal.
+fn ask_on_tty(
+    message: &str,
+    wake: &PipeReader,
+    timeout: Duration,
+) -> io::Result<Result<bool, NoAnswer>> {
+    let tty = OpenOptions::new().read(true).write(true).open("/dev/tty")?;
+    discard_pending_input(&tty)?;
+    let deadline = keys::now() + timeout;
+    let wait = || wait_readable(tty.as_fd(), wake.as_fd(), deadline);
+    ask_yes_no(&mut &tty, &mut &tty, message, wait)
+}
+
 /// Waits until `fd` has input to read (in canonical mode: a complete line),
-/// or `deadline` on the [`keys::now`] clock passes. Returning lets the prompt
-/// give up the terminal instead of leaving a read behind that would swallow
-/// the answer meant for the next prompt.
-fn wait_readable(fd: BorrowedFd<'_>, deadline: Duration) -> io::Result<bool> {
+/// `deadline` on the [`keys::now`] clock passes, or `wake` hangs up (or
+/// becomes readable). Returning lets the prompt give up the terminal instead
+/// of leaving a read behind that would swallow the answer meant for the next
+/// prompt.
+fn wait_readable(
+    fd: BorrowedFd<'_>,
+    wake: BorrowedFd<'_>,
+    deadline: Duration,
+) -> io::Result<Result<(), NoAnswer>> {
     loop {
         let now = keys::now();
         if now >= deadline {
-            return Ok(false);
+            return Ok(Err(NoAnswer::TimedOut));
         }
         // `poll` sleeps on CLOCK_MONOTONIC, which stops during suspend; waking
         // at least every second re-checks the deadline on the suspend-aware
         // clock, like the key TTL.
         let slice = (deadline - now).min(Duration::from_secs(1));
-        let mut pollfd = libc::pollfd {
+        let mut pollfds = [fd, wake].map(|fd| libc::pollfd {
             fd: fd.as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
+        });
+        // SAFETY: `pollfds` is a valid array of its length, and both
+        // descriptors are open for as long as they are borrowed.
+        let rc = unsafe {
+            libc::poll(
+                pollfds.as_mut_ptr(),
+                pollfds.len() as libc::nfds_t,
+                slice.as_millis() as libc::c_int,
+            )
         };
-        // SAFETY: `pollfd` is a valid array of one entry, and `fd` is open for
-        // as long as it is borrowed.
-        let rc = unsafe { libc::poll(&mut pollfd, 1, slice.as_millis() as libc::c_int) };
         match rc {
             0 => continue,
+            // Being withdrawn wins over an answer typed at the same moment.
+            1.. if pollfds[1].revents != 0 => return Ok(Err(NoAnswer::Cancelled)),
             // Readable, or hung up/errored: either way the read will tell.
-            1.. => return Ok(true),
+            1.. => return Ok(Ok(())),
             _ => {
                 let err = io::Error::last_os_error();
                 if err.kind() != ErrorKind::Interrupted {
@@ -135,21 +212,20 @@ fn discard_pending_input(tty: &File) -> io::Result<()> {
 }
 
 /// Requires a typed "y"/"yes" plus Enter; a lone stray keypress can't approve.
-/// `wait` blocks until an answer can be read, returning `false` once the time
-/// to answer has run out, which yields `None`.
+/// `wait` blocks until an answer can be read, or says why there won't be one.
 fn ask_yes_no(
     input: &mut impl Read,
     output: &mut impl Write,
     message: &str,
-    wait: impl FnOnce() -> io::Result<bool>,
-) -> io::Result<Option<bool>> {
+    wait: impl FnOnce() -> io::Result<Result<(), NoAnswer>>,
+) -> io::Result<Result<bool, NoAnswer>> {
     // One write, so a concurrently logged line can't land inside the prompt.
     output.write_all(format!("{message} [y/N] ").as_bytes())?;
     output.flush()?;
 
-    if !wait()? {
+    if let Err(no_answer) = wait()? {
         output.write_all(b"\n")?; // finish the prompt line before the log
-        return Ok(None);
+        return Ok(Err(no_answer));
     }
     // A single read: a terminal in canonical mode returns at most one line,
     // and a second read could block past the deadline. Anything too long for
@@ -158,10 +234,10 @@ fn ask_yes_no(
     let n = input.read(&mut answer)?;
     if n == 0 {
         output.write_all(b"\n")?; // EOF (Ctrl-D): finish the prompt line, deny
-        return Ok(Some(false));
+        return Ok(Ok(false));
     }
     let answer = String::from_utf8_lossy(&answer[..n]);
-    Ok(Some(matches!(
+    Ok(Ok(matches!(
         answer.trim().to_ascii_lowercase().as_str(),
         "y" | "yes"
     )))
@@ -174,9 +250,11 @@ mod tests {
 
     fn answer(input: &str) -> bool {
         let mut output = Vec::new();
-        let approved = ask_yes_no(&mut Cursor::new(input), &mut output, "Allow?", || Ok(true))
-            .unwrap()
-            .expect("answered in time");
+        let approved = ask_yes_no(&mut Cursor::new(input), &mut output, "Allow?", || {
+            Ok(Ok(()))
+        })
+        .unwrap()
+        .expect("answered in time");
         assert!(
             String::from_utf8(output)
                 .unwrap()
@@ -187,19 +265,47 @@ mod tests {
 
     #[test]
     fn no_answer_in_time_is_not_an_answer() {
-        let mut output = Vec::new();
-        let result = ask_yes_no(&mut Cursor::new("y\n"), &mut output, "Allow?", || Ok(false));
-        assert_eq!(result.unwrap(), None);
-        assert_eq!(output, b"Allow? [y/N] \n");
+        for why in [NoAnswer::TimedOut, NoAnswer::Cancelled] {
+            let mut output = Vec::new();
+            let result = ask_yes_no(&mut Cursor::new("y\n"), &mut output, "Allow?", || {
+                Ok(Err(why))
+            });
+            assert!(result.unwrap().is_err());
+            assert_eq!(output, b"Allow? [y/N] \n");
+        }
     }
 
     #[test]
     fn wait_readable_honours_deadline() {
         let (reader, mut writer) = io::pipe().unwrap();
+        let (wake, _wake_up) = io::pipe().unwrap();
         let soon = || keys::now() + Duration::from_millis(50);
-        assert!(!wait_readable(reader.as_fd(), soon()).unwrap());
+        let wait = || wait_readable(reader.as_fd(), wake.as_fd(), soon()).unwrap();
+        assert_eq!(wait(), Err(NoAnswer::TimedOut));
         writer.write_all(b"y\n").unwrap();
-        assert!(wait_readable(reader.as_fd(), soon()).unwrap());
+        assert_eq!(wait(), Ok(()));
+    }
+
+    #[test]
+    fn wait_readable_gives_up_when_woken() {
+        let later = keys::now() + Duration::from_secs(60);
+        let (reader, _writer) = io::pipe().unwrap();
+        let (wake, wake_up) = io::pipe().unwrap();
+        let waiter = std::thread::spawn(move || wait_readable(reader.as_fd(), wake.as_fd(), later));
+        std::thread::sleep(Duration::from_millis(20));
+        drop(wake_up);
+        assert_eq!(waiter.join().unwrap().unwrap(), Err(NoAnswer::Cancelled));
+    }
+
+    #[test]
+    fn withdrawn_prompt_ignores_waiting_answer() {
+        let later = keys::now() + Duration::from_secs(60);
+        let (reader, mut writer) = io::pipe().unwrap();
+        writer.write_all(b"y\n").unwrap();
+        let (wake, wake_up) = io::pipe().unwrap();
+        drop(wake_up);
+        let result = wait_readable(reader.as_fd(), wake.as_fd(), later).unwrap();
+        assert_eq!(result, Err(NoAnswer::Cancelled));
     }
 
     #[test]
@@ -278,7 +384,7 @@ pub mod testing {
         }
 
         /// Denies once the script runs out, like a real prompt would on EOF.
-        async fn confirm(&self, message: &str) -> io::Result<bool> {
+        async fn confirm(&self, message: &str, _: &CancellationToken) -> io::Result<bool> {
             self.asked.lock().unwrap().push(message.to_owned());
             Ok(self.confirms.lock().unwrap().pop_front().unwrap_or(false))
         }

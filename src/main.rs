@@ -21,7 +21,8 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use clap::Parser;
+use clap::error::ErrorKind;
+use clap::{CommandFactory, Parser};
 use ssh_agent_lib::agent::listen;
 use ssh_agent_lib::error::AgentError;
 use ssh_key::HashAlg;
@@ -44,6 +45,10 @@ struct Args {
     #[arg(long, value_name = "DURATION", default_value = "15m", value_parser = keys::parse_duration)]
     ttl: Duration,
 
+    /// Longest TTL a key may have; a longer --ttl is an error.
+    #[arg(long, value_name = "DURATION", default_value = "8h", value_parser = keys::parse_duration)]
+    max_ttl: Duration,
+
     /// How long an approval prompt waits for an answer before denying.
     #[arg(long, value_name = "DURATION", default_value = "2m", value_parser = keys::parse_duration)]
     approval_timeout: Duration,
@@ -56,11 +61,17 @@ struct Args {
 /// Drops keys as their TTL runs out, so expired key material doesn't linger
 /// in memory.
 fn spawn_expiry_reaper(store: Arc<Mutex<Vec<KeyEntry>>>) {
+    // A key is unusable from its deadline on (every lookup checks expiry), so
+    // removing it a moment later costs nothing. That moment lets an approval
+    // prompt for the key be withdrawn first, so this log line doesn't land
+    // inside the prompt's line.
+    const DELAY: Duration = Duration::from_millis(250);
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         loop {
             tick.tick().await;
-            for comment in keys::purge_expired(&store, keys::now()) {
+            let now = keys::now().saturating_sub(DELAY);
+            for comment in keys::purge_expired(&store, now) {
                 log!("Key expired and was removed: {comment}");
             }
         }
@@ -80,7 +91,8 @@ async fn run(args: Args) -> Result<(), AgentError> {
 
     // One prompter for passphrases now and approvals later, so they share the
     // terminal one prompt at a time.
-    let prompter: Arc<dyn Prompter> = Arc::new(TerminalPrompter::new(args.approval_timeout));
+    let terminal = Arc::new(TerminalPrompter::new(args.approval_timeout));
+    let prompter: Arc<dyn Prompter> = terminal.clone();
     let mut loaded: Vec<KeyEntry> = Vec::new();
     for path in &args.keys {
         let entry = keys::load(path, args.ttl, prompter.as_ref()).await?;
@@ -103,7 +115,7 @@ async fn run(args: Args) -> Result<(), AgentError> {
 
     // Installed only now: during passphrase entry the terminal has echo off,
     // and the default SIGINT action is the safer way out of that.
-    let shutdown = shutdown_signal()?;
+    let shutdown = shutdown_signal(move || terminal.interrupt())?;
 
     let store = Arc::new(Mutex::new(loaded));
     spawn_expiry_reaper(Arc::clone(&store));
@@ -129,21 +141,52 @@ async fn run(args: Args) -> Result<(), AgentError> {
 
 /// Resolves on the first signal that should stop the agent cleanly: SIGINT
 /// (Ctrl-C), SIGTERM, or SIGHUP (its terminal went away).
-fn shutdown_signal() -> io::Result<impl Future<Output = &'static str>> {
-    let mut interrupt = signal(SignalKind::interrupt())?;
+///
+/// Ctrl-C at an open approval prompt only denies that request (`interrupt`
+/// returns whether there was one to deny). Pressing it again within
+/// [`STOP_WINDOW`] stops the agent anyway, so a stream of requests can't
+/// keep it running.
+fn shutdown_signal(
+    interrupt: impl Fn() -> bool + Send + 'static,
+) -> io::Result<impl Future<Output = &'static str>> {
+    let mut interrupt_signal = signal(SignalKind::interrupt())?;
     let mut terminate = signal(SignalKind::terminate())?;
     let mut hangup = signal(SignalKind::hangup())?;
     Ok(async move {
-        tokio::select! {
-            _ = interrupt.recv() => "SIGINT",
-            _ = terminate.recv() => "SIGTERM",
-            _ = hangup.recv() => "SIGHUP",
+        // When a Ctrl-C last denied a prompt instead of stopping the agent.
+        let mut denied_at: Option<tokio::time::Instant> = None;
+        loop {
+            tokio::select! {
+                _ = interrupt_signal.recv() => {
+                    let again = denied_at.is_some_and(|at| at.elapsed() < STOP_WINDOW);
+                    if again || !interrupt() {
+                        return "SIGINT";
+                    }
+                    denied_at = Some(tokio::time::Instant::now());
+                }
+                _ = terminate.recv() => return "SIGTERM",
+                _ = hangup.recv() => return "SIGHUP",
+            }
         }
     })
 }
 
+/// How soon a second Ctrl-C must follow one that denied a prompt to stop the
+/// agent anyway.
+const STOP_WINDOW: Duration = Duration::from_secs(2);
+
 fn main() -> ExitCode {
     let args = Args::parse();
+    if args.ttl > args.max_ttl {
+        let message = format!(
+            "--ttl {} is longer than --max-ttl {}",
+            keys::format_duration(args.ttl),
+            keys::format_duration(args.max_ttl)
+        );
+        Args::command()
+            .error(ErrorKind::ArgumentConflict, message)
+            .exit();
+    }
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
         Err(e) => {

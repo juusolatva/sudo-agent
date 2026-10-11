@@ -33,15 +33,23 @@ test, but they should be fixed before calling the core loop done:
       next request. 2 minutes is a compromise for the foreground prompt.
       Revisit per backend once the others exist: pinentry 30–60 s, the
       `sudo-agent approve` client maybe up to 5 min.
-- [ ] **Stale prompts**: if the client gives up (e.g. Ctrl-C on the remote
-      `sudo`), its prompt stays on the terminal until answered or timed out.
-      Answering it is harmless (the signature goes nowhere), but it should
-      be cancelled as soon as the client disconnects.
-- [ ] **Ctrl-C at the agent's own prompt shuts the agent down** (cleanly
-      now: keys dropped, socket removed, the waiting client gets a
-      failure). Open question: should Ctrl-C at a prompt deny just that
-      request instead? The prompt now waits with `poll()` and can give up,
-      which a cancel signal could reuse (also for stale prompts).
+- [x] **Stale prompts**: a prompt is withdrawn (via the `CancellationToken`
+      passed to `Prompter::confirm()`) when it can no longer lead anywhere:
+      - The client goes away: `sign()` watches the client socket (a
+        duplicated fd under `AsyncFd`) for a hang-up, e.g. the SSH connection
+        closing. A request still queued just leaves the queue. Ctrl-C on the
+        remote `sudo` does *not* trigger this: `sudo` ignores it while
+        `pam_ssh_agent_auth` waits for the agent.
+      - The key expires (found in testing 2026-10-11: the prompt stayed until
+        answered, and `y` was refused anyway). The reaper removes keys 250 ms
+        after their deadline, so its log line follows the withdrawn prompt
+        instead of landing inside it.
+      Verified against a server 2026-10-11 (e2e cases 6 and 8).
+- [x] **Ctrl-C at the agent's own prompt** denies just that request (the
+      same cancellation path). Ctrl-C with no prompt open, or a second one
+      within 2 s, still stops the agent, so a stream of requests can't keep
+      it from stopping. Under the planned daemon this only applies to the
+      foreground backup prompt.
 - [x] **Socket removed on shutdown**: SIGINT/SIGTERM/SIGHUP and startup
       failures remove it (only if the file is still the one this process
       bound). The one exception is a kill during passphrase entry, where the
@@ -104,8 +112,18 @@ needs an answer. Design, agreed 2026-10-07:
   terminal to ask for a passphrase, so `ssh-add` (or `sudo-agent add`)
   decrypts the key and sends it over `control.sock`. The daemon never prompts
   for passphrases. `ssh-add -t` lifetimes become the TTL, still tracked and
-  enforced inside the agent (invariant 1), optionally capped by a configured
-  maximum.
+  enforced inside the agent (invariant 1), capped by `--max-ttl`.
+
+  **TTL cap policy** (decided 2026-10-11):
+  - A lifetime above the cap is **clamped** to it, and the agent logs
+    `lifetime 12h capped to 8h`. Refusing would leave `ssh-add` with only
+    "Could not add identity", because the protocol can't carry a reason.
+    `sudo-agent status` shows the real time left.
+  - A key added with **no lifetime** (`ssh-add` without `-t`) gets the
+    default TTL (`--ttl`, 15m), never "until removed".
+  - The cap defaults to **8h** (`--max-ttl`, already enforced on `--ttl`).
+    A `--ttl` above it is a startup error rather than a clamp: the user
+    typed it and the agent can say why.
 - **Approvals are answered by pinentry (desktop popup) or by
   `sudo-agent approve` in any terminal.** Those two are the focus. Today's
   foreground mode, with its prompt on the daemon's own terminal, stays as a

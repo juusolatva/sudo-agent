@@ -64,12 +64,15 @@ sudo-agent --key ~/.ssh/id_ed25519
 |--------|---------|-|
 | `--key <PATH>` | (required) | OpenSSH private key to load; repeatable |
 | `--ttl <DURATION>` | `15m` | How long loaded keys stay usable (`90s`, `15m`, `8h`) |
+| `--max-ttl <DURATION>` | `8h` | Longest TTL a key may have; a longer `--ttl` is an error |
 | `--approval-timeout <DURATION>` | `2m` | How long a prompt waits before denying |
 | `--socket <PATH>` | `$XDG_RUNTIME_DIR/sudo-agent/agent.sock` | Falls back to `~/.cache/sudo-agent/agent-<hostname>.sock` |
 
 The agent runs in the foreground, and approval prompts appear in its
-terminal. Ctrl-C (or closing the terminal) stops it, drops the keys and
-removes the socket.
+terminal. Ctrl-C at a prompt denies that request; Ctrl-C otherwise (or twice
+within two seconds, or closing the terminal) stops the agent, drops the keys
+and removes the socket. A prompt is withdrawn if its client goes away (e.g.
+the SSH connection closes) or its key expires.
 
 Connect to a server, keeping your normal agent for the login and forwarding
 only `sudo-agent`:

@@ -1,7 +1,10 @@
 //! The SSH agent protocol side: listing identities and approving signatures.
 
 use std::fmt;
+use std::future;
+use std::os::fd::{AsFd, OwnedFd};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use signature::Signer;
@@ -11,13 +14,18 @@ use ssh_agent_lib::proto::message::Identity;
 use ssh_agent_lib::proto::{SignRequest, signature::RSA_SHA2_512};
 use ssh_key::public::KeyData;
 use ssh_key::{Algorithm, HashAlg, Signature};
+use tokio::io::Interest;
+use tokio::io::unix::AsyncFd;
 use tokio::net::{UnixListener, UnixStream};
+use tokio_util::sync::CancellationToken;
 
 use crate::keys::{self, KeyEntry};
 use crate::prompt::Prompter;
 
 /// Longest command line shown in an approval prompt, in characters.
 const MAX_COMMAND_CHARS: usize = 200;
+
+const KEY_EXPIRED_WHILE_WAITING: &str = "key expired while waiting for approval";
 
 /// Shared agent state; [`listen`](ssh_agent_lib::agent::listen) asks it for a
 /// fresh [`Connection`] per accepted socket.
@@ -66,12 +74,30 @@ impl SudoAgent {
     /// isn't held while the user decides, and the TTL may run out meanwhile.
     fn sign_with(&self, key_data: &KeyData, data: &[u8]) -> Result<Signature, String> {
         let keys = self.keys.lock().unwrap();
-        let entry =
-            find(&keys, key_data, keys::now()).ok_or("key expired while waiting for approval")?;
+        let entry = find(&keys, key_data, keys::now()).ok_or(KEY_EXPIRED_WHILE_WAITING)?;
         entry
             .private_key
             .try_sign(data)
             .map_err(|e| format!("signing failed: {e}"))
+    }
+
+    /// Resolves once the key can no longer be used: expired, or no longer
+    /// loaded.
+    async fn key_gone(&self, key_data: &KeyData) {
+        loop {
+            let left = {
+                let keys = self.keys.lock().unwrap();
+                let now = keys::now();
+                match find(&keys, key_data, now) {
+                    Some(entry) => entry.expires_at - now,
+                    None => return,
+                }
+            };
+            // `sleep` runs on CLOCK_MONOTONIC, which stops during suspend;
+            // sleeping at most a second at a time re-checks the TTL on the
+            // suspend-aware clock soon after waking.
+            tokio::time::sleep(left.min(Duration::from_secs(1))).await;
+        }
     }
 }
 
@@ -80,6 +106,7 @@ impl Agent<UnixListener> for SudoAgent {
         Connection {
             agent: self.clone(),
             peer: Peer::of(socket),
+            client: socket.as_fd().try_clone_to_owned().ok(),
         }
     }
 }
@@ -88,6 +115,10 @@ impl Agent<UnixListener> for SudoAgent {
 struct Connection {
     agent: SudoAgent,
     peer: Peer,
+    /// A duplicate of the client's socket, watched for the client hanging up
+    /// while its request waits; see [`hung_up`]. `None` if it couldn't be
+    /// duplicated, which just means a stale request waits until answered.
+    client: Option<OwnedFd>,
 }
 
 impl Connection {
@@ -118,7 +149,15 @@ impl Session for Connection {
     }
 
     async fn sign(&mut self, request: SignRequest) -> Result<Signature, AgentError> {
-        let _turn = self.agent.requests.lock().await;
+        // A client that goes away (e.g. its SSH connection closes) leaves the
+        // queue, or has its prompt withdrawn.
+        let hung_up = hung_up(self.client.as_ref());
+        tokio::pin!(hung_up);
+
+        let _turn = tokio::select! {
+            turn = self.agent.requests.lock() => turn,
+            () = &mut hung_up => return self.refuse("client disconnected"),
+        };
 
         let key_data = request.credential.key_data();
         let key = match self.agent.describe(key_data, request.flags) {
@@ -127,7 +166,26 @@ impl Session for Connection {
         };
 
         let message = format!("Signature request from {}\n  key: {key}\nAllow?", self.peer);
-        let approved = match self.agent.prompter.confirm(&message).await {
+        let cancel = CancellationToken::new();
+        let confirm = self.agent.prompter.confirm(&message, &cancel);
+        tokio::pin!(confirm);
+        let key_gone = self.agent.key_gone(key_data);
+        tokio::pin!(key_gone);
+        let answer = tokio::select! {
+            answer = &mut confirm => Ok(answer),
+            () = &mut hung_up => Err("client disconnected"),
+            () = &mut key_gone => Err(KEY_EXPIRED_WHILE_WAITING),
+        };
+        let answer = match answer {
+            Ok(answer) => answer,
+            Err(reason) => {
+                cancel.cancel();
+                // Returns once the prompt is gone, so the log follows it.
+                let _ = confirm.await;
+                return self.refuse(reason);
+            }
+        };
+        let approved = match answer {
             Ok(approved) => approved,
             // Timed out or the prompt failed: both count as a denial.
             Err(e) => return self.refuse(&format!("not approved: {e}")),
@@ -146,13 +204,31 @@ impl Session for Connection {
     }
 }
 
-fn find<'a>(
-    keys: &'a [KeyEntry],
-    key_data: &KeyData,
-    now: std::time::Duration,
-) -> Option<&'a KeyEntry> {
+fn find<'a>(keys: &'a [KeyEntry], key_data: &KeyData, now: Duration) -> Option<&'a KeyEntry> {
     keys.iter()
         .find(|k| !k.is_expired(now) && k.private_key.public_key().key_data() == key_data)
+}
+
+/// Resolves once the client has closed its end of the connection, or never if
+/// that can't be watched. Anything it sends meanwhile (a pipelined request)
+/// is left for the protocol loop to read.
+async fn hung_up(client: Option<&OwnedFd>) {
+    // Registered on our own duplicate of the socket, so the protocol loop's
+    // registration of the original is left alone.
+    let Some(socket) =
+        client.and_then(|fd| AsyncFd::with_interest(fd.as_fd(), Interest::READABLE).ok())
+    else {
+        return future::pending().await;
+    };
+    loop {
+        let Ok(mut ready) = socket.readable().await else {
+            return future::pending().await;
+        };
+        if ready.ready().is_read_closed() {
+            return;
+        }
+        ready.clear_ready();
+    }
 }
 
 /// `ssh-key` signs RSA only with SHA-512, so an RSA request must ask for
@@ -250,7 +326,7 @@ mod tests {
     use ssh_key::PrivateKey;
     use ssh_key::rand_core::OsRng;
     use std::io;
-    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
 
     const CHALLENGE: &[u8] = b"pam_ssh_agent_auth challenge";
 
@@ -275,6 +351,7 @@ mod tests {
         Connection {
             agent: SudoAgent::new(Arc::new(Mutex::new(keys)), prompter),
             peer: Peer::default(),
+            client: None,
         }
     }
 
@@ -336,7 +413,7 @@ mod tests {
         async fn passphrase(&self, _: &str) -> io::Result<zeroize::Zeroizing<String>> {
             unreachable!()
         }
-        async fn confirm(&self, _: &str) -> io::Result<bool> {
+        async fn confirm(&self, _: &str, _: &CancellationToken) -> io::Result<bool> {
             self.0.lock().unwrap()[0].expires_at = keys::now();
             Ok(true)
         }
@@ -351,6 +428,7 @@ mod tests {
         let mut conn = Connection {
             agent: SudoAgent::new(store, prompter),
             peer: Peer::default(),
+            client: None,
         };
 
         assert!(matches!(conn.sign(request).await, Err(AgentError::Failure)));
@@ -368,7 +446,7 @@ mod tests {
         async fn passphrase(&self, _: &str) -> io::Result<zeroize::Zeroizing<String>> {
             unreachable!()
         }
-        async fn confirm(&self, _: &str) -> io::Result<bool> {
+        async fn confirm(&self, _: &str, _: &CancellationToken) -> io::Result<bool> {
             use std::sync::atomic::Ordering::SeqCst;
             let open = self.open.fetch_add(1, SeqCst) + 1;
             self.max_open.fetch_max(open, SeqCst);
@@ -387,10 +465,12 @@ mod tests {
         let mut a = Connection {
             agent: agent.clone(),
             peer: Peer::default(),
+            client: None,
         };
         let mut b = Connection {
             agent,
             peer: Peer::default(),
+            client: None,
         };
 
         let (a, b) = tokio::join!(a.sign(first), b.sign(second));
@@ -398,6 +478,143 @@ mod tests {
         assert_eq!(
             prompter.max_open.load(std::sync::atomic::Ordering::SeqCst),
             1
+        );
+    }
+
+    /// Approves after `delay` unless cancelled first, counting what happened.
+    struct ApprovesAfter {
+        delay: Duration,
+        asked: std::sync::atomic::AtomicUsize,
+        cancelled: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ApprovesAfter {
+        fn new(delay: Duration) -> Self {
+            Self {
+                delay,
+                asked: Default::default(),
+                cancelled: Default::default(),
+            }
+        }
+
+        async fn until_asked(&self, times: usize) {
+            while self.asked.load(std::sync::atomic::Ordering::SeqCst) < times {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Prompter for ApprovesAfter {
+        async fn passphrase(&self, _: &str) -> io::Result<zeroize::Zeroizing<String>> {
+            unreachable!()
+        }
+        async fn confirm(&self, _: &str, cancel: &CancellationToken) -> io::Result<bool> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.asked.fetch_add(1, SeqCst);
+            tokio::select! {
+                () = tokio::time::sleep(self.delay) => Ok(true),
+                () = cancel.cancelled() => {
+                    self.cancelled.fetch_add(1, SeqCst);
+                    Err(io::Error::other("cancelled"))
+                }
+            }
+        }
+    }
+
+    /// A connection whose client end is returned, to hang up or write to.
+    fn with_client(agent: SudoAgent) -> (Connection, UnixStream) {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let conn = Connection {
+            agent,
+            peer: Peer::default(),
+            client: Some(ours.as_fd().try_clone_to_owned().unwrap()),
+        };
+        (conn, theirs)
+    }
+
+    #[tokio::test]
+    async fn hanging_up_withdraws_the_prompt() {
+        let key = entry("laptop", Duration::from_secs(60));
+        let request = request(&key);
+        let prompter = Arc::new(ApprovesAfter::new(Duration::from_secs(60)));
+        let agent = SudoAgent::new(Arc::new(Mutex::new(vec![key])), prompter.clone());
+        let (mut conn, client) = with_client(agent);
+
+        let sign = tokio::spawn(async move { conn.sign(request).await });
+        prompter.until_asked(1).await;
+        drop(client);
+
+        let result = tokio::time::timeout(Duration::from_secs(5), sign)
+            .await
+            .expect("prompt withdrawn")
+            .unwrap();
+        assert!(matches!(result, Err(AgentError::Failure)));
+        assert_eq!(
+            prompter.cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn key_expiring_withdraws_the_prompt() {
+        let key = entry("short-lived", Duration::from_millis(100));
+        let request = request(&key);
+        let prompter = Arc::new(ApprovesAfter::new(Duration::from_secs(60)));
+        let mut conn = connect(vec![key], prompter.clone());
+
+        let result = tokio::time::timeout(Duration::from_secs(5), conn.sign(request))
+            .await
+            .expect("prompt withdrawn");
+        assert!(matches!(result, Err(AgentError::Failure)));
+        assert_eq!(
+            prompter.cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn hanging_up_while_queued_skips_the_prompt() {
+        let key = entry("shared", Duration::from_secs(60));
+        let (first_request, second_request) = (request(&key), request(&key));
+        let prompter = Arc::new(ApprovesAfter::new(Duration::from_millis(500)));
+        let agent = SudoAgent::new(Arc::new(Mutex::new(vec![key])), prompter.clone());
+        let mut first = Connection {
+            agent: agent.clone(),
+            peer: Peer::default(),
+            client: None,
+        };
+        let (mut second, client) = with_client(agent);
+
+        let first = tokio::spawn(async move { first.sign(first_request).await });
+        prompter.until_asked(1).await;
+        let second = tokio::spawn(async move { second.sign(second_request).await });
+        drop(client);
+
+        // Leaves the queue while the first prompt is still open.
+        let second = tokio::time::timeout(Duration::from_millis(250), second)
+            .await
+            .expect("left the queue")
+            .unwrap();
+        assert!(matches!(second, Err(AgentError::Failure)));
+        assert!(first.await.unwrap().is_ok());
+        assert_eq!(prompter.asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn pipelined_request_is_not_a_hang_up() {
+        let key = entry("laptop", Duration::from_secs(60));
+        let request = request(&key);
+        let prompter = Arc::new(ApprovesAfter::new(Duration::from_millis(50)));
+        let agent = SudoAgent::new(Arc::new(Mutex::new(vec![key])), prompter.clone());
+        let (mut conn, mut client) = with_client(agent);
+
+        // A complete REQUEST_IDENTITIES message, sent before the answer.
+        client.write_all(&[0, 0, 0, 1, 11]).await.unwrap();
+        assert!(conn.sign(request).await.is_ok());
+        assert_eq!(
+            prompter.cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            0
         );
     }
 

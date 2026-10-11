@@ -1,6 +1,6 @@
 [package]
 name = "sudo-agent"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["Juuso Latva <juuso.latva@gmail.com>"]
 description = "A lightweight, PAM-aware SSH agent daemon for time-bound sudo authentication."
@@ -22,6 +22,7 @@ signature = "2.2.0"
 ssh-agent-lib = "0.6.0"
 ssh-key = { version = "0.6.7", features = ["crypto", "encryption"] }
 tokio = { version = "1.53.1", features = ["full"] }
+tokio-util = "0.7.19"
 zeroize = "1.9.1"
 
 [dev-dependencies]
