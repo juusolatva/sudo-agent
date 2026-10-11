@@ -55,11 +55,13 @@ Or from a checkout: `cargo build --release`.
 On the machine that holds your key:
 
 ```sh
-sudo-agent --key ~/.ssh/id_ed25519
+sudo-agent serve --key ~/.ssh/id_ed25519
 # Passphrase for /home/you/.ssh/id_ed25519:
 # Loaded /home/you/.ssh/id_ed25519 (SHA256:…), usable for 15m
 # Agent listening on /run/user/1000/sudo-agent/agent.sock
 ```
+
+`serve` can be left out: `sudo-agent --key …` does the same, as in 0.1.
 
 | Option | Default | |
 |--------|---------|-|
@@ -67,7 +69,7 @@ sudo-agent --key ~/.ssh/id_ed25519
 | `--ttl <DURATION>` | `15m` | How long loaded keys stay usable (`90s`, `15m`, `8h`) |
 | `--max-ttl <DURATION>` | `8h` | Longest TTL a key may have; a longer `--ttl` is an error |
 | `--approval-timeout <DURATION>` | `2m` | How long a prompt waits before denying |
-| `--socket <PATH>` | `$XDG_RUNTIME_DIR/sudo-agent/agent.sock` | Falls back to `~/.cache/sudo-agent/agent-<hostname>.sock` |
+| `--agent-socket <PATH>` | `$XDG_RUNTIME_DIR/sudo-agent/agent.sock` | The socket to forward. Also `SUDO_AGENT_SOCKET`; the flag wins. Falls back to `~/.cache/sudo-agent/agent-<hostname>.sock`. `--socket` still works |
 
 The agent runs in the foreground, and approval prompts appear in its
 terminal. Ctrl-C at a prompt denies that request; Ctrl-C otherwise (or twice

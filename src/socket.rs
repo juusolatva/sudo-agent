@@ -7,6 +7,7 @@
 //! hostname suffix keeps machines sharing an NFS home from clobbering each
 //! other's sockets.
 
+use std::ffi::OsString;
 use std::fs::{self, DirBuilder, Permissions};
 use std::io::{self, ErrorKind};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
@@ -19,6 +20,24 @@ const APP_DIR: &str = "sudo-agent";
 /// Size of `sockaddr_un.sun_path` on Linux, including the trailing NUL.
 const SUN_PATH_LEN: usize = 108;
 
+/// Environment variable naming the agent socket (overridden by
+/// `--agent-socket`).
+pub const AGENT_SOCKET_ENV: &str = "SUDO_AGENT_SOCKET";
+
+/// Picks a socket path: `flag` if given, else `env_value` if set and
+/// non-empty (an empty variable counts as unset), else `default()`.
+pub fn choose_path(
+    flag: Option<PathBuf>,
+    env_value: Option<OsString>,
+    default: impl FnOnce() -> io::Result<PathBuf>,
+) -> io::Result<PathBuf> {
+    let env_path = env_value.filter(|v| !v.is_empty()).map(PathBuf::from);
+    match flag.or(env_path) {
+        Some(path) => Ok(path),
+        None => default(),
+    }
+}
+
 /// Returns the default socket path, creating its parent directory with mode
 /// `0700` and verifying ownership/permissions if it already exists.
 pub fn default_path() -> io::Result<PathBuf> {
@@ -30,7 +49,7 @@ pub fn default_path() -> io::Result<PathBuf> {
                 .ok_or_else(|| {
                     io::Error::new(
                         ErrorKind::NotFound,
-                        "none of XDG_RUNTIME_DIR, XDG_CACHE_HOME or HOME is set; use --socket",
+                        "none of XDG_RUNTIME_DIR, XDG_CACHE_HOME or HOME is set; use --agent-socket",
                     )
                 })?;
             let file_name = match hostname() {
@@ -175,6 +194,23 @@ fn hostname() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flag_beats_environment_beats_default() {
+        let default = || Ok(PathBuf::from("default.sock"));
+        let flag = || Some(PathBuf::from("flag.sock"));
+        let env = |v: &str| Some(OsString::from(v));
+        let choose = |flag, env| choose_path(flag, env, default).unwrap();
+
+        assert_eq!(choose(flag(), env("env.sock")), PathBuf::from("flag.sock"));
+        assert_eq!(choose(None, env("env.sock")), PathBuf::from("env.sock"));
+        assert_eq!(choose(None, None), PathBuf::from("default.sock"));
+        assert_eq!(choose(None, env("")), PathBuf::from("default.sock"));
+        // The default (which creates a directory) isn't even computed when
+        // a path was given.
+        let unreachable = || -> io::Result<PathBuf> { panic!("default computed") };
+        choose_path(flag(), None, unreachable).unwrap();
+    }
 
     #[tokio::test]
     async fn socket_file_is_removed_on_drop() {

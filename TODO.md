@@ -209,11 +209,22 @@ needs an answer. Design agreed 2026-10-07; open decisions settled
      shutdown)`, the one place step 1b extends to two listeners.
    - Shared test helpers: `keys::testing::entry`,
      `prompt::testing::{ScriptedPrompter, ApprovesAfter}`.
-- [ ] **1a. Subcommands and socket flags.** `serve` (bare form as alias),
-   `--agent-socket`/`--control-socket` and their environment variables.
-   Behaviour otherwise unchanged. Candidate for 0.2.0.
+- [x] **1a. Subcommands and socket flags.** Done 2026-10-12.
+   - `src/cli.rs`: `serve` subcommand; the bare form is the same `ServeArgs`
+     flattened at the top level (`args_conflicts_with_subcommands`, so
+     options before `serve` are rejected). `--ttl` > `--max-ttl` is checked
+     there.
+   - `--agent-socket` (`--socket` kept as a hidden alias) and
+     `SUDO_AGENT_SOCKET`, resolved by `socket::choose_path`: flag, then the
+     variable if set **and non-empty** (an empty one counts as unset; clap's
+     own `env` treats it as a missing value, so it isn't used), then the
+     default.
+   - `--control-socket` / `SUDO_AGENT_CONTROL_SOCKET` moved to 1b: until
+     `control.sock` exists they would be accepted and do nothing.
+   - Candidate for 0.2.0 once 1b lands.
 - [ ] **1b. `control.sock` and `ssh-add`.** Second listener with the three
-   protection layers; `AddIdentity`/`AddIdConstrained`, `RemoveIdentity`,
+   protection layers and its `--control-socket` / `SUDO_AGENT_CONTROL_SOCKET`
+   (via `socket::choose_path`); `AddIdentity`/`AddIdConstrained`, `RemoveIdentity`,
    `RemoveAllIdentities`; lifetime → TTL with the cap policy; the `ssh-add`
    option rules above; single-instance check on both sockets. `serve` may
    start with no keys. `~/.bashrc`'s `ssh-load` (`rbw` → `SSH_ASKPASS` →

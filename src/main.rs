@@ -11,52 +11,26 @@ macro_rules! log {
 }
 
 mod agent;
+mod cli;
 mod keys;
 mod prompt;
 mod server;
 mod socket;
 
+use std::env;
 use std::io;
-use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use clap::error::ErrorKind;
-use clap::{CommandFactory, Parser};
 use ssh_agent_lib::error::AgentError;
 use ssh_key::HashAlg;
 use tokio::signal::unix::{SignalKind, signal};
 
 use crate::agent::SudoAgent;
+use crate::cli::ServeArgs;
 use crate::keys::KeyEntry;
 use crate::prompt::{Prompter, TerminalPrompter};
-
-/// PAM-aware SSH agent for time-bound, human-approved sudo.
-#[derive(Parser)]
-#[command(version)]
-struct Args {
-    /// OpenSSH private key to load (repeatable). Its passphrase is asked for
-    /// once, at startup.
-    #[arg(long = "key", value_name = "PATH", required = true)]
-    keys: Vec<PathBuf>,
-
-    /// How long loaded keys stay usable, e.g. 90s, 15m or 8h.
-    #[arg(long, value_name = "DURATION", default_value = "15m", value_parser = keys::parse_duration)]
-    ttl: Duration,
-
-    /// Longest TTL a key may have; a longer --ttl is an error.
-    #[arg(long, value_name = "DURATION", default_value = "8h", value_parser = keys::parse_duration)]
-    max_ttl: Duration,
-
-    /// How long an approval prompt waits for an answer before denying.
-    #[arg(long, value_name = "DURATION", default_value = "2m", value_parser = keys::parse_duration)]
-    approval_timeout: Duration,
-
-    /// Socket path [default: $XDG_RUNTIME_DIR/sudo-agent/agent.sock]
-    #[arg(long, value_name = "PATH")]
-    socket: Option<PathBuf>,
-}
 
 /// Drops keys as their TTL runs out, so expired key material doesn't linger
 /// in memory.
@@ -78,11 +52,12 @@ fn spawn_expiry_reaper(store: Arc<Mutex<Vec<KeyEntry>>>) {
     });
 }
 
-async fn run(args: Args) -> Result<(), AgentError> {
-    let socket_path = match args.socket {
-        Some(path) => path,
-        None => socket::default_path()?,
-    };
+async fn run(args: ServeArgs) -> Result<(), AgentError> {
+    let socket_path = socket::choose_path(
+        args.agent_socket,
+        env::var_os(socket::AGENT_SOCKET_ENV),
+        socket::default_path,
+    )?;
     // Bind before asking for passphrases, so a socket problem doesn't waste
     // them. Every return from here on removes the socket file again (via
     // `socket_file`'s drop), except being killed during passphrase entry; the
@@ -175,17 +150,7 @@ fn shutdown_signal(
 const STOP_WINDOW: Duration = Duration::from_secs(2);
 
 fn main() -> ExitCode {
-    let args = Args::parse();
-    if args.ttl > args.max_ttl {
-        let message = format!(
-            "--ttl {} is longer than --max-ttl {}",
-            keys::format_duration(args.ttl),
-            keys::format_duration(args.max_ttl)
-        );
-        Args::command()
-            .error(ErrorKind::ArgumentConflict, message)
-            .exit();
-    }
+    let args = cli::parse();
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
         Err(e) => {

@@ -1,7 +1,7 @@
 # Suggested commands
 
 - `cargo check` — fast type-check
-- `cargo run -- --key ~/.ssh/id_ed25519 [--ttl 15m] [--max-ttl 8h] [--approval-timeout 2m] [--socket PATH]` — run daemon in foreground (default socket `$XDG_RUNTIME_DIR/sudo-agent/agent.sock`; it prints the `export SSH_AUTH_SOCK=…` line)
+- `cargo run -- serve --key ~/.ssh/id_ed25519 [--ttl 15m] [--max-ttl 8h] [--approval-timeout 2m] [--agent-socket PATH]` (or `SUDO_AGENT_SOCKET=PATH`; bare form without `serve` also works) — run daemon in foreground (default socket `$XDG_RUNTIME_DIR/sudo-agent/agent.sock`; it prints the `export SSH_AUTH_SOCK=…` line)
 - `cargo test`, `cargo test <name>`
 - `cargo clippy --all-targets --all-features`
 - `cargo fmt` / `cargo fmt --check`

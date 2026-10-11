@@ -33,7 +33,7 @@ ssh -o ForwardAgent=<sudo-agent socket> ──┴──────────�
 
 ```sh
 cargo build --release
-./target/release/sudo-agent --key ~/.ssh/id_ed25519 --ttl 15m
+./target/release/sudo-agent serve --key ~/.ssh/id_ed25519 --ttl 15m
 # prints: export SSH_AUTH_SOCK='/run/user/1000/sudo-agent/agent.sock'
 ```
 
