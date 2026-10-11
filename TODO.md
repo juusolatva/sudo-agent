@@ -223,7 +223,8 @@ needs an answer. Design agreed 2026-10-07; open decisions settled
      `control.sock` exists they would be accepted and do nothing.
    - Candidate for 0.2.0 once 1b lands.
 - [x] **1b. `control.sock` and `ssh-add`.** Done 2026-10-12; SonarQube
-   Cloud clean. Server run (e2e case 9, plus 6–7) still due before 0.2.0.
+   Cloud clean. Verified on a server (e2e cases 9, 2, 6, 7). Released as
+   0.2.0 (with 0 and 1a).
    - `src/control.rs`: `ControlAgent` / `ControlConnection` wrap the shared
      `SudoAgent` and reuse `Connection` for listing and approval-gated
      signing (so `ssh-add -l` / `-T` work there too). Add, add-constrained,

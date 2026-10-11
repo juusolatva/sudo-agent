@@ -1,6 +1,6 @@
 [package]
 name = "sudo-agent"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 authors = ["Juuso Latva <juuso.latva@gmail.com>"]
 description = "A lightweight, PAM-aware SSH agent daemon for time-bound sudo authentication."

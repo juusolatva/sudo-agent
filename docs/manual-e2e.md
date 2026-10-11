@@ -169,8 +169,14 @@ with a throwaway config and keys, stopped afterwards; no `sudo`):
 - Pitfall found on the way: `ssh` with no agent of its own (`SSH_AUTH_SOCK`
   unset or `IdentityAgent=none`) skips agent forwarding silently, even
   with `ForwardAgent=<path>`.
-- Still to run on a server before 0.2.0: case 9, plus cases 6 and 7 as a
-  regression check.
+
+**2026-10-12, server `palvelin`** (0.2.0 candidate, release build): the key
+added with `ssh-add -t 240m` over `control.sock` (the `ssh-load` flow; logged
+`usable for 4h`), then `sudo` through the forwarded `agent.sock`:
+
+- Case 9 (approve), case 2 (deny), case 7 (Ctrl-C at the laptop prompt:
+  denied, agent kept running) and case 6 (closing the SSH connection: the
+  prompt line ended, `client disconnected`) passed.
 
 ## Troubleshooting
 
