@@ -20,25 +20,32 @@ this agent to sign a challenge. The agent signs only if:
 ## How it works
 
 ```
-your machine                                     server
-────────────                                     ──────
-sudo-agent ── holds the decrypted key     sudo
-   │          for --ttl, then forgets it     └─ pam_ssh_agent_auth
-   │                                               │ "sign this challenge"
-   └─ "Allow? [y/N]"  ◄── forwarded agent ◄────────┘
+your machine                                       server
+────────────                                       ──────
+ssh-add ─► control.sock ─┐                         sudo
+                         ▼                           └─ pam_ssh_agent_auth
+              sudo-agent: holds keys until                │ "sign this challenge"
+              their TTL ends, asks "Allow? [y/N]"         │
+                         ▲                                │
+                         └─ agent.sock ◄── forwarded ◄────┘
 ```
 
-- **Passphrase once.** It's asked for once, when the key is loaded. After
-  that, each signature only needs a `y`.
-- **TTL inside the agent.** A key's TTL starts when it's loaded (once its
-  passphrase is accepted). Keys are dropped (and zeroized) when their time
-  is up. The clock keeps counting while the machine is suspended.
+- **Passphrase once.** It's asked for once, when the key is loaded (by
+  `ssh-add`, or by the agent for `--key`). After that, each signature only
+  needs a `y`.
+- **TTL inside the agent.** A key's TTL starts when it's loaded. Keys are
+  dropped (and zeroized) when their time is up. The clock keeps counting
+  while the machine is suspended.
 - **Every signature is approved.** The prompt shows which local process is
   asking and which key it wants, so a request you didn't start (for example
   from someone else with access to the forwarded socket) is visible rather
   than silent. Approving takes `y` or `yes` plus Enter. Keys typed before
   the prompt appeared are discarded. Anything else, or no answer within
   `--approval-timeout`, denies the request.
+- **Two sockets.** `agent.sock` is the one you forward: it can only list
+  keys and ask for signatures. `control.sock` is for adding and removing
+  keys (`ssh-add`) and is never forwarded; see [Security
+  notes](#security-notes).
 - **One request at a time.** Concurrent requests queue, and every approval
   and refusal is logged.
 
@@ -52,33 +59,65 @@ Or from a checkout: `cargo build --release`.
 
 ## Usage
 
-On the machine that holds your key:
+Start the agent on the machine that holds your key:
 
 ```sh
-sudo-agent serve --key ~/.ssh/id_ed25519
-# Passphrase for /home/you/.ssh/id_ed25519:
-# Loaded /home/you/.ssh/id_ed25519 (SHA256:…), usable for 15m
+sudo-agent serve
 # Agent listening on /run/user/1000/sudo-agent/agent.sock
+# Control socket on /run/user/1000/sudo-agent/control.sock (for ssh-add; never forward it)
+# No keys loaded yet; add one with: SSH_AUTH_SOCK='/run/user/1000/sudo-agent/control.sock' ssh-add <key>
+# export SSH_AUTH_SOCK='/run/user/1000/sudo-agent/agent.sock'
 ```
 
-`serve` can be left out: `sudo-agent --key …` does the same, as in 0.1.
+`serve` can be left out: `sudo-agent [OPTIONS]` does the same, as in 0.1.
+
+### Adding keys
+
+With `ssh-add` through the control socket, while the agent runs:
+
+```sh
+SSH_AUTH_SOCK=$XDG_RUNTIME_DIR/sudo-agent/control.sock ssh-add -t 4h ~/.ssh/id_ed25519
+```
+
+- `-t` sets the key's TTL, cut down to `--max-ttl` if it's longer (the agent
+  logs it). Without `-t` (or with `-t 0`) the key gets `--ttl`: a key never
+  stays until removed.
+- Adding a key that is already loaded replaces it and restarts its TTL;
+  that's how you extend a session.
+- `-l` lists keys, `-d` removes one, `-D` removes all.
+- `-c` is accepted (every signature is approved anyway). `-h` (destination
+  restrictions) and other constraints are refused rather than silently
+  ignored, as are certificates and smartcard keys.
+
+Or load keys at startup, with the passphrase asked in the agent's terminal:
+`sudo-agent serve --key ~/.ssh/id_ed25519` (repeatable).
+
+### Options
 
 | Option | Default | |
 |--------|---------|-|
-| `--key <PATH>` | (required) | OpenSSH private key to load; repeatable |
-| `--ttl <DURATION>` | `15m` | How long loaded keys stay usable (`90s`, `15m`, `8h`) |
-| `--max-ttl <DURATION>` | `8h` | Longest TTL a key may have; a longer `--ttl` is an error |
+| `--key <PATH>` | none | OpenSSH private key to load at startup; repeatable |
+| `--ttl <DURATION>` | `15m` | TTL for `--key` keys and for `ssh-add` without `-t` (`90s`, `15m`, `8h`) |
+| `--max-ttl <DURATION>` | `8h` | Longest TTL a key may have: a longer `--ttl` is an error, a longer `ssh-add -t` is cut down |
 | `--approval-timeout <DURATION>` | `2m` | How long a prompt waits before denying |
-| `--agent-socket <PATH>` | `$XDG_RUNTIME_DIR/sudo-agent/agent.sock` | The socket to forward. Also `SUDO_AGENT_SOCKET`; the flag wins. Falls back to `~/.cache/sudo-agent/agent-<hostname>.sock`. `--socket` still works |
+| `--agent-socket <PATH>` | `$XDG_RUNTIME_DIR/sudo-agent/agent.sock` | The socket to forward. Also `SUDO_AGENT_SOCKET`; the flag wins. `--socket` still works |
+| `--control-socket <PATH>` | `$XDG_RUNTIME_DIR/sudo-agent/control.sock` | The socket for `ssh-add`; never forward it. Also `SUDO_AGENT_CONTROL_SOCKET`; the flag wins |
+
+Without `$XDG_RUNTIME_DIR`, the sockets go to
+`~/.cache/sudo-agent/agent-<hostname>.sock` and `control-<hostname>.sock`.
+Only one agent runs per user: `serve` refuses to start while another agent
+answers on either socket.
 
 The agent runs in the foreground, and approval prompts appear in its
 terminal. Ctrl-C at a prompt denies that request; Ctrl-C otherwise (or twice
 within two seconds, or closing the terminal) stops the agent, drops the keys
-and removes the socket. A prompt is withdrawn if its client goes away (e.g.
+and removes the sockets. A prompt is withdrawn if its client goes away (e.g.
 the SSH connection closes) or its key expires.
 
-Connect to a server, keeping your normal agent for the login and forwarding
-only `sudo-agent`:
+### Connecting to a server
+
+Keep your normal agent for the login and forward only `sudo-agent`'s
+`agent.sock`:
 
 ```sh
 ssh -o ForwardAgent=/run/user/1000/sudo-agent/agent.sock server
@@ -91,6 +130,9 @@ Or set it per host in `~/.ssh/config`. `ForwardAgent` doesn't expand
 Host server
     ForwardAgent /run/user/1000/sudo-agent/agent.sock
 ```
+
+`ssh` forwards an agent only if it has one of its own (`SSH_AUTH_SOCK` or
+`IdentityAgent`). Without one, `ForwardAgent=<path>` silently does nothing.
 
 Then `sudo` on the server makes the approval prompt appear on your machine:
 
@@ -141,7 +183,15 @@ password.
   on the machine running the agent can read keys from its memory.
 - Anyone with root on a server you're connected to can send requests
   through the forwarded socket, but each one needs your approval, and you
-  see it happen.
+  see it happen. They can't add, remove or lock keys through it: the agent
+  refuses that on `agent.sock` and logs the attempt.
+- `control.sock` must never be forwarded, and the agent makes sure a
+  mistake there (say, a copy-pasted `ForwardAgent` line) doesn't hand a
+  server control over your keys. It accepts only your own user, and
+  refuses connections that come through `ssh`: OpenSSH 8.9 and later
+  announce those with a `session-bind@openssh.com` message, and as a
+  further tripwire the agent refuses any client whose executable is named
+  `ssh`. Every refusal is logged.
 - Peer details in the prompt come from the requesting process and are
   informational. They are escaped so they can't rewrite the prompt.
 
@@ -149,12 +199,10 @@ password.
 
 Planned, roughly in order:
 
-- running as a background service (`sudo-agent serve`, a systemd user
-  unit), with keys added through a separate control socket that can't be
-  used through forwarding (so `ssh-add` works);
 - time left shown by `ssh-add -l`, also on the server;
 - approvals through pinentry popups or a `sudo-agent approve` command in
   any terminal;
+- running as a background service (a systemd user unit);
 - later: `sudo-agent stop`, lock/unlock, and `sudo-agent status`;
 - showing the forwarding chain (which host a request came through) in the
   prompt.

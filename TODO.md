@@ -222,15 +222,30 @@ needs an answer. Design agreed 2026-10-07; open decisions settled
    - `--control-socket` / `SUDO_AGENT_CONTROL_SOCKET` moved to 1b: until
      `control.sock` exists they would be accepted and do nothing.
    - Candidate for 0.2.0 once 1b lands.
-- [ ] **1b. `control.sock` and `ssh-add`.** Second listener with the three
-   protection layers and its `--control-socket` / `SUDO_AGENT_CONTROL_SOCKET`
-   (via `socket::choose_path`); `AddIdentity`/`AddIdConstrained`, `RemoveIdentity`,
-   `RemoveAllIdentities`; lifetime → TTL with the cap policy; the `ssh-add`
-   option rules above; single-instance check on both sockets. `serve` may
-   start with no keys. `~/.bashrc`'s `ssh-load` (`rbw` → `SSH_ASKPASS` →
-   `ssh-add -t 240m`) should work against `control.sock` almost unchanged.
-   New e2e cases: `ssh-add` against `control.sock`; a forwarded
-   `control.sock` is refused.
+- [x] **1b. `control.sock` and `ssh-add`.** Done 2026-10-12; SonarQube
+   Cloud clean. Server run (e2e case 9, plus 6–7) still due before 0.2.0.
+   - `src/control.rs`: `ControlAgent` / `ControlConnection` wrap the shared
+     `SudoAgent` and reuse `Connection` for listing and approval-gated
+     signing (so `ssh-add -l` / `-T` work there too). Add, add-constrained,
+     remove, remove-all; `-t` → TTL via `keys::TtlPolicy` (cap logged,
+     0 = default like OpenSSH's "no limit"); `-c` accepted; `-h`, unknown
+     constraints, certificates and smartcard keys refused with a logged
+     reason; re-adding replaces and restarts the TTL. Lock/unlock refused
+     as not supported (a "Later" item).
+   - The three protection layers, each logged once per connection: uid
+     check and `ssh` tripwire at connect (`refusal`), `session-bind`
+     refusing the connection for good (`extension`).
+   - `agent.sock` now logs refused key management (add, remove, lock,
+     smartcard): through forwarding that means a server tried it.
+     Extensions there stay unlogged, as `ssh` sends `session-bind` on every
+     forwarded connection.
+   - `--control-socket` / `SUDO_AGENT_CONTROL_SOCKET` (via
+     `socket::choose_path`); `socket::default_path(name)`; startup refuses
+     the same path for both and a live agent on either; `--key` optional.
+   - Verified locally against real OpenSSH 10.2 with a private `sshd`
+     (`docs/manual-e2e.md`, 2026-10-12): all three layers fire, including
+     `session-bind` alone (renamed `ssh`). OpenSSH only forwards when the
+     client has an agent of its own, documented in README and e2e.
 - [ ] **1c. Time left in key comments** on both sockets. New e2e case:
    `ssh-add -l` on a server shows the time left.
 - [ ] **2. pinentry approvals**, plus the routing scaffold (all backends at

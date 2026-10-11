@@ -33,9 +33,19 @@ ssh -o ForwardAgent=<sudo-agent socket> ──┴──────────�
 
 ```sh
 cargo build --release
-./target/release/sudo-agent serve --key ~/.ssh/id_ed25519 --ttl 15m
+./target/release/sudo-agent serve
 # prints: export SSH_AUTH_SOCK='/run/user/1000/sudo-agent/agent.sock'
 ```
+
+Add the key from a second terminal, through the control socket (`ssh-add`
+asks for the passphrase):
+
+```sh
+SSH_AUTH_SOCK=$XDG_RUNTIME_DIR/sudo-agent/control.sock ssh-add -t 15m ~/.ssh/id_ed25519
+```
+
+(Or load it at startup instead: `sudo-agent serve --key ~/.ssh/id_ed25519
+--ttl 15m`, with the passphrase asked in the agent's terminal.)
 
 In a second terminal, log in with your normal agent but forward only
 `sudo-agent` (OpenSSH ≥ 8.2 accepts a socket path for `ForwardAgent`):
@@ -47,6 +57,10 @@ ssh -o ForwardAgent="$XDG_RUNTIME_DIR/sudo-agent/agent.sock" <server>
 There is an alternative: `SSH_AUTH_SOCK=<sudo-agent socket> ssh -A <server>`.
 It also works, but then the SSH login itself asks `sudo-agent` for a signature,
 so you'll get one approval prompt for the login as well.
+
+Forward `agent.sock` only, never `control.sock`. `ssh` forwards an agent only
+if it has one of its own (`SSH_AUTH_SOCK` or `IdentityAgent` set); without
+one, `ForwardAgent=<path>` silently does nothing.
 
 ## 2. Server: read-only checks
 
@@ -90,6 +104,9 @@ every `sudo` authenticates anyway.)
 | 6 | `sudo -k; sudo -v`, then, while the laptop prompt is open, end the SSH connection with the `~.` escape (Enter, `~`, `.`) in the server session | The prompt line ends and `Refused …: client disconnected` follows at once; after reconnecting, the next prompt works normally | Connection closed (Ctrl-C would not do: `sudo` ignores it while `pam_ssh_agent_auth` waits) |
 | 7 | `sudo -k; sudo -v`, press Ctrl-C at the **laptop** prompt | `^C`, then `Refused …: not approved: cancelled with Ctrl-C`; the agent keeps running (a second Ctrl-C within 2 s would stop it) | Falls back to the password prompt |
 | 8 | Restart the agent with `--ttl 1m`, run `sudo -k; sudo -v` when ~10 s are left and don't answer | At expiry the prompt line ends, then `Refused …: key expired while waiting for approval`, then `Key expired and was removed: …`, each on its own line | Falls back to the password prompt |
+| 9 | With the key added by `ssh-add` over `control.sock` (step 1), `sudo -k; sudo -v`, answer **y** | As case 1; the agent logged `Added key … from ssh-add …, usable for …` when it was added | Succeeds with no password prompt |
+| 10 | `ssh -o ForwardAgent=$XDG_RUNTIME_DIR/sudo-agent/control.sock <server>`, then `ssh-add -l` | `Refused control connection from … ssh …` | `error fetching identities: agent refused operation` |
+| 11 | In a session forwarding `agent.sock`, `ssh-add <some key file>` and `ssh-add -D` on the server | `Refused adding a key …` / `Refused removing all keys …: agent.sock only lists and signs` | Both refused; `ssh-add -l` still lists the key |
 | 5 | Stop the agent (Ctrl-C with no prompt open), then `sudo -k; sudo -v` | Nothing (agent is gone) | Password prompt: proves `sudo` really authenticates through `sudo-agent`, not some other forwarded agent |
 
 Report: the pam_ssh_agent_auth version, key type, the exact prompt text, and
@@ -134,10 +151,34 @@ with prompt cancellation and `--max-ttl`):
   `client disconnected` at once; case 8 withdrew the prompt at expiry and
   `sudo` fell back to the password prompt by itself. Passed.
 
+**2026-10-12, laptop only: `control.sock` against real OpenSSH 10.2**
+(`ssh-add` and `ssh`; a private `sshd` run as the user on `127.0.0.1:2222`
+with a throwaway config and keys, stopped afterwards; no `sudo`):
+
+- `ssh-add` over `control.sock`: add, `-t 12h` capped to 8h and logged,
+  re-add replacing the key, `-c` accepted, `-h` refused (needs the host in
+  `known_hosts`, else `ssh-add` fails before asking the agent), `-x`
+  refused as not supported, `-d`/`-D`. `ssh-add` / `-D` against
+  `agent.sock` refused and logged.
+- Forwarding `control.sock` (cases 10–11 locally): with the real `ssh`, the
+  executable-name tripwire refused it; with a renamed copy of `ssh`, the
+  `session-bind@openssh.com` check refused it. Logging in with
+  `IdentityAgent=control.sock` was refused both ways (the agent held a key
+  the server accepted). Forwarding `agent.sock` listed the key, and adding
+  or removing keys from the server side was refused and logged.
+- Pitfall found on the way: `ssh` with no agent of its own (`SSH_AUTH_SOCK`
+  unset or `IdentityAgent=none`) skips agent forwarding silently, even
+  with `ForwardAgent=<path>`.
+- Still to run on a server before 0.2.0: case 9, plus cases 6 and 7 as a
+  regression check.
+
 ## Troubleshooting
 
 - **No prompt on the laptop, and sudo asks for a password**:
   - Check `ssh-add -l` on the server. If it fails, forwarding isn't active.
+    On the laptop, `ssh` needs an agent of its own (`SSH_AUTH_SOCK`) to
+    forward one, and the forwarded path must be `agent.sock`, not
+    `control.sock` (which refuses `ssh` and logs it).
   - Check that `env_keep` includes `SSH_AUTH_SOCK`.
   - Check that the key's fingerprint is in the PAM `file=`.
   - Check the key hasn't expired.
