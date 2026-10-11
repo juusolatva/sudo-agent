@@ -98,66 +98,141 @@ Committed direction, comes after "Now" — not yet scheduled, but intended.
 
 Goal: the agent runs on its own, independent of any terminal (closing a
 terminal must not kill it or drop keys), and reacts only when a request
-needs an answer. Design, agreed 2026-10-07:
+needs an answer. Design agreed 2026-10-07; open decisions settled
+2026-10-12.
 
+#### Design
+
+- **CLI.** `sudo-agent serve` runs the agent. The bare form
+  (`sudo-agent --key …`, i.e. today's invocation) keeps working as an alias
+  for `serve`. Other subcommands are clients (`approve`, later `stop`). The
+  release that adds subcommands is 0.2.0.
 - **Two sockets.**
   - `agent.sock` is the one that gets forwarded. It only lists identities
-    and signs (approval-gated), plus at most a read-only status query.
+    and signs (approval-gated). Later at most a read-only status extension.
   - `control.sock` is never forwarded. It speaks the full agent protocol
-    (add/remove keys, lock) plus our own commands (status, stop, approve).
+    (add/remove keys, later lock) plus our own commands as vendor
+    extensions (approve, later status and stop).
 
   Nothing on a server can add keys or answer approvals through forwarding.
-  This also covers servers where forwarding the full agent is a concern.
-- **Keys are added from a client, not at daemon startup.** The daemon has no
-  terminal to ask for a passphrase, so `ssh-add` (or `sudo-agent add`)
-  decrypts the key and sends it over `control.sock`. The daemon never prompts
-  for passphrases. `ssh-add -t` lifetimes become the TTL, still tracked and
-  enforced inside the agent (invariant 1), capped by `--max-ttl`.
-
-  **TTL cap policy** (decided 2026-10-11):
-  - A lifetime above the cap is **clamped** to it, and the agent logs
-    `lifetime 12h capped to 8h`. Refusing would leave `ssh-add` with only
-    "Could not add identity", because the protocol can't carry a reason.
-    `sudo-agent status` shows the real time left.
-  - A key added with **no lifetime** (`ssh-add` without `-t`) gets the
-    default TTL (`--ttl`, 15m), never "until removed".
-  - The cap defaults to **8h** (`--max-ttl`, already enforced on `--ttl`).
-    A `--ttl` above it is a startup error rather than a clamp: the user
-    typed it and the agent can say why.
+- **Socket paths.** Each socket has its own flag and environment variable;
+  a flag beats the variable, which beats the default. Names (agreed
+  2026-10-12): `--agent-socket` (with today's `--socket` kept as an alias)
+  / `SUDO_AGENT_SOCKET`, and `--control-socket` /
+  `SUDO_AGENT_CONTROL_SOCKET`. Defaults: `$XDG_RUNTIME_DIR/sudo-agent/`
+  `agent.sock` and `control.sock`; the cache-dir fallback gets
+  `agent-<hostname>.sock` and `control-<hostname>.sock`. Clients
+  (`approve`, `stop`) look up the control socket the same way.
+- **`control.sock` is protected in three layers**, so an accidental
+  `ForwardAgent …/control.sock` (e.g. a copy-paste mistake) doesn't hand a
+  server control over keys or approvals. File permissions alone can't stop
+  that: the forwarding `ssh` runs as the user.
+  1. **Refuse connections that come through `ssh`.** OpenSSH ≥ 8.9 sends
+     `session-bind@openssh.com` on every agent connection it uses for a
+     login or forwards. A `control.sock` connection that sends it is
+     refused for good (every later request on it fails), with a warning
+     in the log.
+  2. **Same user only.** The peer's uid (`SO_PEERCRED`) must equal the
+     agent's.
+  3. **Tripwire.** Refuse when the peer process is `ssh` (its
+     `/proc/<pid>/exe`), for clients older than 8.9. A heuristic, logged
+     as such.
+- **Keys are added from a client, not at daemon startup.** `ssh-add`
+  decrypts the key and sends it over `control.sock`; the daemon never
+  prompts for passphrases. `--key` on `serve` stays for foreground use.
+  The daemon starts with no keys, and restarting it drops them all
+  (intended).
+  - **TTL cap policy** (decided 2026-10-11):
+    - A lifetime above the cap is **clamped** to it, and the agent logs
+      `lifetime 12h capped to 8h`. Refusing would leave `ssh-add` with only
+      "Could not add identity", because the protocol can't carry a reason.
+    - A key added with **no lifetime** (`ssh-add` without `-t`) gets the
+      default TTL (`--ttl`, 15m), never "until removed".
+    - The cap defaults to **8h** (`--max-ttl`, already enforced on
+      `--ttl`). A `--ttl` above it is a startup error rather than a clamp:
+      the user typed it and the agent can say why.
+  - **`ssh-add` options:**
+    - `-c` (confirm each use): accepted and ignored; every signature is
+      confirmed anyway.
+    - `-h` (destination restriction) and any unknown constraint: the key is
+      **refused** and the reason logged. Silently ignoring a restriction
+      the user asked for would give a false sense of safety.
+    - Re-adding a key that is already loaded replaces it and **restarts
+      its TTL** (with the new lifetime and comment). That is how a session
+      is extended: the passphrase is typed again (invariant 2).
+- **Time left, visible remotely: in the key comment.** Identities listed on
+  either socket carry the time left in their comment, as
+  `laptop (12m left)` (agreed 2026-10-12), so plain
+  `ssh-add -l` shows it on any server with nothing installed there, and
+  locally against `control.sock`. Comments are display-only;
+  `pam_ssh_agent_auth` ignores them. This replaces `ssh-status` and its
+  `.ssh_expiry` file, which only guess from outside the agent. A status
+  extension and `sudo-agent status` come later (see "Later").
 - **Approvals are answered by pinentry (desktop popup) or by
-  `sudo-agent approve` in any terminal.** Those two are the focus. Today's
-  foreground mode, with its prompt on the daemon's own terminal, stays as a
-  backup as long as it causes no problems. Routing: an attached `approve`
-  client is asked first; otherwise pinentry if a desktop session is
-  available; otherwise deny and log.
+  `sudo-agent approve` in any terminal**; the foreground prompt on
+  `serve`'s own terminal stays as a backup. **Routing: every available
+  backend is asked at once; the first answer wins and the others are
+  withdrawn** (their `CancellationToken`). Each backend keeps its own
+  timeout. With no backend available the request is denied and logged.
+- **`approve` protocol: vendor extensions on `control.sock`**: one that
+  waits for the next pending request (long poll) and one that answers a
+  request by id. It reuses the agent codec, and the `control.sock`
+  protections apply to it automatically.
+- **Lifecycle.**
+  - **One instance per user**: one agent already serves any number of
+    remote destinations. `serve` refuses to start while either socket
+    answers (today's stale-socket check, applied to both).
+  - systemd **user service**, no socket activation; `setsid -f
+    sudo-agent serve` is the fallback without systemd (no double fork).
+  - **Log lines carry timestamps** in `serve`, except when stderr is the
+    journal (`JOURNAL_STREAM` set), which stamps them itself.
+  - Stopping: signals / `systemctl --user stop` first; `sudo-agent stop`
+    later for convenience.
+- **Gap until step 2, documented:** a `serve` with no terminal has no
+  approval backend before pinentry lands, so it denies (and logs) every
+  request. The sockets, `ssh-add` and the key listing still work and can be
+  tested that way.
 
-Steps:
+#### Steps
 
-1. [ ] **Daemon + control socket + `ssh-add` + status.**
-   - Split the binary into `sudo-agent serve` and client subcommands.
-   - Add `control.sock`, which accepts `AddIdentity`/`AddIdConstrained`
-     (lifetime → TTL), `RemoveIdentity`, `RemoveAllIdentities` and lock.
-   - Keep `--key` on `serve` for foreground use. Until steps 2–3 land,
-     approvals still use the foreground terminal prompt, so nothing
-     regresses.
-   - `~/.bashrc`'s `ssh-load` (`rbw` → `SSH_ASKPASS` → `ssh-add -t 240m`)
-     should work against `control.sock` almost unchanged.
-   - **`sudo-agent status`**: loaded keys and time left on each. It replaces
-     `ssh-status` and its `.ssh_expiry` file, which only guess the TTL from
-     outside the agent. Locally it goes over `control.sock`. On a server, a
-     read-only vendor extension on `agent.sock` (`ssh-agent-lib` supports
-     `extension()`) answers "how long is left" through the forwarded
-     `SSH_AUTH_SOCK`, which is the "surface the TTL remotely" goal from
-     invariant 1. Anyone who can reach that socket can already list the
-     keys, so exposing the TTL there is acceptable.
-2. [ ] **pinentry approvals.**
+- [x] **0. Prep, no visible change.** Done 2026-10-12.
+   - Socket-level tests in `src/server.rs`: the agent served on a temp
+     socket via the real `socket::bind`, driven by `ssh_agent_lib`'s
+     `Client`. They pin listing, signing, refusal keeping the connection
+     usable, hang-up withdrawing the prompt (through the real
+     `new_session`), shutdown removing the socket, and that `agent.sock`
+     answers `Failure` to add, add-constrained, remove, remove-all, lock,
+     unlock and extensions (`session-bind@openssh.com` included), without
+     prompting. Both the refusal and the hang-up test were checked to fail
+     when the behaviour is broken.
+   - Serving moved out of `run()` into `server::serve(listener, agent,
+     shutdown)`, the one place step 1b extends to two listeners.
+   - Shared test helpers: `keys::testing::entry`,
+     `prompt::testing::{ScriptedPrompter, ApprovesAfter}`.
+- [ ] **1a. Subcommands and socket flags.** `serve` (bare form as alias),
+   `--agent-socket`/`--control-socket` and their environment variables.
+   Behaviour otherwise unchanged. Candidate for 0.2.0.
+- [ ] **1b. `control.sock` and `ssh-add`.** Second listener with the three
+   protection layers; `AddIdentity`/`AddIdConstrained`, `RemoveIdentity`,
+   `RemoveAllIdentities`; lifetime → TTL with the cap policy; the `ssh-add`
+   option rules above; single-instance check on both sockets. `serve` may
+   start with no keys. `~/.bashrc`'s `ssh-load` (`rbw` → `SSH_ASKPASS` →
+   `ssh-add -t 240m`) should work against `control.sock` almost unchanged.
+   New e2e cases: `ssh-add` against `control.sock`; a forwarded
+   `control.sock` is refused.
+- [ ] **1c. Time left in key comments** on both sockets. New e2e case:
+   `ssh-add -l` on a server shows the time left.
+- [ ] **2. pinentry approvals**, plus the routing scaffold (all backends at
+   once, first answer wins).
    - Spawn `pinentry` only when a request arrives and speak its Assuan
      protocol: `CONFIRM` for yes/no, `SETDESC`/`SETPROMPT` for the
-     request details.
+     request details. Cancellation kills the child.
    - Talk to it directly, with no crate dependency; the `pinentry` package
      comes with GnuPG on most desktops.
-   - `SETTIMEOUT` gives this backend its own approval timeout (30–60 s
-     likely suits a popup better than the terminal's 2 min).
+   - Still to decide here: which program (a `--pinentry` flag; the default
+     must skip curses/tty variants, since a daemon has no terminal) and its
+     own timeout via `SETTIMEOUT` (30–60 s likely suits a popup better than
+     the terminal's 2 min).
    - Check before trusting it: whether a popup that grabs the keyboard
      while you're typing can be approved by a stray Enter or Space (the
      GUI version of the type-ahead problem the terminal prompt already
@@ -165,17 +240,35 @@ Steps:
    - A daemon started by systemd needs `DISPLAY`/`WAYLAND_DISPLAY` and
      `DBUS_SESSION_BUS_ADDRESS` in its environment. Most desktops import
      them into the user manager; Cinnamon on the laptop does.
-3. [ ] **systemd user unit** (`sudo-agent.service`) and docs for
+- [ ] **3. systemd user unit** (`sudo-agent.service`) and docs for
    `systemctl --user enable --now sudo-agent`.
-   - Logs go to `journalctl --user -u sudo-agent` for free (stderr).
+   - Logs go to `journalctl --user -u sudo-agent` (stderr); timestamps in
+     `serve`'s own log lines, skipped under the journal.
    - Restarting it drops all keys, which is intended.
    - `setsid -f sudo-agent serve` is the documented fallback for machines
-     without systemd. No self-daemonizing (double fork).
-4. [ ] **`sudo-agent approve`**: a terminal client that connects to
-   `control.sock`, shows pending requests and takes `y/N`, with the same
-   type-ahead flush as the foreground prompt.
+     without systemd.
+- [ ] **4. `sudo-agent approve`**: a terminal client on `control.sock`
+   (the long-poll extension) that shows pending requests and takes `y/N`,
+   with the same type-ahead flush and `sanitize()`d text as the foreground
+   prompt; it joins the routing. Its own timeout, maybe up to 5 min.
    - This is the terminal backend from now on (invariant 3). It works from
      any terminal, including when SSH'd into the laptop with no desktop.
+
+Re-run the server cases in `docs/manual-e2e.md` after 1b, 2 and 4: each
+touches signing or prompting.
+
+#### Later (agreed, after steps 0–4)
+
+- **`sudo-agent stop`** over `control.sock`, so users don't need
+  `systemctl` or signals.
+- **Lock/unlock** (`ssh-add -x` / `-X`) on `control.sock` only: while
+  locked, every request is refused without a prompt (a "pause" when away
+  from the desk).
+- **Status extension and `sudo-agent status`**: a read-only vendor
+  extension (`name@domain`, e.g. `status@sudo-agent.juusolatva.github.io`)
+  on both sockets with exact time left per key; `sudo-agent status` on a
+  server talks to the forwarded `SSH_AUTH_SOCK`. Needs `sudo-agent`
+  installed on the server, which is why key comments come first.
 
 ### Other
 

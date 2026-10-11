@@ -321,23 +321,13 @@ fn sanitize(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::prompt::testing::ScriptedPrompter;
+    use crate::keys::testing::entry;
+    use crate::prompt::testing::{ApprovesAfter, ScriptedPrompter};
     use signature::Verifier;
-    use ssh_key::PrivateKey;
-    use ssh_key::rand_core::OsRng;
     use std::io;
     use tokio::io::AsyncWriteExt;
 
     const CHALLENGE: &[u8] = b"pam_ssh_agent_auth challenge";
-
-    fn entry(comment: &str, ttl: Duration) -> KeyEntry {
-        let mut private_key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
-        private_key.set_comment(comment);
-        KeyEntry {
-            private_key,
-            expires_at: keys::now() + ttl,
-        }
-    }
 
     fn request(entry: &KeyEntry) -> SignRequest {
         SignRequest {
@@ -481,47 +471,6 @@ mod tests {
         );
     }
 
-    /// Approves after `delay` unless cancelled first, counting what happened.
-    struct ApprovesAfter {
-        delay: Duration,
-        asked: std::sync::atomic::AtomicUsize,
-        cancelled: std::sync::atomic::AtomicUsize,
-    }
-
-    impl ApprovesAfter {
-        fn new(delay: Duration) -> Self {
-            Self {
-                delay,
-                asked: Default::default(),
-                cancelled: Default::default(),
-            }
-        }
-
-        async fn until_asked(&self, times: usize) {
-            while self.asked.load(std::sync::atomic::Ordering::SeqCst) < times {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        }
-    }
-
-    #[async_trait]
-    impl Prompter for ApprovesAfter {
-        async fn passphrase(&self, _: &str) -> io::Result<zeroize::Zeroizing<String>> {
-            unreachable!()
-        }
-        async fn confirm(&self, _: &str, cancel: &CancellationToken) -> io::Result<bool> {
-            use std::sync::atomic::Ordering::SeqCst;
-            self.asked.fetch_add(1, SeqCst);
-            tokio::select! {
-                () = tokio::time::sleep(self.delay) => Ok(true),
-                () = cancel.cancelled() => {
-                    self.cancelled.fetch_add(1, SeqCst);
-                    Err(io::Error::other("cancelled"))
-                }
-            }
-        }
-    }
-
     /// A connection whose client end is returned, to hang up or write to.
     fn with_client(agent: SudoAgent) -> (Connection, UnixStream) {
         let (ours, theirs) = UnixStream::pair().unwrap();
@@ -550,10 +499,7 @@ mod tests {
             .expect("prompt withdrawn")
             .unwrap();
         assert!(matches!(result, Err(AgentError::Failure)));
-        assert_eq!(
-            prompter.cancelled.load(std::sync::atomic::Ordering::SeqCst),
-            1
-        );
+        assert_eq!(prompter.times_cancelled(), 1);
     }
 
     #[tokio::test]
@@ -567,10 +513,7 @@ mod tests {
             .await
             .expect("prompt withdrawn");
         assert!(matches!(result, Err(AgentError::Failure)));
-        assert_eq!(
-            prompter.cancelled.load(std::sync::atomic::Ordering::SeqCst),
-            1
-        );
+        assert_eq!(prompter.times_cancelled(), 1);
     }
 
     #[tokio::test]
@@ -598,7 +541,7 @@ mod tests {
             .unwrap();
         assert!(matches!(second, Err(AgentError::Failure)));
         assert!(first.await.unwrap().is_ok());
-        assert_eq!(prompter.asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(prompter.times_asked(), 1);
     }
 
     #[tokio::test]
@@ -612,10 +555,7 @@ mod tests {
         // A complete REQUEST_IDENTITIES message, sent before the answer.
         client.write_all(&[0, 0, 0, 1, 11]).await.unwrap();
         assert!(conn.sign(request).await.is_ok());
-        assert_eq!(
-            prompter.cancelled.load(std::sync::atomic::Ordering::SeqCst),
-            0
-        );
+        assert_eq!(prompter.times_cancelled(), 0);
     }
 
     #[test]

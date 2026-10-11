@@ -13,6 +13,7 @@ macro_rules! log {
 mod agent;
 mod keys;
 mod prompt;
+mod server;
 mod socket;
 
 use std::io;
@@ -23,7 +24,6 @@ use std::time::Duration;
 
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser};
-use ssh_agent_lib::agent::listen;
 use ssh_agent_lib::error::AgentError;
 use ssh_key::HashAlg;
 use tokio::signal::unix::{SignalKind, signal};
@@ -122,15 +122,14 @@ async fn run(args: Args) -> Result<(), AgentError> {
 
     println!("Agent listening on {}", socket_path.display());
     println!("export SSH_AUTH_SOCK='{}'", socket_path.display());
-    let result = tokio::select! {
-        result = listen(listener, SudoAgent::new(Arc::clone(&store), prompter)) => result,
-        signal = shutdown => {
-            // Ctrl-C echoes "^C" with no newline (possibly after a prompt).
-            let newline = if signal == "SIGINT" { "\n" } else { "" };
-            log!("{newline}Received {signal}, shutting down");
-            Ok(())
-        }
+    let shutdown = async {
+        let signal = shutdown.await;
+        // Ctrl-C echoes "^C" with no newline (possibly after a prompt).
+        let newline = if signal == "SIGINT" { "\n" } else { "" };
+        log!("{newline}Received {signal}, shutting down");
     };
+    let agent = SudoAgent::new(Arc::clone(&store), prompter);
+    let result = server::serve(listener, agent, shutdown).await;
 
     // Drop (and so zeroize) the keys now rather than relying on destructors
     // running at exit: main doesn't wait for in-flight tasks.

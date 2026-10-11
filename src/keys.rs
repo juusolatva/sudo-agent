@@ -249,3 +249,21 @@ mod tests {
         assert_eq!(format_remaining(secs(3900)), "1h05m");
     }
 }
+
+/// Test helpers shared with other modules' tests.
+#[cfg(test)]
+pub mod testing {
+    use super::*;
+    use ssh_key::Algorithm;
+    use ssh_key::rand_core::OsRng;
+
+    /// A freshly generated Ed25519 key, usable for `ttl` from now.
+    pub fn entry(comment: &str, ttl: Duration) -> KeyEntry {
+        let mut private_key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        private_key.set_comment(comment);
+        KeyEntry {
+            private_key,
+            expires_at: now() + ttl,
+        }
+    }
+}

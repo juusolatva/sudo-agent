@@ -147,11 +147,13 @@ password.
 
 Planned, roughly in order:
 
-- running as a background service, with keys added through a separate
-  control socket (so `ssh-add` works);
+- running as a background service (`sudo-agent serve`, a systemd user
+  unit), with keys added through a separate control socket that can't be
+  used through forwarding (so `ssh-add` works);
+- time left shown by `ssh-add -l`, also on the server;
 - approvals through pinentry popups or a `sudo-agent approve` command in
   any terminal;
-- `sudo-agent status` for time left, also on the server;
+- later: `sudo-agent stop`, lock/unlock, and `sudo-agent status`;
 - showing the forwarding chain (which host a request came through) in the
   prompt.
 

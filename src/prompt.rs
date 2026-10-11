@@ -342,6 +342,8 @@ mod tests {
 pub mod testing {
     use super::*;
     use std::collections::VecDeque;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering::SeqCst;
 
     #[derive(Default)]
     pub struct ScriptedPrompter {
@@ -387,6 +389,56 @@ pub mod testing {
         async fn confirm(&self, message: &str, _: &CancellationToken) -> io::Result<bool> {
             self.asked.lock().unwrap().push(message.to_owned());
             Ok(self.confirms.lock().unwrap().pop_front().unwrap_or(false))
+        }
+    }
+
+    /// Approves after `delay` unless cancelled first, counting what happened.
+    pub struct ApprovesAfter {
+        delay: Duration,
+        asked: AtomicUsize,
+        cancelled: AtomicUsize,
+    }
+
+    impl ApprovesAfter {
+        pub fn new(delay: Duration) -> Self {
+            Self {
+                delay,
+                asked: AtomicUsize::new(0),
+                cancelled: AtomicUsize::new(0),
+            }
+        }
+
+        pub fn times_asked(&self) -> usize {
+            self.asked.load(SeqCst)
+        }
+
+        pub fn times_cancelled(&self) -> usize {
+            self.cancelled.load(SeqCst)
+        }
+
+        /// Waits until a prompt has been opened `times` times.
+        pub async fn until_asked(&self, times: usize) {
+            while self.times_asked() < times {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Prompter for ApprovesAfter {
+        async fn passphrase(&self, _: &str) -> io::Result<Zeroizing<String>> {
+            unreachable!("ApprovesAfter only confirms")
+        }
+
+        async fn confirm(&self, _: &str, cancel: &CancellationToken) -> io::Result<bool> {
+            self.asked.fetch_add(1, SeqCst);
+            tokio::select! {
+                () = tokio::time::sleep(self.delay) => Ok(true),
+                () = cancel.cancelled() => {
+                    self.cancelled.fetch_add(1, SeqCst);
+                    Err(io::Error::other("cancelled"))
+                }
+            }
         }
     }
 }
