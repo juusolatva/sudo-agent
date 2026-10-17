@@ -1,5 +1,9 @@
 # sudo-agent
 
+[![Build](https://github.com/juusolatva/sudo-agent/actions/workflows/build.yml/badge.svg)](https://github.com/juusolatva/sudo-agent/actions/workflows/build.yml)
+[![Security](https://github.com/juusolatva/sudo-agent/actions/workflows/security.yml/badge.svg)](https://github.com/juusolatva/sudo-agent/actions/workflows/security.yml)
+[![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=juusolatva_sudo-agent&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=juusolatva_sudo-agent)
+
 A lightweight SSH agent for **time-bound, human-approved `sudo`**.
 
 Instead of typing your password for every `sudo` on a remote server, or
@@ -185,7 +189,12 @@ request. It can't see which command runs on the server.
 **Key types**: Ed25519 is recommended and the one tested end to end.
 ECDSA should work but is untested. RSA works only when
 the requester asks for `rsa-sha2-512` signatures, which older
-`pam_ssh_agent_auth` versions may not do.
+`pam_ssh_agent_auth` versions may not do. RSA signing also uses the
+`rsa` crate, which has an unfixed timing side-channel advisory
+([RUSTSEC-2023-0071]). Every signature waits for your approval, which
+makes the timing hard to measure from a server, but prefer Ed25519.
+
+[RUSTSEC-2023-0071]: https://rustsec.org/advisories/RUSTSEC-2023-0071
 
 ## Server setup
 

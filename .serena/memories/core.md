@@ -27,5 +27,5 @@ Status: core loop done, "Now" gaps closed (stale prompts, Ctrl-C at a prompt), v
 ## Related memories
 - Language/crate versions and API notes for `ssh-agent-lib`: `mem:tech_stack`
 - Locking, error handling, style rules: `mem:conventions`
-- Build/run/manual e2e commands: `mem:suggested_commands`
+- Build/run/manual e2e commands, plus the CI checks (clippy `-D warnings`, cargo-audit, cargo-deny): `mem:suggested_commands`
 - Checks to run before declaring a task done: `mem:task_completion`

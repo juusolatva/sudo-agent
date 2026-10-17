@@ -5,6 +5,7 @@
 - `cargo test`, `cargo test <name>`
 - `cargo clippy --all-targets --all-features`
 - `cargo fmt` / `cargo fmt --check`
+- CI equivalents (`.github/workflows/build.yml`, `security.yml`): `cargo clippy --all-targets --all-features --locked -- -D warnings`; `cargo audit --deny warnings` (ignores with reasons in `.cargo/audit.toml`); `cargo deny --locked check bans licenses sources` (`deny.toml`; advisories left to cargo-audit, so a full `cargo deny check` still reports the ignored RUSTSEC-2023-0071). Known harmless `cargo deny` warning: duplicate `syn` 2.x/3.x.
 - After `cargo publish`/`cargo package` (even `--dry-run`): `cargo clean -p sudo-agent`, else `cargo build` keeps a stale dev binary.
 - SonarQube Cloud (public, analyses pushed `main`): `curl -s 'https://sonarcloud.io/api/issues/search?componentKeys=juusolatva_sudo-agent&resolved=false'`
 - Popups: with `DISPLAY` set (agents' shells often have it) a request opens a real pinentry on the user's screen. Don't trigger one unasked: use `--no-pinentry`, `env -u DISPLAY -u WAYLAND_DISPLAY`, or `--pinentry <fake script>` (a `/bin/sh` script answering `OK` to every line approves) to exercise routing.

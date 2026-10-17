@@ -97,6 +97,10 @@ Work on this project happens on two kinds of machine, and an agent must know whi
 - `src/socket.rs`: Socket path selection (XDG runtime dir with cache-dir fallback), private-directory checks, stale-socket handling, and binding.
 - `docs/manual-e2e.md`: Manual `pam_ssh_agent_auth` end-to-end test procedure (laptop agent ↔ forwarded server `sudo`).
 - `TODO.md`: Detailed roadmap (Now, Next, Someday) and in-depth rationales for core design decisions.
+- `.github/workflows/build.yml`: CI on pushes to `main` and PRs: Clippy (`-D warnings`) and SonarQube (coverage from `cargo llvm-cov` → `lcov.info`; `sonar.qualitygate.wait=true` in `sonar-project.properties`, so a failed quality gate fails the job).
+- `.github/workflows/security.yml`: `cargo audit --deny warnings` and `cargo deny --locked check bans licenses sources`, on pushes, PRs and daily (new advisories against an unchanged `Cargo.lock`).
+- `deny.toml`: cargo-deny config (Linux targets, license allow-list, crates.io only, no wildcards). Advisories are left to cargo-audit.
+- `.cargo/audit.toml`: cargo-audit ignores, each with its reason (currently RUSTSEC-2023-0071, `rsa` via `ssh-key`; see `TODO.md` → Other).
 
 ## Common Development Commands
 
@@ -118,10 +122,17 @@ cargo test <test_name>
 cargo clippy --all-targets --all-features
 cargo fmt --check
 cargo fmt
+
+# What CI runs (build.yml, security.yml)
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo audit --deny warnings
+cargo deny --locked check bans licenses sources
 ```
 
+- **CI is strict**: any Clippy warning, RustSec advisory or warning (unmaintained, yanked, …), disallowed license or non-crates.io source fails it. When adding or updating dependencies, run `cargo audit` and `cargo deny check` locally. Don't silence findings to get green: a new license goes into `deny.toml`'s allow-list, and an advisory into `.cargo/audit.toml`'s `ignore`, only with the user's agreement and a comment giving the reason. The `syn` duplicate warning from `cargo deny` (2.x via `curve25519-dalek-derive`, 3.x elsewhere) is known and harmless. A full `cargo deny check` also reports RUSTSEC-2023-0071, because cargo-deny doesn't read `.cargo/audit.toml`.
+
 - **After `cargo publish` / `cargo package`** (even `--dry-run`), run `cargo clean -p sudo-agent`. Packaging rewrites the dev binary's fingerprint to track `target/package/…/src`, after which `cargo build` silently reuses a stale `target/debug/sudo-agent` (tests are unaffected, so it looks like code passes tests but fails when run).
-- **SonarQube Cloud** analyses pushed `main` (public project `juusolatva_sudo-agent`). Open issues: `curl -s 'https://sonarcloud.io/api/issues/search?componentKeys=juusolatva_sudo-agent&resolved=false'`.
+- **SonarQube Cloud** analyses pushed `main` and PRs through `build.yml`, with test coverage, and the quality gate (including coverage on new code) must pass (public project `juusolatva_sudo-agent`). Open issues: `curl -s 'https://sonarcloud.io/api/issues/search?componentKeys=juusolatva_sudo-agent&resolved=false'`.
 
 ## Coding Conventions & Guidelines
 

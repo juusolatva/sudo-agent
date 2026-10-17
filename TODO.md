@@ -401,6 +401,11 @@ touches signing or prompting.
       X"); the remote *process* (sudo vs. anything else) is never visible.
       Display only, no enforcement — the groundwork for the destination
       restriction under "Someday", not a substitute for it.
+- [ ] **Drop the RUSTSEC-2023-0071 ignore** in `.cargo/audit.toml` (`rsa`
+      timing side channel, pulled in by `ssh-key`'s `crypto` feature) once a
+      fixed `rsa` reaches `ssh-key` (tracking: RustCrypto/RSA#626). Accepted
+      2026-10-18 because every RSA signature waits for a human approval.
+      Alternative if it lingers: build `ssh-key` without RSA (drops RSA keys).
 
 ## Someday (only if bothered — not committed, fine to drop)
 
