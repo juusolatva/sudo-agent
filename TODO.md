@@ -298,8 +298,10 @@ needs an answer. Design agreed 2026-10-07; open decisions settled
    - Tests with the scripted prompters: first answer wins and withdraws the
      rest, a failed backend doesn't deny while another can still answer,
      all failing denies, cancelling the request withdraws every backend.
-- [ ] **2b. pinentry client** (`src/pinentry.rs`), not wired in yet.
-   Implemented 2026-10-17, awaiting the user's test with the real popup.
+- [x] **2b. pinentry client** (`src/pinentry.rs`), not wired in yet.
+   Done 2026-10-17; the user checked the real popup (Allow, Deny/Escape/
+   close, its own timeout, withdrawal closing the gnome3 window, and
+   `pinentry-curses` failing cleanly without taking the terminal).
    - Spawn per request: pipes for stdin/stdout, stderr to `/dev/null`,
      `setsid` + `PR_SET_PDEATHSIG` in `pre_exec`, `kill_on_drop`.
    - Send `SETTITLE`, `SETDESC`, `SETOK Allow`, `SETCANCEL Deny`,
@@ -315,7 +317,8 @@ needs an answer. Design agreed 2026-10-07; open decisions settled
    - Tests against a fake pinentry script in a temp dir (approve, deny,
      timeout, garbage, hang, cancel kills it, escaping), plus an
      `#[ignore]`d test that pops up the real one on the laptop.
-- [ ] **2c. Wire pinentry into routing.** Candidate for 0.3.0.
+- [ ] **2c. Wire pinentry into routing.** Candidate for 0.3.0. Implemented
+   2026-10-17 (e2e cases 13–23), awaiting the user's laptop and server tests.
    - `--pinentry <PROGRAM>` (default `pinentry`) and a 60 s pinentry
      timeout; available only with `DISPLAY`/`WAYLAND_DISPLAY`; the startup
      banner says which backends are in use, or why pinentry isn't.

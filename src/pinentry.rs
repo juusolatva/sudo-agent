@@ -2,7 +2,8 @@
 //! to over its Assuan protocol on stdin/stdout. Only `CONFIRM` (Allow / Deny)
 //! is used; pinentry never asks for a passphrase here.
 
-use std::ffi::OsString;
+use std::env;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, ErrorKind};
 use std::path::Path;
 use std::process::Stdio;
@@ -44,6 +45,8 @@ pub struct Pinentry {
     /// How long the popup waits for an answer (pinentry's own `SETTIMEOUT`).
     timeout: Duration,
     grace: Duration,
+    /// Whether there was a display for a popup at startup.
+    display: bool,
 }
 
 impl Pinentry {
@@ -53,6 +56,10 @@ impl Pinentry {
             args: Vec::new(),
             timeout,
             grace: GRACE,
+            display: has_display(
+                env::var_os("DISPLAY").as_deref(),
+                env::var_os("WAYLAND_DISPLAY").as_deref(),
+            ),
         }
     }
 
@@ -91,7 +98,11 @@ impl Pinentry {
         }
         command.spawn().map_err(|e| {
             let program = Path::new(&self.program).display();
-            io::Error::new(e.kind(), format!("can't start {program}: {e}"))
+            let hint = match e.kind() {
+                ErrorKind::NotFound => "; install pinentry, or name one with --pinentry",
+                _ => "",
+            };
+            io::Error::new(e.kind(), format!("can't start {program}: {e}{hint}"))
         })
     }
 
@@ -122,11 +133,22 @@ impl Pinentry {
                 format!("no answer within {}", keys::format_duration(self.timeout)),
             )),
             Reply::Err(_, text) => Err(io::Error::other(format!(
-                "pinentry failed: {}",
+                "pinentry failed: {}; if it's a terminal pinentry, name a graphical one \
+                 with --pinentry",
                 sanitize(&text)
             ))),
         }
     }
+}
+
+/// Whether a graphical pinentry could show a popup: `DISPLAY` or
+/// `WAYLAND_DISPLAY` is set. That says nothing about anyone looking (after
+/// logout, behind a lock screen), which routing tolerates: a popup that fails
+/// or times out is no answer, not a denial.
+fn has_display(display: Option<&OsStr>, wayland_display: Option<&OsStr>) -> bool {
+    [display, wayland_display]
+        .into_iter()
+        .any(|value| value.is_some_and(|value| !value.is_empty()))
 }
 
 #[async_trait]
@@ -136,6 +158,10 @@ impl Prompter for Pinentry {
             ErrorKind::Unsupported,
             "pinentry only asks for approvals",
         ))
+    }
+
+    fn available(&self) -> bool {
+        self.display
     }
 
     async fn confirm(&self, message: &str, cancel: &CancellationToken) -> io::Result<bool> {
@@ -312,6 +338,7 @@ done"#,
             args: vec!["-c".into(), script.into()],
             timeout: TIMEOUT,
             grace: Duration::from_millis(200),
+            display: true,
         }
     }
 
@@ -504,6 +531,17 @@ done"#,
             e.to_string()
                 .starts_with("can't start /nonexistent/pinentry: ")
         );
+    }
+
+    #[test]
+    fn needs_a_display() {
+        let set = Some(OsStr::new(":0"));
+        let empty = Some(OsStr::new(""));
+        assert!(has_display(set, None));
+        assert!(has_display(None, Some(OsStr::new("wayland-0"))));
+        assert!(has_display(empty, set));
+        assert!(!has_display(None, None));
+        assert!(!has_display(empty, empty));
     }
 
     #[test]

@@ -1,32 +1,43 @@
-//! Approval routing: every available backend (the terminal; later pinentry
-//! and `sudo-agent approve` clients) is asked at once, and the first answer
-//! wins.
+//! Approval routing: every available backend (the terminal, pinentry; later
+//! `sudo-agent approve` clients) is asked at once, and the first answer wins.
 
+use std::collections::HashSet;
 use std::future::{Future, poll_fn};
 use std::io::{self, ErrorKind};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::task::Poll;
 
-use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
-use zeroize::Zeroizing;
 
 use crate::prompt::Prompter;
 
-/// An approval backend and the name its reasons are logged under.
+/// An approval backend and the name it's logged under.
 struct Backend {
     name: &'static str,
     prompter: Arc<dyn Prompter>,
 }
 
-/// A [`Prompter`] for approvals that asks every available backend at once.
-/// The first answer (approve or deny) wins, and the other backends are
-/// withdrawn. A backend that gives up (times out, fails) is no answer, not a
-/// denial: the request is only denied once all of them have given up, or if
-/// none is available.
+/// Asks every available backend at once. The first answer (approve or deny)
+/// wins, and the other backends are withdrawn. A backend that gives up (times
+/// out, fails) is no answer, not a denial: the request is only denied once
+/// all of them have given up, or if none is available.
 pub struct Router {
     backends: Vec<Backend>,
+    /// Backend failures already handed out in an [`Answer`], so each is
+    /// logged once rather than on every request.
+    reported: Mutex<HashSet<String>>,
+}
+
+/// How a request was answered.
+#[derive(Debug)]
+pub struct Answer {
+    pub approved: bool,
+    /// The backend that answered.
+    pub by: &'static str,
+    /// Failures of other backends while asking (not timeouts), each one only
+    /// the first time it happens.
+    pub problems: Vec<String>,
 }
 
 impl Router {
@@ -35,25 +46,25 @@ impl Router {
             .into_iter()
             .map(|(name, prompter)| Backend { name, prompter })
             .collect();
-        Self { backends }
-    }
-}
-
-/// One backend's open question.
-type Asking<'a> = Pin<Box<dyn Future<Output = io::Result<bool>> + Send + 'a>>;
-
-#[async_trait]
-impl Prompter for Router {
-    /// Passphrases aren't routed: the terminal asks for them directly, once,
-    /// at startup.
-    async fn passphrase(&self, _: &str) -> io::Result<Zeroizing<String>> {
-        Err(io::Error::new(
-            ErrorKind::Unsupported,
-            "passphrases aren't routed",
-        ))
+        Self {
+            backends,
+            reported: Mutex::default(),
+        }
     }
 
-    async fn confirm(&self, message: &str, cancel: &CancellationToken) -> io::Result<bool> {
+    /// A router with just `prompter`, named `test`.
+    #[cfg(test)]
+    pub fn only(prompter: Arc<dyn Prompter>) -> Self {
+        Self::new([("test", prompter)])
+    }
+
+    /// Asks for approval. `Err` means no backend answered, which callers
+    /// treat as a denial.
+    ///
+    /// Once `cancel` fires, every backend withdraws the question; this
+    /// returns only after they all have, so nothing logged afterwards lands
+    /// inside a prompt.
+    pub async fn ask(&self, message: &str, cancel: &CancellationToken) -> io::Result<Answer> {
         // Fires with `cancel`, or once a backend has answered.
         let withdraw = cancel.child_token();
         let mut asking: Vec<(&'static str, Asking<'_>)> = self
@@ -73,14 +84,33 @@ impl Prompter for Router {
                     // Returns once the others are gone, so their lines end
                     // before the log line.
                     while next_done(&mut asking).await.is_some() {}
-                    return Ok(approved);
+                    return Ok(Answer {
+                        approved,
+                        by: name,
+                        problems: self.new_problems(&gave_up),
+                    });
                 }
                 Err(e) => gave_up.push((name, e)),
             }
         }
         Err(no_answer(gave_up))
     }
+
+    /// The failures among `gave_up` not reported before. A timeout isn't a
+    /// failure: the user just answered somewhere else.
+    fn new_problems(&self, gave_up: &[(&'static str, io::Error)]) -> Vec<String> {
+        let mut reported = self.reported.lock().unwrap_or_else(PoisonError::into_inner);
+        gave_up
+            .iter()
+            .filter(|(_, e)| e.kind() != ErrorKind::TimedOut)
+            .map(|(name, e)| format!("{name}: {e}"))
+            .filter(|problem| reported.insert(problem.clone()))
+            .collect()
+    }
 }
+
+/// One backend's open question.
+type Asking<'a> = Pin<Box<dyn Future<Output = io::Result<bool>> + Send + 'a>>;
 
 /// Waits for the next backend in `asking` to finish and removes it; `None`
 /// once none is left.
@@ -132,8 +162,12 @@ mod tests {
 
     const LONG: Duration = Duration::from_secs(60);
 
-    fn route_to(backends: Vec<Arc<dyn Prompter>>) -> Router {
-        Router::new(backends.into_iter().map(|backend| ("test", backend)))
+    fn route_to(backends: Vec<(&'static str, Arc<dyn Prompter>)>) -> Router {
+        Router::new(backends)
+    }
+
+    async fn ask(router: &Router) -> io::Result<Answer> {
+        router.ask("Allow?", &CancellationToken::new()).await
     }
 
     #[tokio::test]
@@ -141,10 +175,11 @@ mod tests {
         for answer in [true, false] {
             let slow = Arc::new(ApprovesAfter::new(LONG));
             let quick = Arc::new(ScriptedPrompter::with_confirms([answer]));
-            let router = route_to(vec![slow.clone(), quick.clone()]);
+            let router = route_to(vec![("slow", slow.clone()), ("quick", quick.clone())]);
 
-            let result = router.confirm("Allow?", &CancellationToken::new()).await;
-            assert_eq!(result.unwrap(), answer);
+            let result = ask(&router).await.unwrap();
+            assert_eq!(result.approved, answer);
+            assert_eq!(result.by, "quick");
             assert_eq!(quick.asked(), ["Allow?"]);
             assert_eq!(slow.times_asked(), 1);
             assert_eq!(slow.times_cancelled(), 1);
@@ -155,27 +190,44 @@ mod tests {
     async fn giving_up_is_not_a_denial_while_another_backend_can_answer() {
         let gives_up = Arc::new(GivesUp::new(ErrorKind::TimedOut));
         let approves = Arc::new(ApprovesAfter::new(Duration::from_millis(20)));
-        let router = route_to(vec![gives_up.clone(), approves.clone()]);
+        let router = route_to(vec![
+            ("gives-up", gives_up.clone()),
+            ("approves", approves.clone()),
+        ]);
 
-        let result = router.confirm("Allow?", &CancellationToken::new()).await;
-        assert!(result.unwrap());
+        let result = ask(&router).await.unwrap();
+        assert!(result.approved);
+        assert_eq!(result.by, "approves");
+        // A timeout isn't a problem worth logging.
+        assert!(result.problems.is_empty());
         assert_eq!(gives_up.times_asked(), 1);
         assert_eq!(approves.times_cancelled(), 0);
     }
 
     #[tokio::test]
-    async fn all_giving_up_denies_with_every_reason() {
-        let router = Router::new([
+    async fn failures_are_reported_once() {
+        let router = route_to(vec![
+            ("broken", Arc::new(GivesUp::new(ErrorKind::Other))),
             (
-                "one",
-                Arc::new(GivesUp::new(ErrorKind::TimedOut)) as Arc<dyn Prompter>,
+                "approves",
+                Arc::new(ApprovesAfter::new(Duration::from_millis(10))),
             ),
+        ]);
+        let first = ask(&router).await.unwrap();
+        assert!(first.approved);
+        assert_eq!(first.problems, [format!("broken: {}", GivesUp::REASON)]);
+        let second = ask(&router).await.unwrap();
+        assert!(second.approved);
+        assert!(second.problems.is_empty());
+    }
+
+    #[tokio::test]
+    async fn all_giving_up_denies_with_every_reason() {
+        let router = route_to(vec![
+            ("one", Arc::new(GivesUp::new(ErrorKind::TimedOut))),
             ("two", Arc::new(GivesUp::new(ErrorKind::Other))),
         ]);
-        let e = router
-            .confirm("Allow?", &CancellationToken::new())
-            .await
-            .unwrap_err();
+        let e = ask(&router).await.unwrap_err();
         let message = e.to_string();
         assert!(message.contains("one: "), "{message}");
         assert!(message.contains("two: "), "{message}");
@@ -184,11 +236,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_lone_backend_gives_its_own_reason() {
-        let router = route_to(vec![Arc::new(GivesUp::new(ErrorKind::TimedOut))]);
-        let e = router
-            .confirm("Allow?", &CancellationToken::new())
-            .await
-            .unwrap_err();
+        let router = Router::only(Arc::new(GivesUp::new(ErrorKind::TimedOut)));
+        let e = ask(&router).await.unwrap_err();
         assert_eq!(e.kind(), ErrorKind::TimedOut);
         assert_eq!(e.to_string(), GivesUp::REASON);
     }
@@ -197,12 +246,12 @@ mod tests {
     async fn cancelling_the_request_withdraws_every_backend() {
         let one = Arc::new(ApprovesAfter::new(LONG));
         let two = Arc::new(ApprovesAfter::new(LONG));
-        let router = Arc::new(route_to(vec![one.clone(), two.clone()]));
+        let router = Arc::new(route_to(vec![("one", one.clone()), ("two", two.clone())]));
         let cancel = CancellationToken::new();
 
         let asking = tokio::spawn({
             let (router, cancel) = (Arc::clone(&router), cancel.clone());
-            async move { router.confirm("Allow?", &cancel).await }
+            async move { router.ask("Allow?", &cancel).await }
         });
         one.until_asked(1).await;
         two.until_asked(1).await;
@@ -215,23 +264,18 @@ mod tests {
     #[tokio::test]
     async fn unavailable_backends_are_not_asked() {
         let quick = Arc::new(ScriptedPrompter::with_confirms([true]));
-        let router = route_to(vec![Arc::new(Unavailable), quick.clone()]);
-        let result = router.confirm("Allow?", &CancellationToken::new()).await;
-        assert!(result.unwrap());
+        let router = route_to(vec![
+            ("unavailable", Arc::new(Unavailable)),
+            ("quick", quick.clone()),
+        ]);
+        assert!(ask(&router).await.unwrap().approved);
 
         // `Unavailable` panics if asked.
-        let router = route_to(vec![Arc::new(Unavailable), Arc::new(Unavailable)]);
-        let e = router
-            .confirm("Allow?", &CancellationToken::new())
-            .await
-            .unwrap_err();
+        let router = route_to(vec![
+            ("one", Arc::new(Unavailable)),
+            ("two", Arc::new(Unavailable)),
+        ]);
+        let e = ask(&router).await.unwrap_err();
         assert_eq!(e.to_string(), "no approval backend is available");
-    }
-
-    #[tokio::test]
-    async fn passphrases_are_not_routed() {
-        let router = route_to(vec![Arc::new(ScriptedPrompter::with_passphrases(["x"]))]);
-        let e = router.passphrase("Passphrase").await.unwrap_err();
-        assert_eq!(e.kind(), ErrorKind::Unsupported);
     }
 }

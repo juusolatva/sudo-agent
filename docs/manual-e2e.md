@@ -97,17 +97,28 @@ every `sudo` authenticates anyway.)
 
 | # | Action | Expected on laptop | Expected on server |
 |---|--------|--------------------|--------------------|
-| 1 | `sudo -k; sudo -v`, answer **y** | Prompt names the `ssh … <server>` process, the key, and time left; then `Approved signature request …` | Succeeds with **no password prompt** |
-| 2 | `sudo -k; sudo -v`, answer **n** (or Enter) | `Refused signature request …: denied` | Falls back to the password prompt (or fails if there's no fallback) |
+| 1 | `sudo -k; sudo -v`, answer **y** | Prompt names the `ssh … <server>` process, the key, and time left; then `Approved (terminal) signature request …` | Succeeds with **no password prompt** |
+| 2 | `sudo -k; sudo -v`, answer **n** (or Enter) | `Refused signature request …: denied (terminal)` | Falls back to the password prompt (or fails if there's no fallback) |
 | 3 | Restart the agent with `--ttl 1m` (no need to reconnect: the forwarded channel reconnects to the socket path for every request), wait > 1 min, then `sudo -k; sudo -v` | `Key expired and was removed: …`, **no** prompt | `ssh-add -l` shows no identities; sudo falls back to the password |
 | 4 | Two sessions run `sudo -k; sudo -v` at the same time | Prompts appear one after another; each request's `Approved`/`Refused` line comes before the next prompt, nothing interleaved | Each succeeds once approved |
 | 6 | `sudo -k; sudo -v`, then, while the laptop prompt is open, end the SSH connection with the `~.` escape (Enter, `~`, `.`) in the server session | The prompt line ends and `Refused …: client disconnected` follows at once; after reconnecting, the next prompt works normally | Connection closed (Ctrl-C would not do: `sudo` ignores it while `pam_ssh_agent_auth` waits) |
-| 7 | `sudo -k; sudo -v`, press Ctrl-C at the **laptop** prompt | `^C`, then `Refused …: denied` (before 2a: `not approved: cancelled with Ctrl-C`); the agent keeps running (a second Ctrl-C within 2 s would stop it) | Falls back to the password prompt |
+| 7 | `sudo -k; sudo -v`, press Ctrl-C at the **laptop** prompt | `^C`, then `Refused …: denied (terminal)` (before 2a: `not approved: cancelled with Ctrl-C`); the agent keeps running (a second Ctrl-C within 2 s would stop it) | Falls back to the password prompt |
 | 8 | Restart the agent with `--ttl 1m`, run `sudo -k; sudo -v` when ~10 s are left and don't answer | At expiry the prompt line ends, then `Refused …: key expired while waiting for approval`, then `Key expired and was removed: …`, each on its own line | Falls back to the password prompt |
 | 9 | With the key added by `ssh-add` over `control.sock` (step 1), `sudo -k; sudo -v`, answer **y** | As case 1; the agent logged `Added key … from ssh-add …, usable for …` when it was added | Succeeds with no password prompt |
 | 10 | `ssh -o ForwardAgent=$XDG_RUNTIME_DIR/sudo-agent/control.sock <server>`, then `ssh-add -l` | `Refused control connection from … ssh …` | `error fetching identities: agent refused operation` |
 | 11 | In a session forwarding `agent.sock`, `ssh-add <some key file>` and `ssh-add -D` on the server | `Refused adding a key …` / `Refused removing all keys …: agent.sock only lists and signs` | Both refused; `ssh-add -l` still lists the key |
 | 12 | `ssh-add -l` on the server, then again a minute later | Nothing (listing never prompts) | Each key's comment ends in its time left, e.g. `laptop (14m30s left)`, about a minute less the second time; it matches `ssh-add -l` on the laptop against `control.sock` |
+| 13 | In the desktop session, `sudo -k; sudo -v`, click **Allow** in the popup | Startup said `Approvals: a pinentry popup or this terminal …`; popup and terminal prompt appear together; the terminal prompt line ends, then `Approved (pinentry) …` | Succeeds |
+| 14 | As 13, but **Deny** (then again with Escape, and with closing the window) | Terminal prompt line ends, then `Refused …: denied (pinentry)` | Falls back to the password prompt |
+| 15 | As 13, but answer **y** at the terminal | The popup disappears; `Approved (terminal) …` | Succeeds |
+| 16 | As 13, but Ctrl-C at the terminal | The popup disappears; `Refused …: denied (terminal)`; the agent keeps running | Falls back to the password prompt |
+| 17 | As 13, answer nothing | After 60 s the popup closes by itself and the terminal prompt keeps waiting; at 2 min `Refused …: not approved: pinentry: no answer within 1m; terminal: no answer within 2m` | Falls back to the password prompt |
+| 18 | As 13, then end the SSH connection (`~.`) while the popup is open | Popup and terminal prompt withdrawn; `Refused …: client disconnected` | Connection closed |
+| 19 | As case 8 (`--ttl 1m`, ~10 s left), with the popup open | At expiry the popup and the terminal prompt are withdrawn; `Refused …: key expired while waiting for approval` | Falls back to the password prompt |
+| 20 | Restart with `--pinentry pinentry-curses`, then `sudo -k; sudo -v` twice, answering at the terminal | The terminal prompt works and isn't disturbed; after the first answer `Approval backend failed (logged only once): pinentry: pinentry failed: Inappropriate ioctl for device …`; not repeated the second time | Both as answered |
+| 21 | Laptop only: SSH into the laptop (no `DISPLAY`) and run `sudo-agent serve` there | Startup says `Approvals: this terminal only (no pinentry popups: …)`; requests prompt in that terminal only | — |
+| 22 | With a popup open, `kill -9` the agent from another terminal | The popup closes (pinentry is killed with the agent) | Falls back to the password prompt |
+| 23 | Run the agent without a terminal in the desktop session: `setsid -f sudo-agent serve > /tmp/sudo-agent.log 2>&1`, add the key, `sudo -k; sudo -v`, click **Allow** | The log says `Approvals: a pinentry popup (no terminal)`, then `Approved (pinentry) …` | Succeeds |
 | 5 | Stop the agent (Ctrl-C with no prompt open), then `sudo -k; sudo -v` | Nothing (agent is gone) | Password prompt: proves `sudo` really authenticates through `sudo-agent`, not some other forwarded agent |
 
 Report: the pam_ssh_agent_auth version, key type, the exact prompt text, and

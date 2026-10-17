@@ -45,9 +45,18 @@ pub struct ServeArgs {
     #[arg(long, value_name = "DURATION", default_value = "8h", value_parser = keys::parse_duration)]
     pub max_ttl: Duration,
 
-    /// How long an approval prompt waits for an answer before denying.
+    /// How long the terminal prompt waits for an answer before giving up.
     #[arg(long, value_name = "DURATION", default_value = "2m", value_parser = keys::parse_duration)]
     pub approval_timeout: Duration,
+
+    /// Program for approval popups, run for each request while DISPLAY or
+    /// WAYLAND_DISPLAY is set.
+    #[arg(long, value_name = "PROGRAM", default_value = "pinentry")]
+    pub pinentry: PathBuf,
+
+    /// How long a pinentry popup waits for an answer before giving up.
+    #[arg(long, value_name = "DURATION", default_value = "60s", value_parser = keys::parse_duration)]
+    pub pinentry_timeout: Duration,
 
     /// Agent socket, the one to forward [env: SUDO_AGENT_SOCKET]
     /// [default: $XDG_RUNTIME_DIR/sudo-agent/agent.sock]
@@ -132,6 +141,16 @@ mod tests {
         let parsed = parse(&["serve", "--control-socket", "/tmp/c.sock"]).unwrap();
         assert_eq!(parsed.control_socket, Some(PathBuf::from("/tmp/c.sock")));
         assert_eq!(parsed.agent_socket, None);
+    }
+
+    #[test]
+    fn pinentry_defaults() {
+        let parsed = parse(&["serve"]).unwrap();
+        assert_eq!(parsed.pinentry, PathBuf::from("pinentry"));
+        assert_eq!(parsed.pinentry_timeout, Duration::from_secs(60));
+        let parsed = parse(&["--pinentry", "pinentry-qt", "--pinentry-timeout", "30s"]).unwrap();
+        assert_eq!(parsed.pinentry, PathBuf::from("pinentry-qt"));
+        assert_eq!(parsed.pinentry_timeout, Duration::from_secs(30));
     }
 
     #[test]

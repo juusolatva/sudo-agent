@@ -38,12 +38,15 @@ ssh-add ─► control.sock ─┐                         sudo
   while the machine is suspended. `ssh-add -l` shows the time left after
   each key's comment, e.g. `laptop (14m30s left)`, on a server you've
   forwarded the agent to as well as locally.
-- **Every signature is approved.** The prompt shows which local process is
-  asking and which key it wants, so a request you didn't start (for example
-  from someone else with access to the forwarded socket) is visible rather
-  than silent. Approving takes `y` or `yes` plus Enter. Keys typed before
-  the prompt appeared are discarded. Anything else, or no answer within
-  `--approval-timeout`, denies the request.
+- **Every signature is approved**, in a pinentry popup or at the agent's
+  terminal, whichever you answer first; the other one closes. The prompt
+  shows which local process is asking and which key it wants, so a request
+  you didn't start (for example from someone else with access to the
+  forwarded socket) is visible rather than silent. In the popup, click
+  Allow; Deny, Escape or closing it denies. At the terminal, approving
+  takes `y` or `yes` plus Enter, and keys typed before the prompt appeared
+  are discarded; anything else denies. With no answer anywhere in time, the
+  request is denied.
 - **Two sockets.** `agent.sock` is the one you forward: it can only list
   keys and ask for signatures. `control.sock` is for adding and removing
   keys (`ssh-add`) and is never forwarded; see [Security
@@ -68,6 +71,7 @@ sudo-agent serve
 # Agent listening on /run/user/1000/sudo-agent/agent.sock
 # Control socket on /run/user/1000/sudo-agent/control.sock (for ssh-add; never forward it)
 # No keys loaded yet; add one with: SSH_AUTH_SOCK='/run/user/1000/sudo-agent/control.sock' ssh-add <key>
+# Approvals: a pinentry popup or this terminal, whichever answers first
 # export SSH_AUTH_SOCK='/run/user/1000/sudo-agent/agent.sock'
 ```
 
@@ -101,7 +105,9 @@ Or load keys at startup, with the passphrase asked in the agent's terminal:
 | `--key <PATH>` | none | OpenSSH private key to load at startup; repeatable |
 | `--ttl <DURATION>` | `15m` | TTL for `--key` keys and for `ssh-add` without `-t` (`90s`, `15m`, `8h`) |
 | `--max-ttl <DURATION>` | `8h` | Longest TTL a key may have: a longer `--ttl` is an error, a longer `ssh-add -t` is cut down |
-| `--approval-timeout <DURATION>` | `2m` | How long a prompt waits before denying |
+| `--approval-timeout <DURATION>` | `2m` | How long the terminal prompt waits for an answer |
+| `--pinentry <PROGRAM>` | `pinentry` | Program for approval popups; see [Approval popups](#approval-popups) |
+| `--pinentry-timeout <DURATION>` | `60s` | How long a popup waits for an answer |
 | `--agent-socket <PATH>` | `$XDG_RUNTIME_DIR/sudo-agent/agent.sock` | The socket to forward. Also `SUDO_AGENT_SOCKET`; the flag wins. `--socket` still works |
 | `--control-socket <PATH>` | `$XDG_RUNTIME_DIR/sudo-agent/control.sock` | The socket for `ssh-add`; never forward it. Also `SUDO_AGENT_CONTROL_SOCKET`; the flag wins |
 
@@ -111,10 +117,31 @@ Only one agent runs per user: `serve` refuses to start while another agent
 answers on either socket.
 
 The agent runs in the foreground, and approval prompts appear in its
-terminal. Ctrl-C at a prompt denies that request; Ctrl-C otherwise (or twice
-within two seconds, or closing the terminal) stops the agent, drops the keys
-and removes the sockets. A prompt is withdrawn if its client goes away (e.g.
-the SSH connection closes) or its key expires.
+terminal, and as popups when there's a display. Ctrl-C at a prompt denies
+that request; Ctrl-C otherwise (or twice within two seconds, or closing the
+terminal) stops the agent, drops the keys and removes the sockets. A prompt
+or popup is withdrawn if its client goes away (e.g. the SSH connection
+closes) or its key expires.
+
+### Approval popups
+
+When `DISPLAY` or `WAYLAND_DISPLAY` is set, each request also opens a
+[pinentry](https://gnupg.org/related_software/pinentry/) popup (it comes
+with GnuPG on most desktops). The startup line `Approvals: …` says whether
+popups are used.
+
+- The default `pinentry` is the one GnuPG uses: on Fedora, openSUSE and
+  Arch a script that picks a variant, on Debian and Ubuntu whichever
+  variant `update-alternatives` chose. `--pinentry` names another, e.g.
+  `--pinentry pinentry-qt` (or on NixOS, where there is no default).
+- It needs a graphical variant (`pinentry-gnome3`, `-qt`, `-gtk`). A
+  terminal one (`pinentry-curses`, `-tty`) can't work for the agent: it
+  fails without touching the agent's terminal, the failure is logged once,
+  and the other prompts still work.
+- A popup that fails or times out doesn't deny the request while the
+  terminal prompt is still waiting.
+- With neither a terminal nor a display, nothing can approve requests, so
+  every one is refused; the startup line says so.
 
 ### Connecting to a server
 
@@ -142,8 +169,10 @@ Then `sudo` on the server makes the approval prompt appear on your machine:
 Signature request from pid 402599, uid 1000: ssh server
   key: laptop (SHA256:…), expires in 12m30s
 Allow? [y/N] y
-Approved signature request from pid 402599, uid 1000: ssh server
+Approved (terminal) signature request from pid 402599, uid 1000: ssh server
 ```
+
+The popup shows the same text, with Allow and Deny buttons.
 
 The prompt names the local `ssh` process that carries the forwarded
 request. It can't see which command runs on the server.
@@ -194,6 +223,10 @@ asking for a password.
   announce those with a `session-bind@openssh.com` message, and as a
   further tripwire the agent refuses any client whose executable is named
   `ssh`. Every refusal is logged.
+- The terminal prompt needs `y` plus Enter and ignores type-ahead. A popup
+  can be approved with a click or Enter, so a keystroke meant for another
+  window could approve one that appears while you type. You still see the
+  popup, and you expect one for every `sudo` you run.
 - Peer details in the prompt come from the requesting process and are
   informational. They are escaped so they can't rewrite the prompt.
 
@@ -201,8 +234,7 @@ asking for a password.
 
 Planned, roughly in order:
 
-- approvals through pinentry popups or a `sudo-agent approve` command in
-  any terminal;
+- a `sudo-agent approve` command for approving from any terminal;
 - running as a background service (a systemd user unit);
 - later: `sudo-agent stop`, lock/unlock, and `sudo-agent status`;
 - showing the forwarding chain (which host a request came through) in the

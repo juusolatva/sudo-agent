@@ -23,7 +23,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio_util::sync::CancellationToken;
 
 use crate::keys::{self, KeyEntry};
-use crate::prompt::Prompter;
+use crate::routing::Router;
 
 /// Longest command line shown in an approval prompt, in characters.
 const MAX_COMMAND_CHARS: usize = 200;
@@ -35,7 +35,7 @@ const KEY_EXPIRED_WHILE_WAITING: &str = "key expired while waiting for approval"
 #[derive(Clone)]
 pub struct SudoAgent {
     keys: Arc<Mutex<Vec<KeyEntry>>>,
-    prompter: Arc<dyn Prompter>,
+    approvals: Arc<Router>,
     /// Serves signature requests one at a time, in arrival order (tokio's
     /// mutex is fair), from key lookup to logged outcome. Unlike `keys`, this
     /// is meant to be held while prompting: it guards the user's attention,
@@ -46,10 +46,10 @@ pub struct SudoAgent {
 }
 
 impl SudoAgent {
-    pub fn new(keys: Arc<Mutex<Vec<KeyEntry>>>, prompter: Arc<dyn Prompter>) -> Self {
+    pub fn new(keys: Arc<Mutex<Vec<KeyEntry>>>, approvals: Router) -> Self {
         Self {
             keys,
-            prompter,
+            approvals: Arc::new(approvals),
             requests: Arc::default(),
         }
     }
@@ -265,7 +265,7 @@ impl Session for Connection {
 
         let message = format!("Signature request from {}\n  key: {key}\nAllow?", self.peer);
         let cancel = CancellationToken::new();
-        let confirm = self.agent.prompter.confirm(&message, &cancel);
+        let confirm = self.agent.approvals.ask(&message, &cancel);
         tokio::pin!(confirm);
         let key_gone = self.agent.key_gone(key_data);
         tokio::pin!(key_gone);
@@ -283,18 +283,25 @@ impl Session for Connection {
                 return self.refuse(reason);
             }
         };
-        let approved = match answer {
-            Ok(approved) => approved,
-            // Timed out or the prompt failed: both count as a denial.
+        let answer = match answer {
+            Ok(answer) => answer,
+            // No backend answered: that counts as a denial.
             Err(e) => return self.refuse(&format!("not approved: {e}")),
         };
-        if !approved {
-            return self.refuse("denied");
+        for problem in &answer.problems {
+            log!("Approval backend failed (logged only once): {problem}");
+        }
+        if !answer.approved {
+            return self.refuse(&format!("denied ({})", answer.by));
         }
 
         match self.agent.sign_with(key_data, &request.data) {
             Ok(signature) => {
-                log!("Approved signature request from {}", self.peer);
+                log!(
+                    "Approved ({}) signature request from {}",
+                    answer.by,
+                    self.peer
+                );
                 Ok(signature)
             }
             Err(reason) => self.refuse(&reason),
@@ -420,6 +427,7 @@ pub fn sanitize(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::keys::testing::entry;
+    use crate::prompt::Prompter;
     use crate::prompt::testing::{ApprovesAfter, ScriptedPrompter};
     use signature::Verifier;
     use std::io;
@@ -437,7 +445,7 @@ mod tests {
 
     fn connect(keys: Vec<KeyEntry>, prompter: Arc<dyn Prompter>) -> Connection {
         Connection {
-            agent: SudoAgent::new(Arc::new(Mutex::new(keys)), prompter),
+            agent: SudoAgent::new(Arc::new(Mutex::new(keys)), Router::only(prompter)),
             peer: Peer::default(),
             client: None,
         }
@@ -514,7 +522,7 @@ mod tests {
         let store = Arc::new(Mutex::new(vec![key]));
         let prompter = Arc::new(ExpiresWhileAsking(Arc::clone(&store)));
         let mut conn = Connection {
-            agent: SudoAgent::new(store, prompter),
+            agent: SudoAgent::new(store, Router::only(prompter)),
             peer: Peer::default(),
             client: None,
         };
@@ -549,7 +557,10 @@ mod tests {
         let key = entry("shared", Duration::from_secs(60));
         let (first, second) = (request(&key), request(&key));
         let prompter = Arc::new(SlowApprover::default());
-        let agent = SudoAgent::new(Arc::new(Mutex::new(vec![key])), prompter.clone());
+        let agent = SudoAgent::new(
+            Arc::new(Mutex::new(vec![key])),
+            Router::only(prompter.clone()),
+        );
         let mut a = Connection {
             agent: agent.clone(),
             peer: Peer::default(),
@@ -585,7 +596,10 @@ mod tests {
         let key = entry("laptop", Duration::from_secs(60));
         let request = request(&key);
         let prompter = Arc::new(ApprovesAfter::new(Duration::from_secs(60)));
-        let agent = SudoAgent::new(Arc::new(Mutex::new(vec![key])), prompter.clone());
+        let agent = SudoAgent::new(
+            Arc::new(Mutex::new(vec![key])),
+            Router::only(prompter.clone()),
+        );
         let (mut conn, client) = with_client(agent);
 
         let sign = tokio::spawn(async move { conn.sign(request).await });
@@ -619,7 +633,10 @@ mod tests {
         let key = entry("shared", Duration::from_secs(60));
         let (first_request, second_request) = (request(&key), request(&key));
         let prompter = Arc::new(ApprovesAfter::new(Duration::from_millis(500)));
-        let agent = SudoAgent::new(Arc::new(Mutex::new(vec![key])), prompter.clone());
+        let agent = SudoAgent::new(
+            Arc::new(Mutex::new(vec![key])),
+            Router::only(prompter.clone()),
+        );
         let mut first = Connection {
             agent: agent.clone(),
             peer: Peer::default(),
@@ -647,7 +664,10 @@ mod tests {
         let key = entry("laptop", Duration::from_secs(60));
         let request = request(&key);
         let prompter = Arc::new(ApprovesAfter::new(Duration::from_millis(50)));
-        let agent = SudoAgent::new(Arc::new(Mutex::new(vec![key])), prompter.clone());
+        let agent = SudoAgent::new(
+            Arc::new(Mutex::new(vec![key])),
+            Router::only(prompter.clone()),
+        );
         let (mut conn, mut client) = with_client(agent);
 
         // A complete REQUEST_IDENTITIES message, sent before the answer.

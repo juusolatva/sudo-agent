@@ -14,7 +14,6 @@ mod agent;
 mod cli;
 mod control;
 mod keys;
-#[allow(dead_code)] // Not used for approvals until step 2c.
 mod pinentry;
 mod prompt;
 mod routing;
@@ -23,6 +22,7 @@ mod socket;
 
 use std::env;
 use std::io;
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -34,6 +34,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use crate::agent::SudoAgent;
 use crate::cli::ServeArgs;
 use crate::keys::{KeyEntry, TtlPolicy};
+use crate::pinentry::Pinentry;
 use crate::prompt::{Prompter, TerminalPrompter};
 use crate::routing::Router;
 use crate::server::Listeners;
@@ -113,8 +114,15 @@ async fn run(args: ServeArgs) -> Result<(), AgentError> {
         let terminal = Arc::clone(&terminal);
         move || terminal.interrupt()
     })?;
-    let approvals: Arc<dyn Prompter> =
-        Arc::new(Router::new([("terminal", terminal as Arc<dyn Prompter>)]));
+    let pinentry = Arc::new(Pinentry::new(&args.pinentry, args.pinentry_timeout));
+    let approvals_line = approvals_line(
+        terminal.available(),
+        pinentry.available().then_some(args.pinentry.as_path()),
+    );
+    let approvals = Router::new([
+        ("terminal", terminal as Arc<dyn Prompter>),
+        ("pinentry", pinentry as Arc<dyn Prompter>),
+    ]);
 
     let store = Arc::new(Mutex::new(loaded));
     spawn_expiry_reaper(Arc::clone(&store));
@@ -124,6 +132,7 @@ async fn run(args: ServeArgs) -> Result<(), AgentError> {
         "Control socket on {} (for ssh-add; never forward it)",
         control_path.display()
     );
+    println!("{approvals_line}");
     if args.keys.is_empty() {
         println!(
             "No keys loaded yet; add one with: SSH_AUTH_SOCK='{}' ssh-add <key>",
@@ -154,6 +163,26 @@ async fn run(args: ServeArgs) -> Result<(), AgentError> {
     drop(agent_file);
     drop(control_file);
     result
+}
+
+/// The startup line saying how requests can be approved: `pinentry` is the
+/// program, if it can show popups.
+fn approvals_line(terminal: bool, pinentry: Option<&Path>) -> String {
+    match (terminal, pinentry) {
+        (true, Some(program)) => format!(
+            "Approvals: a {} popup or this terminal, whichever answers first",
+            program.display()
+        ),
+        (true, None) => "Approvals: this terminal only (no pinentry popups: neither DISPLAY \
+                         nor WAYLAND_DISPLAY is set)"
+            .to_owned(),
+        (false, Some(program)) => {
+            format!("Approvals: a {} popup (no terminal)", program.display())
+        }
+        (false, None) => "No way to approve requests: there's no terminal, and pinentry needs \
+                          DISPLAY or WAYLAND_DISPLAY; every signature request will be refused"
+            .to_owned(),
+    }
 }
 
 /// Resolves on the first signal that should stop the agent cleanly: SIGINT

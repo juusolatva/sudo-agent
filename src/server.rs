@@ -47,6 +47,7 @@ mod tests {
     use crate::keys::testing::entry;
     use crate::prompt::Prompter;
     use crate::prompt::testing::{ApprovesAfter, ScriptedPrompter};
+    use crate::routing::Router;
     use crate::socket;
     use signature::Verifier;
     use ssh_agent_lib::agent::Session;
@@ -95,7 +96,7 @@ mod tests {
                 agent: agent_listener,
                 control: control_listener,
             };
-            let agent = SudoAgent::new(Arc::new(Mutex::new(keys)), prompter);
+            let agent = SudoAgent::new(Arc::new(Mutex::new(keys)), Router::only(prompter));
             let (stop, stopped) = oneshot::channel::<()>();
             let served = tokio::spawn(async move {
                 let shutdown = async {
