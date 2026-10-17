@@ -1,0 +1,31 @@
+# cargo-deny configuration. Advisories are checked by cargo-audit (security.yml),
+# so CI runs: cargo deny --locked check bans licenses sources
+
+[graph]
+# sudo-agent targets Linux only; skip Windows/WASM-only dependencies.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+all-features = true
+
+[licenses]
+# Each entry is used by at least one dependency in Cargo.lock.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause", # curve25519-dalek, ed25519-dalek, subtle
+    "Unicode-3.0",  # unicode-ident
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

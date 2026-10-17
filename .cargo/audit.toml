@@ -1,0 +1,12 @@
+# cargo-audit configuration (read by `cargo audit`, including security.yml).
+
+[advisories]
+ignore = [
+    # rsa: Marvin Attack, timing side channel (no fixed version exists).
+    # Pulled in by ssh-key's `crypto` feature; used only when signing with an
+    # RSA key. The only remote path to it is a sign request over the forwarded
+    # agent.sock, and every one waits for a human yes/no, whose latency swamps
+    # the timing differences the attack needs. Ed25519 is the recommended key
+    # type. Revisit once RustCrypto/RSA#626 is fixed.
+    "RUSTSEC-2023-0071",
+]
