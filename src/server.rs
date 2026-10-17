@@ -124,10 +124,17 @@ mod tests {
             Client::new(UnixStream::connect(&self.control_path).await.unwrap())
         }
 
-        /// Comments of the keys listed on `agent.sock`.
+        /// Comments of the keys listed on `agent.sock`, without the time
+        /// left.
         async fn listed(&self) -> Vec<String> {
             let identities = self.client().await.request_identities().await.unwrap();
-            identities.into_iter().map(|i| i.comment).collect()
+            identities
+                .into_iter()
+                .map(|i| match i.comment.rsplit_once(" (") {
+                    Some((comment, left)) if left.ends_with(" left)") => comment.to_owned(),
+                    _ => panic!("no time left in {:?}", i.comment),
+                })
+                .collect()
         }
 
         /// Stops serving; the temporary directory stays until `self` drops.
@@ -169,14 +176,37 @@ mod tests {
 
     #[tokio::test]
     async fn lists_loaded_keys() {
-        let key = entry("laptop", Duration::from_secs(60));
+        let key = entry("laptop", Duration::from_secs(3600 + 30));
         let public = public(&key);
         let running = Running::start(vec![key], Arc::new(ScriptedPrompter::default()));
 
         let identities = running.client().await.request_identities().await.unwrap();
         assert_eq!(identities.len(), 1);
         assert_eq!(identities[0].credential.key_data(), &public);
-        assert_eq!(identities[0].comment, "laptop");
+        assert_eq!(identities[0].comment, "laptop (1h00m left)");
+    }
+
+    /// `ssh-add -l` shows the time left, on a server through the forwarded
+    /// `agent.sock` as well as locally on `control.sock`.
+    #[tokio::test]
+    async fn listed_comments_show_time_left_on_both_sockets() {
+        // Above an hour only minutes are shown, which leaves 30 s of slack.
+        let keys = vec![
+            entry("one", Duration::from_secs(3600 + 5 * 60 + 30)),
+            entry("eight", Duration::from_secs(8 * 3600 + 30)),
+        ];
+        let running = Running::start(keys, Arc::new(ScriptedPrompter::default()));
+
+        for mut client in [running.client().await, running.control().await] {
+            let comments: Vec<_> = client
+                .request_identities()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|i| i.comment)
+                .collect();
+            assert_eq!(comments, ["one (1h05m left)", "eight (8h00m left)"]);
+        }
     }
 
     #[tokio::test]

@@ -239,7 +239,7 @@ impl Session for Connection {
             .filter(|k| !k.is_expired(now))
             .map(|k| Identity {
                 credential: k.private_key.public_key().key_data().clone().into(),
-                comment: k.private_key.comment().into(),
+                comment: k.listed_comment(now),
             })
             .collect();
 

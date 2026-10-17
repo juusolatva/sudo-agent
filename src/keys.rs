@@ -22,6 +22,17 @@ impl KeyEntry {
     pub fn is_expired(&self, now: Duration) -> bool {
         now >= self.expires_at
     }
+
+    /// The comment as listed to clients: the key's own comment followed by
+    /// the time left, e.g. `laptop (14m30s left)`, so `ssh-add -l` shows it
+    /// on any server the agent is forwarded to.
+    pub fn listed_comment(&self, now: Duration) -> String {
+        let left = format_remaining(self.expires_at.saturating_sub(now));
+        match self.private_key.comment() {
+            "" => format!("({left} left)"),
+            comment => format!("{comment} ({left} left)"),
+        }
+    }
 }
 
 /// How long keys added over `control.sock` stay usable.
@@ -287,6 +298,20 @@ mod tests {
         assert_eq!(format_remaining(secs(45)), "45s");
         assert_eq!(format_remaining(secs(870)), "14m30s");
         assert_eq!(format_remaining(secs(3900)), "1h05m");
+    }
+
+    #[test]
+    fn listed_comment_shows_time_left() {
+        let mut key = testing::entry("laptop", Duration::ZERO);
+        let now = key.expires_at;
+        key.expires_at = now + Duration::from_secs(870);
+        assert_eq!(key.listed_comment(now), "laptop (14m30s left)");
+        assert_eq!(
+            key.listed_comment(now + Duration::from_secs(900)),
+            "laptop (0s left)"
+        );
+        key.private_key.set_comment("");
+        assert_eq!(key.listed_comment(now), "(14m30s left)");
     }
 }
 

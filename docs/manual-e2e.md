@@ -69,8 +69,8 @@ Run these in the forwarded session. None of them changes anything.
 ```sh
 echo "$SSH_AUTH_SOCK"          # set: ~/.ssh/agent/s.*.sshd.* on recent
                                # OpenSSH, /tmp/ssh-XXXX/agent.NNNN on older
-ssh-add -l                     # lists the key with sudo-agent's fingerprint;
-                               # listing never prompts
+ssh-add -l                     # lists the key with sudo-agent's fingerprint
+                               # and its time left; listing never prompts
 grep -n pam_ssh_agent_auth /etc/pam.d/sudo   # note the file= argument
 ssh-keygen -lf <that file>     # must include the same fingerprint
 dpkg -l | grep -i ssh-agent-auth || rpm -q pam_ssh_agent_auth   # record version
@@ -107,6 +107,7 @@ every `sudo` authenticates anyway.)
 | 9 | With the key added by `ssh-add` over `control.sock` (step 1), `sudo -k; sudo -v`, answer **y** | As case 1; the agent logged `Added key … from ssh-add …, usable for …` when it was added | Succeeds with no password prompt |
 | 10 | `ssh -o ForwardAgent=$XDG_RUNTIME_DIR/sudo-agent/control.sock <server>`, then `ssh-add -l` | `Refused control connection from … ssh …` | `error fetching identities: agent refused operation` |
 | 11 | In a session forwarding `agent.sock`, `ssh-add <some key file>` and `ssh-add -D` on the server | `Refused adding a key …` / `Refused removing all keys …: agent.sock only lists and signs` | Both refused; `ssh-add -l` still lists the key |
+| 12 | `ssh-add -l` on the server, then again a minute later | Nothing (listing never prompts) | Each key's comment ends in its time left, e.g. `laptop (14m30s left)`, about a minute less the second time; it matches `ssh-add -l` on the laptop against `control.sock` |
 | 5 | Stop the agent (Ctrl-C with no prompt open), then `sudo -k; sudo -v` | Nothing (agent is gone) | Password prompt: proves `sudo` really authenticates through `sudo-agent`, not some other forwarded agent |
 
 Report: the pam_ssh_agent_auth version, key type, the exact prompt text, and

@@ -249,6 +249,10 @@ needs an answer. Design agreed 2026-10-07; open decisions settled
      client has an agent of its own, documented in README and e2e.
 - [ ] **1c. Time left in key comments** on both sockets. New e2e case:
    `ssh-add -l` on a server shows the time left.
+   - Implemented 2026-10-17 as `<comment> (14m30s left)`, in the format the
+     approval prompt already uses (`keys::format_remaining`: seconds below
+     an hour, minutes above). Released as 0.2.1. To do: e2e case 12 on a
+     server.
 - [ ] **2. pinentry approvals**, plus the routing scaffold (all backends at
    once, first answer wins).
    - Spawn `pinentry` only when a request arrives and speak its Assuan

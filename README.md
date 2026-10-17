@@ -35,7 +35,9 @@ ssh-add ─► control.sock ─┐                         sudo
   needs a `y`.
 - **TTL inside the agent.** A key's TTL starts when it's loaded. Keys are
   dropped (and zeroized) when their time is up. The clock keeps counting
-  while the machine is suspended.
+  while the machine is suspended. `ssh-add -l` shows the time left after
+  each key's comment, e.g. `laptop (14m30s left)`, on a server you've
+  forwarded the agent to as well as locally.
 - **Every signature is approved.** The prompt shows which local process is
   asking and which key it wants, so a request you didn't start (for example
   from someone else with access to the forwarded socket) is visible rather
@@ -84,7 +86,7 @@ SSH_AUTH_SOCK=$XDG_RUNTIME_DIR/sudo-agent/control.sock ssh-add -t 4h ~/.ssh/id_e
   stays until removed.
 - Adding a key that is already loaded replaces it and restarts its TTL;
   that's how you extend a session.
-- `-l` lists keys, `-d` removes one, `-D` removes all.
+- `-l` lists keys with their time left, `-d` removes one, `-D` removes all.
 - `-c` is accepted (every signature is approved anyway). `-h` (destination
   restrictions) and other constraints are refused rather than silently
   ignored, as are certificates and smartcard keys.
@@ -173,9 +175,9 @@ Keep a root shell open while you change any of this.
    auth sufficient pam_ssh_agent_auth.so file=/etc/security/authorized_keys
    ```
 
-To check it: `ssh-add -l` on the server should list your key, and
-`sudo -k; sudo -v` should prompt on your machine instead of asking for a
-password.
+To check it: `ssh-add -l` on the server should list your key with its
+time left, and `sudo -k; sudo -v` should prompt on your machine instead of
+asking for a password.
 
 ## Security notes
 
@@ -199,7 +201,6 @@ password.
 
 Planned, roughly in order:
 
-- time left shown by `ssh-add -l`, also on the server;
 - approvals through pinentry popups or a `sudo-agent approve` command in
   any terminal;
 - running as a background service (a systemd user unit);
