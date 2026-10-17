@@ -253,23 +253,79 @@ needs an answer. Design agreed 2026-10-07; open decisions settled
      already uses (`keys::format_remaining`: seconds below an hour, minutes
      above).
 - [ ] **2. pinentry approvals**, plus the routing scaffold (all backends at
-   once, first answer wins).
-   - Spawn `pinentry` only when a request arrives and speak its Assuan
-     protocol: `CONFIRM` for yes/no, `SETDESC`/`SETPROMPT` for the
-     request details. Cancellation kills the child.
-   - Talk to it directly, with no crate dependency; the `pinentry` package
-     comes with GnuPG on most desktops.
-   - Still to decide here: which program (a `--pinentry` flag; the default
-     must skip curses/tty variants, since a daemon has no terminal) and its
-     own timeout via `SETTIMEOUT` (30–60 s likely suits a popup better than
-     the terminal's 2 min).
-   - Check before trusting it: whether a popup that grabs the keyboard
-     while you're typing can be approved by a stray Enter or Space (the
-     GUI version of the type-ahead problem the terminal prompt already
-     handles).
+   once, first answer wins). Split into 2a–2c, each tested before the next.
+   Decided 2026-10-17:
+   - The popup is a pinentry `CONFIRM` dialog (Allow / Deny buttons) with
+     the same text as the terminal prompt. It never asks for a passphrase
+     and sends no `SETKEYINFO` (no "save in password manager" offer).
+     (`SETPROMPT` labels an input field, which `CONFIRM` doesn't have.)
+   - A stray Enter or Space may approve a popup that appears while you're
+     typing. That's accepted: you expect a popup for every `sudo` you run,
+     and one you didn't start is still seen. sudo-agent makes remote `sudo`
+     convenient; it isn't an intrusion detection tool.
+   - Its own timeout, 60 s (`SETTIMEOUT`); the popup is easy to notice and
+     expected.
+   - The program is `pinentry` (the distro's wrapper or alternatives
+     symlink, which gpg-agent uses too), overridable with `--pinentry`
+     (needed on NixOS, or to pick a variant).
+   - It's used only when `DISPLAY` or `WAYLAND_DISPLAY` is set. That only
+     says a GUI pinentry *could* work, not that anyone is looking (stale
+     after logout, screen locked), which routing tolerates: a popup that
+     fails or times out is no answer, not a denial, and the other backends
+     are asked at the same time.
+   - The child runs in its own session (`setsid`), so a curses/tty variant
+     picked by the wrapper can't take `serve`'s terminal (it fails instead)
+     and Ctrl-C doesn't reach it. `PR_SET_PDEATHSIG(SIGKILL)` (spawned from
+     an async worker thread, as it follows the spawning thread) and the
+     60 s timeout clean up after a daemon that dies abruptly.
+   - Talk to it directly over pipes, with no crate dependency.
+- [ ] **2a. Routing scaffold**, still with the terminal as the only backend:
+   no visible change apart from log wording.
+   - A router `Prompter` asks every available backend at once, each with a
+     child `CancellationToken`. The first real answer (approve or deny)
+     wins; the others are withdrawn and awaited, so their lines end before
+     the log line. A backend that times out or fails just drops out; when
+     all have, the request is denied with their reasons logged. No backend
+     available: deny and log.
+   - Backends tell an answer apart from no answer (today `confirm()`'s
+     `Err` covers both). Ctrl-C at the terminal prompt becomes a deny
+     answer, so it withdraws the other backends instead of dropping out.
+   - Each backend says whether it's available (the terminal: `/dev/tty`
+     opens). `passphrase()` (`--key` at startup) stays on the terminal.
+   - `--approval-timeout` becomes the terminal prompt's timeout.
+   - Tests with the scripted prompters: first answer wins and withdraws the
+     rest, a failed backend doesn't deny while another can still answer,
+     all failing denies, cancelling the request withdraws every backend.
+- [ ] **2b. pinentry client** (`src/pinentry.rs`), not wired in yet.
+   - Spawn per request: pipes for stdin/stdout, stderr to `/dev/null`,
+     `setsid` + `PR_SET_PDEATHSIG` in `pre_exec`, `kill_on_drop`.
+   - Send `SETTITLE`, `SETDESC`, `SETOK Allow`, `SETCANCEL Deny`,
+     `SETTIMEOUT`, `CONFIRM`; `OK` approves, the cancel error denies,
+     timeout or anything else is no answer. Percent-escape `%`, CR and LF,
+     keep lines under Assuan's 1000 bytes, and give every reply a deadline
+     (a curses fallback may write screen codes into the pipe).
+   - Withdrawing: SIGTERM, then SIGKILL after about a second, then reap.
+   - Tests against a fake pinentry script in a temp dir (approve, deny,
+     timeout, garbage, hang, cancel kills it, escaping), plus an
+     `#[ignore]`d test that pops up the real one on the laptop.
+- [ ] **2c. Wire pinentry into routing.** Candidate for 0.3.0.
+   - `--pinentry <PROGRAM>` (default `pinentry`) and a 60 s pinentry
+     timeout; available only with `DISPLAY`/`WAYLAND_DISPLAY`; the startup
+     banner says which backends are in use, or why pinentry isn't.
+   - Log lines name the backend that answered; repeated pinentry failures
+     (e.g. a curses variant without a terminal) are logged once with a
+     `--pinentry` hint, not on every request.
+   - Docs: README, AGENTS.md, `docs/manual-e2e.md` cases.
+   - Laptop checks: popup in the desktop session; Ctrl-C at the terminal
+     prompt withdraws the popup; popup withdrawn on client hang-up and key
+     expiry; `serve` over SSH without a display (curses fails cleanly, the
+     terminal prompt still works); killing the daemon closes the popup
+     (gnome3's window belongs to `gcr-prompter`). Then the server cases.
    - A daemon started by systemd needs `DISPLAY`/`WAYLAND_DISPLAY` and
-     `DBUS_SESSION_BUS_ADDRESS` in its environment. Most desktops import
-     them into the user manager; Cinnamon on the laptop does.
+     `DBUS_SESSION_BUS_ADDRESS` in its environment, and gets them only if
+     the desktop imports them into the user manager before the service
+     starts; that's step 3's problem (unit ordering or documented
+     `import-environment`).
 - [ ] **3. systemd user unit** (`sudo-agent.service`) and docs for
    `systemctl --user enable --now sudo-agent`.
    - Logs go to `journalctl --user -u sudo-agent` (stderr); timestamps in
