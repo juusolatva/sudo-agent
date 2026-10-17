@@ -279,8 +279,10 @@ needs an answer. Design agreed 2026-10-07; open decisions settled
      an async worker thread, as it follows the spawning thread) and the
      60 s timeout clean up after a daemon that dies abruptly.
    - Talk to it directly over pipes, with no crate dependency.
-- [ ] **2a. Routing scaffold**, still with the terminal as the only backend:
-   no visible change apart from log wording.
+- [x] **2a. Routing scaffold**, still with the terminal as the only backend:
+   no visible change apart from log wording. Done 2026-10-17 (`src/routing.rs`);
+   tested by the user in a terminal (approve/deny, Ctrl-C now logs `denied`,
+   timeout, hang-up).
    - A router `Prompter` asks every available backend at once, each with a
      child `CancellationToken`. The first real answer (approve or deny)
      wins; the others are withdrawn and awaited, so their lines end before
@@ -297,11 +299,16 @@ needs an answer. Design agreed 2026-10-07; open decisions settled
      rest, a failed backend doesn't deny while another can still answer,
      all failing denies, cancelling the request withdraws every backend.
 - [ ] **2b. pinentry client** (`src/pinentry.rs`), not wired in yet.
+   Implemented 2026-10-17, awaiting the user's test with the real popup.
    - Spawn per request: pipes for stdin/stdout, stderr to `/dev/null`,
      `setsid` + `PR_SET_PDEATHSIG` in `pre_exec`, `kill_on_drop`.
    - Send `SETTITLE`, `SETDESC`, `SETOK Allow`, `SETCANCEL Deny`,
-     `SETTIMEOUT`, `CONFIRM`; `OK` approves, the cancel error denies,
-     timeout or anything else is no answer. Percent-escape `%`, CR and LF,
+     `SETTIMEOUT`, `CONFIRM`; `OK` approves, only the cancel error (99)
+     denies, timeout or anything else is no answer. Found probing: without a
+     terminal `pinentry-tty` (what the wrapper picks with no display)
+     answers "Not confirmed" (114) and `pinentry-curses` "Inappropriate
+     ioctl", so 114 must not count as a denial (a real Deny is always 99,
+     as there's no third button). Percent-escape `%`, CR and LF,
      keep lines under Assuan's 1000 bytes, and give every reply a deadline
      (a curses fallback may write screen codes into the pipe).
    - Withdrawing: SIGTERM, then SIGKILL after about a second, then reap.

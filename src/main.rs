@@ -14,6 +14,8 @@ mod agent;
 mod cli;
 mod control;
 mod keys;
+#[allow(dead_code)] // Not used for approvals until step 2c.
+mod pinentry;
 mod prompt;
 mod routing;
 mod server;
