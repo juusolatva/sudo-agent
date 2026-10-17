@@ -108,11 +108,19 @@ impl Pinentry {
 
     async fn ask(&self, session: &mut Session, message: &str) -> io::Result<bool> {
         session.expect_ok("start").await?;
-        let description = escape(message, MAX_LINE - "SETDESC \n".len());
+        // Its own deadline, so it isn't mistaken for the key's time left.
+        let message = format!(
+            "{message}\n\nThis popup closes in {} without an answer.",
+            keys::format_duration(self.timeout)
+        );
+        let description = escape(&message, MAX_LINE - "SETDESC \n".len());
         // pinentry reads 0 as "no timeout".
         let timeout = self.timeout.as_secs().max(1);
         for command in [
             "SETTITLE sudo-agent".to_owned(),
+            // The heading of a pinentry-gnome3 CONFIRM dialog ("Message"
+            // without it); others don't show it.
+            "SETPROMPT sudo-agent".to_owned(),
             format!("SETDESC {description}"),
             "SETOK Allow".to_owned(),
             "SETCANCEL Deny".to_owned(),
@@ -399,7 +407,9 @@ done"#,
             fake.log(),
             [
                 "SETTITLE sudo-agent",
-                "SETDESC Signature request from pid 1%0A  key: k%0AAllow?",
+                "SETPROMPT sudo-agent",
+                "SETDESC Signature request from pid 1%0A  key: k%0AAllow?%0A%0AThis popup closes \
+                 in 1m without an answer.",
                 "SETOK Allow",
                 "SETCANCEL Deny",
                 "SETTIMEOUT 60",
@@ -593,7 +603,7 @@ done"#,
 
     const REAL_MESSAGE: &str = "Signature request from pid 402599, uid 1000: ssh server\n  \
                                 key: laptop (SHA256:LaGG9bgLw3dl0cl0JDUUbOPEl36TgNwNysXvEICHKtU), \
-                                expires in 12m30s\nAllow?";
+                                12m30s left\nAllow?";
 
     #[tokio::test]
     #[ignore = "opens a real pinentry popup"]

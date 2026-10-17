@@ -58,6 +58,10 @@ pub struct ServeArgs {
     #[arg(long, value_name = "DURATION", default_value = "60s", value_parser = keys::parse_duration)]
     pub pinentry_timeout: Duration,
 
+    /// Don't show pinentry popups; approve at this terminal only.
+    #[arg(long, conflicts_with_all = ["pinentry", "pinentry_timeout"])]
+    pub no_pinentry: bool,
+
     /// Agent socket, the one to forward [env: SUDO_AGENT_SOCKET]
     /// [default: $XDG_RUNTIME_DIR/sudo-agent/agent.sock]
     #[arg(long, alias = "socket", value_name = "PATH")]
@@ -151,6 +155,18 @@ mod tests {
         let parsed = parse(&["--pinentry", "pinentry-qt", "--pinentry-timeout", "30s"]).unwrap();
         assert_eq!(parsed.pinentry, PathBuf::from("pinentry-qt"));
         assert_eq!(parsed.pinentry_timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn no_pinentry() {
+        assert!(!parse(&["serve"]).unwrap().no_pinentry);
+        assert!(parse(&["serve", "--no-pinentry"]).unwrap().no_pinentry);
+        // Setting up popups that are off is a mistake worth pointing out.
+        for other in [["--pinentry", "pinentry-qt"], ["--pinentry-timeout", "30s"]] {
+            let args = [&["serve", "--no-pinentry"][..], &other[..]].concat();
+            let error = parse(&args).err().unwrap();
+            assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+        }
     }
 
     #[test]

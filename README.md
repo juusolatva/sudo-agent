@@ -108,6 +108,7 @@ Or load keys at startup, with the passphrase asked in the agent's terminal:
 | `--approval-timeout <DURATION>` | `2m` | How long the terminal prompt waits for an answer |
 | `--pinentry <PROGRAM>` | `pinentry` | Program for approval popups; see [Approval popups](#approval-popups) |
 | `--pinentry-timeout <DURATION>` | `60s` | How long a popup waits for an answer |
+| `--no-pinentry` | | No popups: approve at the agent's terminal only |
 | `--agent-socket <PATH>` | `$XDG_RUNTIME_DIR/sudo-agent/agent.sock` | The socket to forward. Also `SUDO_AGENT_SOCKET`; the flag wins. `--socket` still works |
 | `--control-socket <PATH>` | `$XDG_RUNTIME_DIR/sudo-agent/control.sock` | The socket for `ssh-add`; never forward it. Also `SUDO_AGENT_CONTROL_SOCKET`; the flag wins |
 
@@ -127,8 +128,8 @@ closes) or its key expires.
 
 When `DISPLAY` or `WAYLAND_DISPLAY` is set, each request also opens a
 [pinentry](https://gnupg.org/related_software/pinentry/) popup (it comes
-with GnuPG on most desktops). The startup line `Approvals: …` says whether
-popups are used.
+with GnuPG on most desktops), unless `--no-pinentry` is given. The startup
+line `Approvals: …` says whether popups are used.
 
 - The default `pinentry` is the one GnuPG uses: on Fedora, openSUSE and
   Arch a script that picks a variant, on Debian and Ubuntu whichever
@@ -140,6 +141,9 @@ popups are used.
   and the other prompts still work.
 - A popup that fails or times out doesn't deny the request while the
   terminal prompt is still waiting.
+- `pinentry-gnome3` holds the keyboard and mouse while it's open, so the
+  terminal can't be reached until you answer the popup or it times out
+  (`--pinentry-timeout`); the terminal prompt then still waits.
 - With neither a terminal nor a display, nothing can approve requests, so
   every one is refused; the startup line says so.
 
@@ -167,12 +171,13 @@ Then `sudo` on the server makes the approval prompt appear on your machine:
 
 ```
 Signature request from pid 402599, uid 1000: ssh server
-  key: laptop (SHA256:…), expires in 12m30s
+  key: laptop (SHA256:…), 12m30s left
 Allow? [y/N] y
 Approved (terminal) signature request from pid 402599, uid 1000: ssh server
 ```
 
-The popup shows the same text, with Allow and Deny buttons.
+The popup shows the same text, says when it closes by itself
+(`--pinentry-timeout`), and has Allow and Deny buttons.
 
 The prompt names the local `ssh` process that carries the forwarded
 request. It can't see which command runs on the server.

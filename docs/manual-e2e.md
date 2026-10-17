@@ -108,18 +108,27 @@ every `sudo` authenticates anyway.)
 | 10 | `ssh -o ForwardAgent=$XDG_RUNTIME_DIR/sudo-agent/control.sock <server>`, then `ssh-add -l` | `Refused control connection from … ssh …` | `error fetching identities: agent refused operation` |
 | 11 | In a session forwarding `agent.sock`, `ssh-add <some key file>` and `ssh-add -D` on the server | `Refused adding a key …` / `Refused removing all keys …: agent.sock only lists and signs` | Both refused; `ssh-add -l` still lists the key |
 | 12 | `ssh-add -l` on the server, then again a minute later | Nothing (listing never prompts) | Each key's comment ends in its time left, e.g. `laptop (14m30s left)`, about a minute less the second time; it matches `ssh-add -l` on the laptop against `control.sock` |
-| 13 | In the desktop session, `sudo -k; sudo -v`, click **Allow** in the popup | Startup said `Approvals: a pinentry popup or this terminal …`; popup and terminal prompt appear together; the terminal prompt line ends, then `Approved (pinentry) …` | Succeeds |
+| 13 | In the desktop session, `sudo -k; sudo -v`, click **Allow** in the popup | Startup said `Approvals: a pinentry popup or this terminal …`; popup (headed `sudo-agent`, text ending in `This popup closes in 1m without an answer.`) and terminal prompt appear together; the terminal prompt line ends, then `Approved (pinentry) …` | Succeeds |
 | 14 | As 13, but **Deny** (then again with Escape, and with closing the window) | Terminal prompt line ends, then `Refused …: denied (pinentry)` | Falls back to the password prompt |
-| 15 | As 13, but answer **y** at the terminal | The popup disappears; `Approved (terminal) …` | Succeeds |
-| 16 | As 13, but Ctrl-C at the terminal | The popup disappears; `Refused …: denied (terminal)`; the agent keeps running | Falls back to the password prompt |
-| 17 | As 13, answer nothing | After 60 s the popup closes by itself and the terminal prompt keeps waiting; at 2 min `Refused …: not approved: pinentry: no answer within 1m; terminal: no answer within 2m` | Falls back to the password prompt |
-| 18 | As 13, then end the SSH connection (`~.`) while the popup is open | Popup and terminal prompt withdrawn; `Refused …: client disconnected` | Connection closed |
+| 15 | Agent run in tmux (`tmux new -s sa sudo-agent serve`); in another laptop terminal `(sleep 15; tmux send-keys -t sa y Enter) &`, then within 15 s `sudo -k; sudo -v` and leave the popup alone | At 15 s the terminal answers: the popup disappears; `Approved (terminal) …` | Succeeds |
+| 16 | In another laptop terminal `(sleep 15; pkill -INT -x sudo-agent) &` (what Ctrl-C sends), then within 15 s `sudo -k; sudo -v` and leave the popup alone | At 15 s the popup disappears; `Refused …: denied (terminal)`; the agent keeps running | Falls back to the password prompt |
+| 17 | As 13, answer nothing anywhere | After 60 s the popup closes by itself and the terminal prompt keeps waiting (answering it then works); left alone, at 2 min `Refused …: not approved: pinentry: no answer within 1m; terminal: no answer within 2m` | Falls back to the password prompt |
+| 18 | In another laptop terminal `(sleep 15; pkill -x -n ssh) &` (the newest `ssh`: the server session), then within 15 s `sudo -k; sudo -v` and leave the popup alone | At 15 s popup and terminal prompt are withdrawn; `Refused …: client disconnected` | Connection closed |
 | 19 | As case 8 (`--ttl 1m`, ~10 s left), with the popup open | At expiry the popup and the terminal prompt are withdrawn; `Refused …: key expired while waiting for approval` | Falls back to the password prompt |
 | 20 | Restart with `--pinentry pinentry-curses`, then `sudo -k; sudo -v` twice, answering at the terminal | The terminal prompt works and isn't disturbed; after the first answer `Approval backend failed (logged only once): pinentry: pinentry failed: Inappropriate ioctl for device …`; not repeated the second time | Both as answered |
 | 21 | Laptop only: SSH into the laptop (no `DISPLAY`) and run `sudo-agent serve` there | Startup says `Approvals: this terminal only (no pinentry popups: …)`; requests prompt in that terminal only | — |
-| 22 | With a popup open, `kill -9` the agent from another terminal | The popup closes (pinentry is killed with the agent) | Falls back to the password prompt |
+| 22 | In another laptop terminal `(sleep 15; pkill -KILL -x sudo-agent) &`, then within 15 s `sudo -k; sudo -v` | The popup closes (pinentry is killed with the agent) | Falls back to the password prompt |
 | 23 | Run the agent without a terminal in the desktop session: `setsid -f sudo-agent serve > /tmp/sudo-agent.log 2>&1`, add the key, `sudo -k; sudo -v`, click **Allow** | The log says `Approvals: a pinentry popup (no terminal)`, then `Approved (pinentry) …` | Succeeds |
 | 5 | Stop the agent (Ctrl-C with no prompt open), then `sudo -k; sudo -v` | Nothing (agent is gone) | Password prompt: proves `sudo` really authenticates through `sudo-agent`, not some other forwarded agent |
+
+Cases 1, 2 and 6–9 test the terminal prompt: since step 2c, start the agent
+with `--no-pinentry` for them (startup says `Approvals: this terminal only
+(pinentry popups are off with --no-pinentry)`), or they're answered in the
+popup instead, which cases 13–19 cover.
+
+`pinentry-gnome3` holds the keyboard and mouse while its popup is open (seen
+on Cinnamon), so the terminal can't be reached then. Cases 15, 16, 18 and
+22 therefore act on the agent from a timer started beforehand.
 
 Report: the pam_ssh_agent_auth version, key type, the exact prompt text, and
 any `Refused …` lines from the laptop.
@@ -197,6 +206,24 @@ added with `ssh-add -t 240m` over `control.sock` (the `ssh-load` flow; logged
   `licepad (14m14s left) (ED25519)`, i.e. with the time left after its
   comment. Passed. Only one listing was taken; the "a minute later"
   re-check wasn't part of this run.
+
+**2026-10-17, laptop + server `palvelin`** (step 2c, `pinentry-gnome3` on
+Fedora 44 Cinnamon through the `pinentry` wrapper):
+
+- Case 13 (Allow) and case 14 (Deny, Escape; this popup has no close
+  button) passed. The first popup was headed "Message" and its key line
+  ("expires in …") read like the popup's own deadline; fixed with
+  `SETPROMPT sudo-agent`, a closing line with the popup's timeout, and the
+  key line as `12m30s left`.
+- The popup holds keyboard and mouse, so cases 15, 16, 18 and 22 were run
+  from timers (tmux `send-keys`, `pkill -INT`, `pkill ssh`, `pkill -KILL`):
+  all passed, each withdrawing the popup. Case 17 passed: after the
+  popup's 60 s the terminal still answered both ways, and with no answer
+  anywhere the request was refused at 2 min.
+- Case 19 (key expiring with the popup open), 20 (`pinentry-curses`: went
+  straight to the terminal prompt, and the `Approval backend failed (logged
+  only once)` line appeared once), 21 (`serve` over SSH without a display)
+  and 23 (`setsid -f`, popup only) passed.
 
 ## Troubleshooting
 

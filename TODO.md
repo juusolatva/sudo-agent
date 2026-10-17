@@ -258,7 +258,11 @@ needs an answer. Design agreed 2026-10-07; open decisions settled
    - The popup is a pinentry `CONFIRM` dialog (Allow / Deny buttons) with
      the same text as the terminal prompt. It never asks for a passphrase
      and sends no `SETKEYINFO` (no "save in password manager" offer).
-     (`SETPROMPT` labels an input field, which `CONFIRM` doesn't have.)
+     `SETPROMPT sudo-agent` too: `pinentry-gnome3` shows it as the heading
+     of a `CONFIRM` dialog ("Message" without it; found in testing). The
+     description ends with when the popup closes, so its timeout isn't
+     mistaken for the key's time left (now shown as `12m30s left`, as in
+     `ssh-add -l`, instead of `expires in 12m30s`).
    - A stray Enter or Space may approve a popup that appears while you're
      typing. That's accepted: you expect a popup for every `sudo` you run,
      and one you didn't start is still seen. sudo-agent makes remote `sudo`
@@ -318,7 +322,11 @@ needs an answer. Design agreed 2026-10-07; open decisions settled
      timeout, garbage, hang, cancel kills it, escaping), plus an
      `#[ignore]`d test that pops up the real one on the laptop.
 - [ ] **2c. Wire pinentry into routing.** Candidate for 0.3.0. Implemented
-   2026-10-17 (e2e cases 13–23), awaiting the user's laptop and server tests.
+   2026-10-17 (e2e cases 13–23); laptop cases passed 2026-10-17; the
+   terminal-only server cases still to run.
+   - `--no-pinentry` (added 2026-10-17 at the user's request): no popups,
+     terminal only. Makes the terminal cases testable on a desktop, and
+     suits anyone who'd rather not have a popup holding the keyboard.
    - `--pinentry <PROGRAM>` (default `pinentry`) and a 60 s pinentry
      timeout; available only with `DISPLAY`/`WAYLAND_DISPLAY`; the startup
      banner says which backends are in use, or why pinentry isn't.

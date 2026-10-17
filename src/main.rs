@@ -114,15 +114,21 @@ async fn run(args: ServeArgs) -> Result<(), AgentError> {
         let terminal = Arc::clone(&terminal);
         move || terminal.interrupt()
     })?;
-    let pinentry = Arc::new(Pinentry::new(&args.pinentry, args.pinentry_timeout));
-    let approvals_line = approvals_line(
-        terminal.available(),
-        pinentry.available().then_some(args.pinentry.as_path()),
-    );
-    let approvals = Router::new([
-        ("terminal", terminal as Arc<dyn Prompter>),
-        ("pinentry", pinentry as Arc<dyn Prompter>),
-    ]);
+    let mut backends: Vec<(&'static str, Arc<dyn Prompter>)> = Vec::new();
+    let popups = if args.no_pinentry {
+        Popups::Off
+    } else {
+        let pinentry = Pinentry::new(&args.pinentry, args.pinentry_timeout);
+        let popups = match pinentry.available() {
+            true => Popups::Program(&args.pinentry),
+            false => Popups::NoDisplay,
+        };
+        backends.push(("pinentry", Arc::new(pinentry)));
+        popups
+    };
+    let approvals_line = approvals_line(terminal.available(), popups);
+    backends.insert(0, ("terminal", terminal));
+    let approvals = Router::new(backends);
 
     let store = Arc::new(Mutex::new(loaded));
     spawn_expiry_reaper(Arc::clone(&store));
@@ -165,23 +171,36 @@ async fn run(args: ServeArgs) -> Result<(), AgentError> {
     result
 }
 
-/// The startup line saying how requests can be approved: `pinentry` is the
-/// program, if it can show popups.
-fn approvals_line(terminal: bool, pinentry: Option<&Path>) -> String {
-    match (terminal, pinentry) {
-        (true, Some(program)) => format!(
-            "Approvals: a {} popup or this terminal, whichever answers first",
-            program.display()
-        ),
-        (true, None) => "Approvals: this terminal only (no pinentry popups: neither DISPLAY \
-                         nor WAYLAND_DISPLAY is set)"
-            .to_owned(),
-        (false, Some(program)) => {
-            format!("Approvals: a {} popup (no terminal)", program.display())
+/// Whether approval popups are shown, and if not, why.
+enum Popups<'a> {
+    /// By this pinentry program.
+    Program(&'a Path),
+    NoDisplay,
+    /// `--no-pinentry`.
+    Off,
+}
+
+/// The startup line saying how requests can be approved.
+fn approvals_line(terminal: bool, popups: Popups) -> String {
+    let no_popups = match popups {
+        Popups::Program(program) if terminal => {
+            return format!(
+                "Approvals: a {} popup or this terminal, whichever answers first",
+                program.display()
+            );
         }
-        (false, None) => "No way to approve requests: there's no terminal, and pinentry needs \
-                          DISPLAY or WAYLAND_DISPLAY; every signature request will be refused"
-            .to_owned(),
+        Popups::Program(program) => {
+            return format!("Approvals: a {} popup (no terminal)", program.display());
+        }
+        Popups::NoDisplay => "no pinentry popups: neither DISPLAY nor WAYLAND_DISPLAY is set",
+        Popups::Off => "pinentry popups are off with --no-pinentry",
+    };
+    match terminal {
+        true => format!("Approvals: this terminal only ({no_popups})"),
+        false => format!(
+            "No way to approve requests: there's no terminal, and {no_popups}; every signature \
+             request will be refused"
+        ),
     }
 }
 

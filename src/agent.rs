@@ -65,7 +65,7 @@ impl SudoAgent {
             return Err(reason.to_owned());
         }
         Ok(format!(
-            "{} ({}), expires in {}",
+            "{} ({}), {} left",
             sanitize(entry.private_key.comment()),
             entry.private_key.fingerprint(HashAlg::Sha256),
             keys::format_remaining(entry.expires_at - now)
