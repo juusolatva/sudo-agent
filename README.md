@@ -239,8 +239,8 @@ asking for a password.
 
 Planned, roughly in order:
 
-- a `sudo-agent approve` command for approving from any terminal;
 - running as a background service (a systemd user unit);
+- a `sudo-agent approve` command for approving from any terminal;
 - later: `sudo-agent stop`, lock/unlock, and `sudo-agent status`;
 - showing the forwarding chain (which host a request came through) in the
   prompt.

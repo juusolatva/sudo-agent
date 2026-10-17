@@ -224,6 +224,8 @@ Fedora 44 Cinnamon through the `pinentry` wrapper):
   straight to the terminal prompt, and the `Approval backend failed (logged
   only once)` line appeared once), 21 (`serve` over SSH without a display)
   and 23 (`setsid -f`, popup only) passed.
+- With `--no-pinentry`, the terminal cases 1, 2 and 6–9 passed on the
+  server as before, now logged as `(terminal)`. Released as 0.3.0.
 
 ## Troubleshooting
 

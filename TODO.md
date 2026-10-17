@@ -252,8 +252,10 @@ needs an answer. Design agreed 2026-10-07; open decisions settled
    - Shown as `<comment> (14m30s left)`, in the format the approval prompt
      already uses (`keys::format_remaining`: seconds below an hour, minutes
      above).
-- [ ] **2. pinentry approvals**, plus the routing scaffold (all backends at
+- [x] **2. pinentry approvals**, plus the routing scaffold (all backends at
    once, first answer wins). Split into 2a–2c, each tested before the next.
+   Done 2026-10-17; verified on the laptop and a server (e2e cases 1, 2,
+   6–9 with `--no-pinentry`, 13–23). Released as 0.3.0.
    Decided 2026-10-17:
    - The popup is a pinentry `CONFIRM` dialog (Allow / Deny buttons) with
      the same text as the terminal prompt. It never asks for a passphrase
@@ -321,9 +323,9 @@ needs an answer. Design agreed 2026-10-07; open decisions settled
    - Tests against a fake pinentry script in a temp dir (approve, deny,
      timeout, garbage, hang, cancel kills it, escaping), plus an
      `#[ignore]`d test that pops up the real one on the laptop.
-- [ ] **2c. Wire pinentry into routing.** Candidate for 0.3.0. Implemented
-   2026-10-17 (e2e cases 13–23); laptop cases passed 2026-10-17; the
-   terminal-only server cases still to run.
+- [x] **2c. Wire pinentry into routing.** Done 2026-10-17 (e2e cases
+   13–23 on the laptop with `sudo` on a server, and the terminal cases 1, 2,
+   6–9 with `--no-pinentry`). Released as 0.3.0 (with 2a and 2b).
    - `--no-pinentry` (added 2026-10-17 at the user's request): no popups,
      terminal only. Makes the terminal cases testable on a desktop, and
      suits anyone who'd rather not have a popup holding the keyboard.
