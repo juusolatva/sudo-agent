@@ -1,8 +1,11 @@
 # sudo-agent
 
+[![crates.io](https://img.shields.io/crates/v/sudo-agent.svg)](https://crates.io/crates/sudo-agent)
 [![Build](https://github.com/juusolatva/sudo-agent/actions/workflows/build.yml/badge.svg)](https://github.com/juusolatva/sudo-agent/actions/workflows/build.yml)
 [![Security](https://github.com/juusolatva/sudo-agent/actions/workflows/security.yml/badge.svg)](https://github.com/juusolatva/sudo-agent/actions/workflows/security.yml)
 [![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=juusolatva_sudo-agent&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=juusolatva_sudo-agent)
+[![Coverage](https://sonarcloud.io/api/project_badges/measure?project=juusolatva_sudo-agent&metric=coverage)](https://sonarcloud.io/summary/new_code?id=juusolatva_sudo-agent)
+[![License: MIT](https://img.shields.io/crates/l/sudo-agent.svg)](LICENSE)
 
 A lightweight SSH agent for **time-bound, human-approved `sudo`**.
 
