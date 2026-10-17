@@ -15,6 +15,7 @@ mod cli;
 mod control;
 mod keys;
 mod prompt;
+mod routing;
 mod server;
 mod socket;
 
@@ -32,6 +33,7 @@ use crate::agent::SudoAgent;
 use crate::cli::ServeArgs;
 use crate::keys::{KeyEntry, TtlPolicy};
 use crate::prompt::{Prompter, TerminalPrompter};
+use crate::routing::Router;
 use crate::server::Listeners;
 
 /// Drops keys as their TTL runs out, so expired key material doesn't linger
@@ -80,13 +82,12 @@ async fn run(args: ServeArgs) -> Result<(), AgentError> {
     let (agent_listener, agent_file) = socket::bind(&agent_path)?;
     let (control_listener, control_file) = socket::bind(&control_path)?;
 
-    // One prompter for passphrases now and approvals later, so they share the
-    // terminal one prompt at a time.
+    // Passphrases now and approvals later share the terminal, one prompt at a
+    // time.
     let terminal = Arc::new(TerminalPrompter::new(args.approval_timeout));
-    let prompter: Arc<dyn Prompter> = terminal.clone();
     let mut loaded: Vec<KeyEntry> = Vec::new();
     for path in &args.keys {
-        let entry = keys::load(path, args.ttl, prompter.as_ref()).await?;
+        let entry = keys::load(path, args.ttl, terminal.as_ref()).await?;
         let public_key = entry.private_key.public_key();
         if loaded
             .iter()
@@ -106,7 +107,12 @@ async fn run(args: ServeArgs) -> Result<(), AgentError> {
 
     // Installed only now: during passphrase entry the terminal has echo off,
     // and the default SIGINT action is the safer way out of that.
-    let shutdown = shutdown_signal(move || terminal.interrupt())?;
+    let shutdown = shutdown_signal({
+        let terminal = Arc::clone(&terminal);
+        move || terminal.interrupt()
+    })?;
+    let approvals: Arc<dyn Prompter> =
+        Arc::new(Router::new([("terminal", terminal as Arc<dyn Prompter>)]));
 
     let store = Arc::new(Mutex::new(loaded));
     spawn_expiry_reaper(Arc::clone(&store));
@@ -129,7 +135,7 @@ async fn run(args: ServeArgs) -> Result<(), AgentError> {
         let newline = if signal == "SIGINT" { "\n" } else { "" };
         log!("{newline}Received {signal}, shutting down");
     };
-    let agent = SudoAgent::new(Arc::clone(&store), prompter);
+    let agent = SudoAgent::new(Arc::clone(&store), approvals);
     let listeners = Listeners {
         agent: agent_listener,
         control: control_listener,

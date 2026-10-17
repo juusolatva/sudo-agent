@@ -21,15 +21,24 @@ pub trait Prompter: Send + Sync {
     /// Asks for a secret, e.g. a key passphrase. Only used at key load time.
     async fn passphrase(&self, message: &str) -> io::Result<Zeroizing<String>>;
 
-    /// Asks a yes/no question. Anything but an explicit "yes" is `false`;
-    /// callers must also treat `Err` as a denial. A backend that gives up
-    /// waiting returns an `ErrorKind::TimedOut` error saying so.
+    /// Asks a yes/no question. `Ok` is an answer: anything but an explicit
+    /// "yes" is `false`. `Err` means no answer (timed out, withdrawn, or the
+    /// backend failed), which routing doesn't count as a denial while another
+    /// backend may still answer; callers must treat it as one otherwise. A
+    /// backend that gives up waiting returns an `ErrorKind::TimedOut` error
+    /// saying so.
     ///
     /// Once `cancel` fires (e.g. the requesting client went away), the
     /// backend withdraws the question and returns an error. It must not
     /// return before the question is gone, so nothing printed afterwards
     /// lands inside it.
     async fn confirm(&self, message: &str, cancel: &CancellationToken) -> io::Result<bool>;
+
+    /// Whether this backend can ask anything at all, e.g. there is a terminal
+    /// to prompt on. Routing skips backends that can't.
+    fn available(&self) -> bool {
+        true
+    }
 }
 
 /// Prompts on the controlling terminal (`/dev/tty`), one prompt at a time.
@@ -45,6 +54,9 @@ pub struct TerminalPrompter {
     /// How long an approval waits for an answer before it counts as denied.
     /// Passphrase prompts (startup only) don't time out.
     approval_timeout: Duration,
+    /// Whether there was a terminal to prompt on at startup (there isn't
+    /// under systemd or `setsid`).
+    has_tty: bool,
 }
 
 impl TerminalPrompter {
@@ -53,11 +65,16 @@ impl TerminalPrompter {
             tty: Arc::default(),
             open: Arc::default(),
             approval_timeout,
+            has_tty: OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/tty")
+                .is_ok(),
         }
     }
 
-    /// Withdraws the approval prompt on the terminal, if one is open, which
-    /// denies that request. Returns whether there was one. Used for Ctrl-C,
+    /// Answers the approval prompt on the terminal with a denial, if one is
+    /// open. Returns whether there was one. Used for Ctrl-C,
     /// which should answer the prompt rather than stop the agent.
     pub fn interrupt(&self) -> bool {
         let open = self
@@ -120,14 +137,20 @@ impl Prompter for TerminalPrompter {
                 prompt.await?
             }
         };
-        answer.map_err(|no_answer| match no_answer {
-            NoAnswer::TimedOut => io::Error::new(
+        match answer {
+            Ok(approved) => Ok(approved),
+            Err(NoAnswer::TimedOut) => Err(io::Error::new(
                 ErrorKind::TimedOut,
                 format!("no answer within {}", keys::format_duration(timeout)),
-            ),
-            NoAnswer::Cancelled if cancel.is_cancelled() => io::Error::other("cancelled"),
-            NoAnswer::Cancelled => io::Error::other("cancelled with Ctrl-C"),
-        })
+            )),
+            Err(NoAnswer::Cancelled) if cancel.is_cancelled() => Err(io::Error::other("cancelled")),
+            // Ctrl-C is an answer, so it also withdraws the other backends.
+            Err(NoAnswer::Cancelled) => Ok(false),
+        }
+    }
+
+    fn available(&self) -> bool {
+        self.has_tty
     }
 }
 
@@ -389,6 +412,57 @@ pub mod testing {
         async fn confirm(&self, message: &str, _: &CancellationToken) -> io::Result<bool> {
             self.asked.lock().unwrap().push(message.to_owned());
             Ok(self.confirms.lock().unwrap().pop_front().unwrap_or(false))
+        }
+    }
+
+    /// Gives up at once without answering, like a backend that failed.
+    pub struct GivesUp {
+        kind: io::ErrorKind,
+        asked: AtomicUsize,
+    }
+
+    impl GivesUp {
+        pub const REASON: &str = "gave up";
+
+        pub fn new(kind: io::ErrorKind) -> Self {
+            Self {
+                kind,
+                asked: AtomicUsize::new(0),
+            }
+        }
+
+        pub fn times_asked(&self) -> usize {
+            self.asked.load(SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl Prompter for GivesUp {
+        async fn passphrase(&self, _: &str) -> io::Result<Zeroizing<String>> {
+            unreachable!("GivesUp only confirms")
+        }
+
+        async fn confirm(&self, _: &str, _: &CancellationToken) -> io::Result<bool> {
+            self.asked.fetch_add(1, SeqCst);
+            Err(io::Error::new(self.kind, Self::REASON))
+        }
+    }
+
+    /// A backend that can't ask anything; panics if asked anyway.
+    pub struct Unavailable;
+
+    #[async_trait]
+    impl Prompter for Unavailable {
+        async fn passphrase(&self, _: &str) -> io::Result<Zeroizing<String>> {
+            unreachable!("Unavailable is never asked")
+        }
+
+        async fn confirm(&self, _: &str, _: &CancellationToken) -> io::Result<bool> {
+            unreachable!("Unavailable is never asked")
+        }
+
+        fn available(&self) -> bool {
+            false
         }
     }
 
