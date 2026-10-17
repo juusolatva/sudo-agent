@@ -179,6 +179,14 @@ added with `ssh-add -t 240m` over `control.sock` (the `ssh-load` flow; logged
   denied, agent kept running) and case 6 (closing the SSH connection: the
   prompt line ended, `client disconnected`) passed.
 
+**2026-10-17, server `palvelin`** (0.2.1, Ed25519 key added over
+`control.sock`, forwarded `agent.sock`):
+
+- Case 12: `ssh-add -l` on the server listed the key as
+  `licepad (14m14s left) (ED25519)`, i.e. with the time left after its
+  comment. Passed. Only one listing was taken; the "a minute later"
+  re-check wasn't part of this run.
+
 ## Troubleshooting
 
 - **No prompt on the laptop, and sudo asks for a password**:

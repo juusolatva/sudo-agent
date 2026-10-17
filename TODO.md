@@ -247,12 +247,11 @@ needs an answer. Design agreed 2026-10-07; open decisions settled
      (`docs/manual-e2e.md`, 2026-10-12): all three layers fire, including
      `session-bind` alone (renamed `ssh`). OpenSSH only forwards when the
      client has an agent of its own, documented in README and e2e.
-- [ ] **1c. Time left in key comments** on both sockets. New e2e case:
-   `ssh-add -l` on a server shows the time left.
-   - Implemented 2026-10-17 as `<comment> (14m30s left)`, in the format the
-     approval prompt already uses (`keys::format_remaining`: seconds below
-     an hour, minutes above). Released as 0.2.1. To do: e2e case 12 on a
-     server.
+- [x] **1c. Time left in key comments** on both sockets. Done 2026-10-17;
+   verified on a server (e2e case 12). Released as 0.2.1.
+   - Shown as `<comment> (14m30s left)`, in the format the approval prompt
+     already uses (`keys::format_remaining`: seconds below an hour, minutes
+     above).
 - [ ] **2. pinentry approvals**, plus the routing scaffold (all backends at
    once, first answer wins).
    - Spawn `pinentry` only when a request arrives and speak its Assuan
