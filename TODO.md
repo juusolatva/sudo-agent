@@ -353,6 +353,50 @@ needs an answer. Design agreed 2026-10-07; open decisions settled
    - Restarting it drops all keys, which is intended.
    - `setsid -f sudo-agent serve` is the documented fallback for machines
      without systemd.
+   - Split into 3a–3d, each tested before the next (split 2026-10-20).
+   - Open, to decide before the code that needs it:
+     - Does the startup banner (`println!` to stdout) get timestamps too,
+       or stay plain? Leaning: timestamped, so the journal and log files
+       read alike (3a).
+     - Unit target: tie it to `graphical-session.target` (starts after the
+       desktop exported its environment, stops at logout and drops the
+       keys, but no agent when only SSH'd into the laptop), or
+       `default.target` with a documented `import-environment` (always
+       running, but no display if it started before login)? Leaning: the
+       graphical session, since pinentry is the main backend until step 4
+       (3c).
+- [ ] **3a. Log timestamps**, code only, no systemd yet.
+   - `log!` prefixes a local timestamp (`2026-10-20 14:03:12`) via
+     `libc::localtime_r`, with no new dependency.
+   - Skipped under the journal, detected as systemd documents it:
+     `JOURNAL_STREAM` set **and** its `dev:ino` matching stderr's, so a
+     variable leaked into a child (`setsid -f … > file` from a shell that
+     inherited it) still gets timestamps.
+   - Tests: the formatting and the `JOURNAL_STREAM` check.
+   - Laptop checks: timestamps in a foreground `serve` and in
+     `setsid -f sudo-agent serve > log`. Only the log format changes, so
+     re-running the server cases isn't needed unless the user wants it.
+- [ ] **3b. The unit file, headless.**
+   - `contrib/systemd/sudo-agent.service`:
+     `ExecStart=%h/.cargo/bin/sudo-agent serve`, `Restart=on-failure`, no
+     socket activation.
+   - README: installing the unit, `systemctl --user enable --now
+     sudo-agent`, `journalctl --user -u sudo-agent`, `ForwardAgent` and
+     `ssh-add` against the default socket paths, and the `setsid -f`
+     fallback.
+   - Laptop checks without a display: the service starts, both sockets
+     exist, `ssh-add` / `ssh-add -l` work, journal lines aren't stamped
+     twice; with neither a terminal nor a display the banner says every
+     request is denied, and it is.
+- [ ] **3c. pinentry under systemd**: the service needs `DISPLAY` /
+   `WAYLAND_DISPLAY` and `DBUS_SESSION_BUS_ADDRESS` (see the end of step 2).
+   On the laptop (Cinnamon, X11) the user manager already has `DISPLAY=:0`
+   and the bus address once logged in, and `graphical-session.target` is
+   active, so this is about ordering (the unit target question above).
+   - Laptop checks: the popup appears and **Allow** works with the agent
+     run by the service; new e2e cases for it.
+- [ ] **3d. Docs wrap-up**: AGENTS.md (status, `log!` convention),
+   `docs/manual-e2e.md` cases for 3b/3c, README, these checkboxes.
 - [ ] **4. `sudo-agent approve`**: a terminal client on `control.sock`
    (the long-poll extension) that shows pending requests and takes `y/N`,
    with the same type-ahead flush and `sanitize()`d text as the foreground
