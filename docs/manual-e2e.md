@@ -253,7 +253,7 @@ the systemd user service, Fedora 44 Cinnamon, systemd 259):
 - Case 26 passed after a reboot, and case 27 twice (the second time with a
   key loaded): the user manager kept running across the logouts, so
   `PartOf=graphical-session.target` stopped the agent; each login started a
-  fresh one with no keys and the display.
+  fresh one with no keys and the display. Released as 0.4.0.
 
 ## Troubleshooting
 

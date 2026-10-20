@@ -351,7 +351,7 @@ needs an answer. Design agreed 2026-10-07; open decisions settled
      `import-environment`).
 - [x] **3. systemd user unit** (`sudo-agent.service`) and docs for
    `systemctl --user enable --now sudo-agent`. Done 2026-10-20 (e2e
-   cases 24–27).
+   cases 24–27). Released as 0.4.0.
    - Logs go to `journalctl --user -u sudo-agent` (stderr); timestamps in
      `serve`'s own log lines, skipped under the journal.
    - Restarting it drops all keys, which is intended.
