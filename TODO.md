@@ -31,8 +31,9 @@ test, but they should be fixed before calling the core loop done:
 - [x] **Approval timeout**: an unanswered prompt is denied after
       `--approval-timeout` (default `2m`), and the terminal is freed for the
       next request. 2 minutes is a compromise for the foreground prompt.
-      Revisit per backend once the others exist: pinentry 30–60 s, the
-      `sudo-agent approve` client maybe up to 5 min.
+      Revisited per backend once the others existed: pinentry has its own
+      (15 s), and the `sudo-agent approve` client shares
+      `--approval-timeout` (decided 2026-10-21, step 4).
 - [x] **Stale prompts**: a prompt is withdrawn (via the `CancellationToken`
       passed to `Prompter::confirm()`) when it can no longer lead anywhere:
       - The client goes away: `sign()` watches the client socket (a
@@ -175,9 +176,10 @@ needs an answer. Design agreed 2026-10-07; open decisions settled
   withdrawn** (their `CancellationToken`). Each backend keeps its own
   timeout. With no backend available the request is denied and logged.
 - **`approve` protocol: vendor extensions on `control.sock`**: one that
-  waits for the next pending request (long poll) and one that answers a
-  request by id. It reuses the agent codec, and the `control.sock`
-  protections apply to it automatically.
+  waits for the next event (long poll: a request pending or withdrawn,
+  from a per-connection queue) and one that answers a request by id. It
+  reuses the agent codec, and the `control.sock` protections apply to it
+  automatically. Details under step 4.
 - **Lifecycle.**
   - **One instance per user**: one agent already serves any number of
     remote destinations. `serve` refuses to start while either socket
@@ -432,9 +434,88 @@ needs an answer. Design agreed 2026-10-07; open decisions settled
 - [ ] **4. `sudo-agent approve`**: a terminal client on `control.sock`
    (the long-poll extension) that shows pending requests and takes `y/N`,
    with the same type-ahead flush and `sanitize()`d text as the foreground
-   prompt; it joins the routing. Its own timeout, maybe up to 5 min.
+   prompt; it joins the routing.
    - This is the terminal backend from now on (invariant 3). It works from
      any terminal, including when SSH'd into the laptop with no desktop.
+   - Split into 4a–4c, each tested before the next (split 2026-10-21).
+   Decided 2026-10-21:
+   - **Every attached client is shown the request**; the first answer
+     from any backend wins, as with the others. In the router the clients
+     are one `approve` backend that fans out to all of them.
+   - **Events, not just requests.** The wait returns the next event,
+     `request N pending` (with its text and deadline) or `request N
+     withdrawn` (answered elsewhere, timed out, client hung up, key
+     expired), so a client can drop a prompt it no longer needs. Answers go
+     over a second connection, since the event connection is busy waiting.
+   - **A per-connection event queue**, not a grace period: a client keeps
+     one connection open for events and waits on it again and again; the
+     first wait creates a small queue for that connection, events arriving
+     between waits are kept there, and the next wait returns them at once.
+     The client counts as attached while that connection is open, and its
+     queue goes when it closes. No client ids or timers.
+     - A hang-up during a wait isn't seen by the session (it isn't reading
+       the socket then), so watch the socket like `sign()` does
+       (`AsyncFd`, read-closed). Between waits `ssh-agent-lib` should drop
+       the session on EOF: check it, and pin it with a test.
+     - The queue is bounded (requests are routed one at a time, so it
+       holds at most a pending and a withdrawn event); a client that
+       overflows it is disconnected.
+     - A frozen client (Ctrl-Z) still counts as attached, so the request
+       waits for the timeout instead of being denied when the other
+       backends give up. Accepted; the timeout bounds it.
+     - An answer to a request that is already withdrawn gets a reply
+       saying so, and the client prints that it was answered elsewhere.
+     - Any `control.sock` connection may answer any request: the same
+       trust as `ssh-add` adding keys there, so plain counting ids do.
+   - **Available only while a client is attached** when the request
+     arrives. Otherwise, under systemd with no client running, a request
+     the popup doesn't answer would hang `sudo` for the full timeout
+     instead of falling back to the password after 15 s. A client that
+     attaches while a request is already out to `approve` is shown it.
+   - **Timeout: `--approval-timeout`** (default `2m`), now covering both
+     terminal backends (`serve`'s own prompt and `approve` clients), not a
+     separate flag. Under systemd there is no foreground terminal, so it is
+     effectively the overall timeout: how long after the popup closes an
+     `approve` client can still answer. Raise it if 2m is too short. The
+     daemon enforces it (clients get a withdrawn event); the deadline in
+     the event lets the client say when the prompt closes, as the popup
+     does.
+   - Extension names under `sudo-agent.juusolatva.github.io`, like the
+     planned status extension (e.g. `approve-wait@…`,
+     `approve-answer@…`; settle in 4a). Log lines name the backend
+     `approve` (`Approved (approve) …`).
+- [ ] **4a. Daemon side**: the two extensions on `control.sock` and the
+   `approve` backend in the router. No client yet; tested with
+   `ssh_agent_lib`'s `Client` in socket-level tests.
+   - The backend: `available()` while at least one event connection is
+     open; `confirm()` sends `pending` to every attached queue, waits for
+     an answer or the timeout or its token, then sends `withdrawn`.
+     Withdrawn on cancel, like the other backends.
+   - Not on `agent.sock`: its extensions stay refused (pin it).
+   - Startup banner: with neither a terminal nor a display, requests are
+     no longer always refused, since a client may attach; say approvals
+     need `sudo-agent approve` instead.
+   - Tests: pending reaches every attached client, first answer wins and
+     withdraws the rest (the popup and the other clients), events queued
+     between waits, hang-up mid-wait and between waits detaches, late
+     attach sees the request in flight, answer after withdrawal, timeout,
+     overflow disconnects, `agent.sock` refuses both extensions.
+- [ ] **4b. The `sudo-agent approve` subcommand.**
+   - Finds `control.sock` like `serve` does (`--control-socket` /
+     `SUDO_AGENT_CONTROL_SOCKET`, `socket::choose_path`).
+   - Shows each pending request with its closing time and takes `y/N`
+     (typed `y`/`yes` + Enter, type-ahead flushed), reusing the terminal
+     prompt code; text `sanitize()`d again on the client. A withdrawn event
+     ends the prompt with a line saying why.
+   - Ctrl-C at a prompt denies that request; with no prompt open it exits
+     the client.
+   - Decide here: whether the client reconnects (with a message) when the
+     daemon restarts, or exits.
+- [ ] **4c. Docs wrap-up**: README (`approve`, `--approval-timeout`
+   wording in the table and `--help`), AGENTS.md, `docs/manual-e2e.md`
+   cases from 28 (approve, deny, two clients, popup and client racing,
+   withdrawal, the systemd service with a client over SSH into the
+   laptop), these checkboxes. Then the server cases; candidate for 0.5.0.
 
 Re-run the server cases in `docs/manual-e2e.md` after 1b, 2 and 4: each
 touches signing or prompting.
