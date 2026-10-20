@@ -138,6 +138,8 @@ popup instead, which cases 13–19 cover.
 `pinentry-gnome3` holds the keyboard and mouse while its popup is open (seen
 on Cinnamon), so the terminal can't be reached then. Cases 15, 16, 18 and
 22 therefore act on the agent from a timer started beforehand.
+`pinentry-qt` (`--pinentry pinentry-qt`) doesn't: Alt+Tab reaches the
+terminal, so with it cases 15 and 16 can be answered there directly.
 
 Cases 24–27 run the agent as the systemd user service; read its log with
 `journalctl --user -u sudo-agent -b`.
@@ -254,6 +256,22 @@ the systemd user service, Fedora 44 Cinnamon, systemd 259):
   key loaded): the user manager kept running across the logouts, so
   `PartOf=graphical-session.target` stopped the agent; each login started a
   fresh one with no keys and the display. Released as 0.4.0.
+
+**2026-10-21, laptop + server `palvelin`** (0.4.0 with `--pinentry
+pinentry-qt`: `pinentry-qt` 1.3.2 on Qt 6, Fedora 44 Cinnamon on X11, a
+foreground `serve`):
+
+- Startup said `Approvals: a pinentry-qt popup or this terminal, whichever
+  answers first`.
+- Cases 13 (Allow) and 14 (Deny) passed, twice each. The popup's window
+  title was `sudo-agent`, above the same text as the terminal prompt and
+  its closing line; no heading (qt doesn't show `SETPROMPT`).
+- Case 17 passed: the popup closed by itself after 15 s with no `Approval
+  backend failed` line (so `pinentry-qt` reports its timeout as a timeout,
+  not as Deny or a failure), and `y` at the terminal then approved it.
+- Unlike `pinentry-gnome3`, the popup doesn't hold the keyboard: with it
+  open, Alt+Tab reached the terminal and Ctrl-C there logged `denied
+  (terminal)`, withdrawing the popup (case 16 without the timer).
 
 ## Troubleshooting
 

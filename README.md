@@ -201,6 +201,8 @@ line `Approvals: …` says whether popups are used.
 - `pinentry-gnome3` holds the keyboard and mouse while it's open, so the
   terminal can't be reached until you answer the popup or it times out
   (`--pinentry-timeout`); the terminal prompt then still waits.
+  `pinentry-qt` doesn't, so with it the terminal can be answered (or
+  Ctrl-C pressed) while the popup is open.
 - With neither a terminal nor a display, nothing can approve requests, so
   every one is refused; the startup line says so.
 
