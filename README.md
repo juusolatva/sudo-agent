@@ -75,12 +75,15 @@ Start the agent on the machine that holds your key:
 
 ```sh
 sudo-agent serve
-# Agent listening on /run/user/1000/sudo-agent/agent.sock
-# Control socket on /run/user/1000/sudo-agent/control.sock (for ssh-add; never forward it)
-# No keys loaded yet; add one with: SSH_AUTH_SOCK='/run/user/1000/sudo-agent/control.sock' ssh-add <key>
-# Approvals: a pinentry popup or this terminal, whichever answers first
-# export SSH_AUTH_SOCK='/run/user/1000/sudo-agent/agent.sock'
+# 2026-10-20 14:03:12 Agent listening on /run/user/1000/sudo-agent/agent.sock
+# 2026-10-20 14:03:12 Control socket on /run/user/1000/sudo-agent/control.sock (for ssh-add; never forward it)
+# 2026-10-20 14:03:12 Approvals: a pinentry popup or this terminal, whichever answers first
+# 2026-10-20 14:03:12 No keys loaded yet; add one with: SSH_AUTH_SOCK='/run/user/1000/sudo-agent/control.sock' ssh-add <key>
+# 2026-10-20 14:03:12 Forward it with: ssh -o ForwardAgent='/run/user/1000/sudo-agent/agent.sock' <host>
 ```
+
+Everything goes to stderr, each line starting with the local time (left out
+when stderr is the systemd journal, which adds its own).
 
 `serve` can be left out: `sudo-agent [OPTIONS]` does the same, as in 0.1.
 
@@ -114,7 +117,7 @@ Or load keys at startup, with the passphrase asked in the agent's terminal:
 | `--max-ttl <DURATION>` | `8h` | Longest TTL a key may have: a longer `--ttl` is an error, a longer `ssh-add -t` is cut down |
 | `--approval-timeout <DURATION>` | `2m` | How long the terminal prompt waits for an answer |
 | `--pinentry <PROGRAM>` | `pinentry` | Program for approval popups; see [Approval popups](#approval-popups) |
-| `--pinentry-timeout <DURATION>` | `60s` | How long a popup waits for an answer |
+| `--pinentry-timeout <DURATION>` | `15s` | How long a popup waits for an answer |
 | `--no-pinentry` | | No popups: approve at the agent's terminal only |
 | `--agent-socket <PATH>` | `$XDG_RUNTIME_DIR/sudo-agent/agent.sock` | The socket to forward. Also `SUDO_AGENT_SOCKET`; the flag wins. `--socket` still works |
 | `--control-socket <PATH>` | `$XDG_RUNTIME_DIR/sudo-agent/control.sock` | The socket for `ssh-add`; never forward it. Also `SUDO_AGENT_CONTROL_SOCKET`; the flag wins |

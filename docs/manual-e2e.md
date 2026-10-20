@@ -34,7 +34,7 @@ ssh -o ForwardAgent=<sudo-agent socket> ──┴──────────�
 ```sh
 cargo build --release
 ./target/release/sudo-agent serve
-# prints: export SSH_AUTH_SOCK='/run/user/1000/sudo-agent/agent.sock'
+# prints, among others: … Forward it with: ssh -o ForwardAgent='/run/user/1000/sudo-agent/agent.sock' <host>
 ```
 
 Add the key from a second terminal, through the control socket (`ssh-add`
@@ -112,7 +112,7 @@ every `sudo` authenticates anyway.)
 | 14 | As 13, but **Deny** (then again with Escape, and with closing the window) | Terminal prompt line ends, then `Refused …: denied (pinentry)` | Falls back to the password prompt |
 | 15 | Agent run in tmux (`tmux new -s sa sudo-agent serve`); in another laptop terminal `(sleep 15; tmux send-keys -t sa y Enter) &`, then within 15 s `sudo -k; sudo -v` and leave the popup alone | At 15 s the terminal answers: the popup disappears; `Approved (terminal) …` | Succeeds |
 | 16 | In another laptop terminal `(sleep 15; pkill -INT -x sudo-agent) &` (what Ctrl-C sends), then within 15 s `sudo -k; sudo -v` and leave the popup alone | At 15 s the popup disappears; `Refused …: denied (terminal)`; the agent keeps running | Falls back to the password prompt |
-| 17 | As 13, answer nothing anywhere | After 60 s the popup closes by itself and the terminal prompt keeps waiting (answering it then works); left alone, at 2 min `Refused …: not approved: pinentry: no answer within 1m; terminal: no answer within 2m` | Falls back to the password prompt |
+| 17 | As 13, answer nothing anywhere | After 15 s the popup closes by itself and the terminal prompt keeps waiting (answering it then works); left alone, at 2 min `Refused …: not approved: pinentry: no answer within 15s; terminal: no answer within 2m` | Falls back to the password prompt |
 | 18 | In another laptop terminal `(sleep 15; pkill -x -n ssh) &` (the newest `ssh`: the server session), then within 15 s `sudo -k; sudo -v` and leave the popup alone | At 15 s popup and terminal prompt are withdrawn; `Refused …: client disconnected` | Connection closed |
 | 19 | As case 8 (`--ttl 1m`, ~10 s left), with the popup open | At expiry the popup and the terminal prompt are withdrawn; `Refused …: key expired while waiting for approval` | Falls back to the password prompt |
 | 20 | Restart with `--pinentry pinentry-curses`, then `sudo -k; sudo -v` twice, answering at the terminal | The terminal prompt works and isn't disturbed; after the first answer `Approval backend failed (logged only once): pinentry: pinentry failed: Inappropriate ioctl for device …`; not repeated the second time | Both as answered |

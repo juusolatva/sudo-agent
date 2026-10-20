@@ -1,11 +1,12 @@
 /// Like `eprintln!`, but emits the whole line in a single `write()`. The
 /// kernel never interleaves one write to a terminal with another, so a line
 /// logged while a prompt is on screen lands whole instead of splitting it.
-/// Use it for anything printed while requests are being served.
+/// Lines start with a timestamp unless stderr is the journal (`logging`).
+/// Use it for everything the agent prints, prompts aside.
 macro_rules! log {
     ($($arg:tt)*) => {{
         use std::io::Write as _;
-        let line = format!("{}\n", format_args!($($arg)*));
+        let line = $crate::logging::line(format_args!($($arg)*));
         let _ = std::io::stderr().write_all(line.as_bytes());
     }};
 }
@@ -14,6 +15,7 @@ mod agent;
 mod cli;
 mod control;
 mod keys;
+mod logging;
 mod pinentry;
 mod prompt;
 mod routing;
@@ -96,10 +98,10 @@ async fn run(args: ServeArgs) -> Result<(), AgentError> {
             .iter()
             .any(|k| k.private_key.public_key().key_data() == public_key.key_data())
         {
-            eprintln!("warning: {} is already loaded, skipping", path.display());
+            log!("warning: {} is already loaded, skipping", path.display());
             continue;
         }
-        eprintln!(
+        log!(
             "Loaded {} ({}), usable for {}",
             path.display(),
             public_key.fingerprint(HashAlg::Sha256),
@@ -133,24 +135,31 @@ async fn run(args: ServeArgs) -> Result<(), AgentError> {
     let store = Arc::new(Mutex::new(loaded));
     spawn_expiry_reaper(Arc::clone(&store));
 
-    println!("Agent listening on {}", agent_path.display());
-    println!(
+    log!("Agent listening on {}", agent_path.display());
+    log!(
         "Control socket on {} (for ssh-add; never forward it)",
         control_path.display()
     );
-    println!("{approvals_line}");
+    log!("{approvals_line}");
     if args.keys.is_empty() {
-        println!(
+        log!(
             "No keys loaded yet; add one with: SSH_AUTH_SOCK='{}' ssh-add <key>",
             control_path.display()
         );
     }
-    println!("export SSH_AUTH_SOCK='{}'", agent_path.display());
+    log!(
+        "Forward it with: ssh -o ForwardAgent='{}' <host>",
+        agent_path.display()
+    );
     let shutdown = async {
         let signal = shutdown.await;
-        // Ctrl-C echoes "^C" with no newline (possibly after a prompt).
-        let newline = if signal == "SIGINT" { "\n" } else { "" };
-        log!("{newline}Received {signal}, shutting down");
+        // Ctrl-C echoes "^C" with no newline (possibly after a prompt); end
+        // that line first, so the timestamp starts the next one.
+        if signal == "SIGINT" {
+            use std::io::Write as _;
+            let _ = io::stderr().write_all(b"\n");
+        }
+        log!("Received {signal}, shutting down");
     };
     let agent = SudoAgent::new(Arc::clone(&store), approvals);
     let listeners = Listeners {
@@ -242,10 +251,11 @@ const STOP_WINDOW: Duration = Duration::from_secs(2);
 
 fn main() -> ExitCode {
     let args = cli::parse();
+    logging::init();
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
         Err(e) => {
-            eprintln!("sudo-agent: failed to start the async runtime: {e}");
+            log!("sudo-agent: failed to start the async runtime: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -259,8 +269,8 @@ fn main() -> ExitCode {
         Err(e) => {
             match e {
                 // Our own startup errors already carry context; skip the "Agent: I/O error" prefix.
-                AgentError::IO(e) => eprintln!("sudo-agent: {e}"),
-                e => eprintln!("sudo-agent: {e}"),
+                AgentError::IO(e) => log!("sudo-agent: {e}"),
+                e => log!("sudo-agent: {e}"),
             }
             ExitCode::FAILURE
         }

@@ -1,7 +1,7 @@
 # Suggested commands
 
 - `cargo check` — fast type-check
-- `cargo run -- serve --key ~/.ssh/id_ed25519 [--ttl 15m] [--max-ttl 8h] [--approval-timeout 2m] [--pinentry PROGRAM] [--pinentry-timeout 60s | --no-pinentry] [--agent-socket PATH] [--control-socket PATH]` (or `SUDO_AGENT_SOCKET` / `SUDO_AGENT_CONTROL_SOCKET`; bare form without `serve` also works; `--key` optional) — run daemon in foreground (default sockets `$XDG_RUNTIME_DIR/sudo-agent/{agent,control}.sock`; it prints the `export SSH_AUTH_SOCK=…` line). Socket paths must fit 107 bytes, so the scratchpad is too long: use `mktemp -d "$XDG_RUNTIME_DIR/…"` for throwaway sockets.
+- `cargo run -- serve --key ~/.ssh/id_ed25519 [--ttl 15m] [--max-ttl 8h] [--approval-timeout 2m] [--pinentry PROGRAM] [--pinentry-timeout 15s | --no-pinentry] [--agent-socket PATH] [--control-socket PATH]` (or `SUDO_AGENT_SOCKET` / `SUDO_AGENT_CONTROL_SOCKET`; bare form without `serve` also works; `--key` optional) — run daemon in foreground (default sockets `$XDG_RUNTIME_DIR/sudo-agent/{agent,control}.sock`; it prints a `Forward it with: ssh -o ForwardAgent=…` line). Socket paths must fit 107 bytes, so the scratchpad is too long: use `mktemp -d "$XDG_RUNTIME_DIR/…"` for throwaway sockets.
 - `cargo test`, `cargo test <name>`
 - `cargo clippy --all-targets --all-features`
 - `cargo fmt` / `cargo fmt --check`

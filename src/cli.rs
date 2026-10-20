@@ -55,7 +55,7 @@ pub struct ServeArgs {
     pub pinentry: PathBuf,
 
     /// How long a pinentry popup waits for an answer before giving up.
-    #[arg(long, value_name = "DURATION", default_value = "60s", value_parser = keys::parse_duration)]
+    #[arg(long, value_name = "DURATION", default_value = "15s", value_parser = keys::parse_duration)]
     pub pinentry_timeout: Duration,
 
     /// Don't show pinentry popups; approve at this terminal only.
@@ -151,7 +151,7 @@ mod tests {
     fn pinentry_defaults() {
         let parsed = parse(&["serve"]).unwrap();
         assert_eq!(parsed.pinentry, PathBuf::from("pinentry"));
-        assert_eq!(parsed.pinentry_timeout, Duration::from_secs(60));
+        assert_eq!(parsed.pinentry_timeout, Duration::from_secs(15));
         let parsed = parse(&["--pinentry", "pinentry-qt", "--pinentry-timeout", "30s"]).unwrap();
         assert_eq!(parsed.pinentry, PathBuf::from("pinentry-qt"));
         assert_eq!(parsed.pinentry_timeout, Duration::from_secs(30));

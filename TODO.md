@@ -269,8 +269,11 @@ needs an answer. Design agreed 2026-10-07; open decisions settled
      typing. That's accepted: you expect a popup for every `sudo` you run,
      and one you didn't start is still seen. sudo-agent makes remote `sudo`
      convenient; it isn't an intrusion detection tool.
-   - Its own timeout, 60 s (`SETTIMEOUT`); the popup is easy to notice and
-     expected.
+   - Its own timeout (`SETTIMEOUT`), 60 s at first, 15 s since 2026-10-20:
+     the popup shows on top of everything else, and a `sudo` you started is
+     one you're waiting on. One you didn't start is still seen when it
+     pops up, whatever the timeout. Some pinentry variants may be less
+     prominent; `--pinentry-timeout` is there for them.
    - The program is `pinentry` (the distro's wrapper or alternatives
      symlink, which gpg-agent uses too), overridable with `--pinentry`
      (needed on NixOS, or to pick a variant).
@@ -283,7 +286,7 @@ needs an answer. Design agreed 2026-10-07; open decisions settled
      picked by the wrapper can't take `serve`'s terminal (it fails instead)
      and Ctrl-C doesn't reach it. `PR_SET_PDEATHSIG(SIGKILL)` (spawned from
      an async worker thread, as it follows the spawning thread) and the
-     60 s timeout clean up after a daemon that dies abruptly.
+     popup's timeout clean up after a daemon that dies abruptly.
    - Talk to it directly over pipes, with no crate dependency.
 - [x] **2a. Routing scaffold**, still with the terminal as the only backend:
    no visible change apart from log wording. Done 2026-10-17 (`src/routing.rs`);
@@ -329,8 +332,8 @@ needs an answer. Design agreed 2026-10-07; open decisions settled
    - `--no-pinentry` (added 2026-10-17 at the user's request): no popups,
      terminal only. Makes the terminal cases testable on a desktop, and
      suits anyone who'd rather not have a popup holding the keyboard.
-   - `--pinentry <PROGRAM>` (default `pinentry`) and a 60 s pinentry
-     timeout; available only with `DISPLAY`/`WAYLAND_DISPLAY`; the startup
+   - `--pinentry <PROGRAM>` (default `pinentry`) and a pinentry timeout
+     (60 s then, 15 s now); available only with `DISPLAY`/`WAYLAND_DISPLAY`; the startup
      banner says which backends are in use, or why pinentry isn't.
    - Log lines name the backend that answered; repeated pinentry failures
      (e.g. a curses variant without a terminal) are logged once with a
@@ -354,17 +357,14 @@ needs an answer. Design agreed 2026-10-07; open decisions settled
    - `setsid -f sudo-agent serve` is the documented fallback for machines
      without systemd.
    - Split into 3a–3d, each tested before the next (split 2026-10-20).
-   - Open, to decide before the code that needs it:
-     - Does the startup banner (`println!` to stdout) get timestamps too,
-       or stay plain? Leaning: timestamped, so the journal and log files
-       read alike (3a).
-     - Unit target: tie it to `graphical-session.target` (starts after the
-       desktop exported its environment, stops at logout and drops the
-       keys, but no agent when only SSH'd into the laptop), or
-       `default.target` with a documented `import-environment` (always
-       running, but no display if it started before login)? Leaning: the
-       graphical session, since pinentry is the main backend until step 4
-       (3c).
+   Decided 2026-10-20:
+   - The startup banner follows the same logic as other log lines:
+     timestamped, except under the journal (3a).
+   - The unit is tied to `graphical-session.target`: it starts after the
+     desktop has exported its environment and stops at logout, dropping
+     the keys. The cost: no agent when only SSH'd into the laptop without
+     a desktop session (step 4's `approve` doesn't change that; a manual
+     `systemctl --user start` or `setsid -f` still works) (3b, 3c).
 - [ ] **3a. Log timestamps**, code only, no systemd yet.
    - `log!` prefixes a local timestamp (`2026-10-20 14:03:12`) via
      `libc::localtime_r`, with no new dependency.
@@ -372,6 +372,12 @@ needs an answer. Design agreed 2026-10-07; open decisions settled
      `JOURNAL_STREAM` set **and** its `dev:ino` matching stderr's, so a
      variable leaked into a child (`setsid -f … > file` from a shell that
      inherited it) still gets timestamps.
+   - The banner's `export SSH_AUTH_SOCK='…/agent.sock'` line goes: it
+     suggests using the agent locally, which isn't the documented use
+     (`ForwardAgent=<path>` next to your own agent). In its place:
+     `Forward it with: ssh -o ForwardAgent=<agent.sock> <host>`, copyable
+     after the colon like the `ssh-add` hint. Update `README.md` and
+     `docs/manual-e2e.md`, which quote the old line.
    - Tests: the formatting and the `JOURNAL_STREAM` check.
    - Laptop checks: timestamps in a foreground `serve` and in
      `setsid -f sudo-agent serve > log`. Only the log format changes, so
@@ -392,7 +398,8 @@ needs an answer. Design agreed 2026-10-07; open decisions settled
    `WAYLAND_DISPLAY` and `DBUS_SESSION_BUS_ADDRESS` (see the end of step 2).
    On the laptop (Cinnamon, X11) the user manager already has `DISPLAY=:0`
    and the bus address once logged in, and `graphical-session.target` is
-   active, so this is about ordering (the unit target question above).
+   active, so this is about ordering (`graphical-session.target`, decided
+   above).
    - Laptop checks: the popup appears and **Allow** works with the agent
      run by the service; new e2e cases for it.
 - [ ] **3d. Docs wrap-up**: AGENTS.md (status, `log!` convention),

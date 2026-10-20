@@ -99,7 +99,7 @@ pub async fn load(path: &Path, ttl: Duration, prompter: &dyn Prompter) -> io::Re
     let private_key = if key.is_encrypted() {
         decrypt(&key, path, prompter).await?
     } else {
-        eprintln!("warning: {} is not passphrase-protected", path.display());
+        log!("warning: {} is not passphrase-protected", path.display());
         key
     };
     Ok(KeyEntry {
