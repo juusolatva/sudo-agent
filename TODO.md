@@ -349,8 +349,9 @@ needs an answer. Design agreed 2026-10-07; open decisions settled
      the desktop imports them into the user manager before the service
      starts; that's step 3's problem (unit ordering or documented
      `import-environment`).
-- [ ] **3. systemd user unit** (`sudo-agent.service`) and docs for
-   `systemctl --user enable --now sudo-agent`.
+- [x] **3. systemd user unit** (`sudo-agent.service`) and docs for
+   `systemctl --user enable --now sudo-agent`. Done 2026-10-20 (e2e
+   cases 24–27).
    - Logs go to `journalctl --user -u sudo-agent` (stderr); timestamps in
      `serve`'s own log lines, skipped under the journal.
    - Restarting it drops all keys, which is intended.
@@ -365,7 +366,8 @@ needs an answer. Design agreed 2026-10-07; open decisions settled
      the keys. The cost: no agent when only SSH'd into the laptop without
      a desktop session (step 4's `approve` doesn't change that; a manual
      `systemctl --user start` or `setsid -f` still works) (3b, 3c).
-- [ ] **3a. Log timestamps**, code only, no systemd yet.
+- [x] **3a. Log timestamps**, code only, no systemd yet. Done 2026-10-20,
+   with the pinentry timeout cut to 15 s.
    - `log!` prefixes a local timestamp (`2026-10-20 14:03:12`) via
      `libc::localtime_r`, with no new dependency.
    - Skipped under the journal, detected as systemd documents it:
@@ -382,10 +384,19 @@ needs an answer. Design agreed 2026-10-07; open decisions settled
    - Laptop checks: timestamps in a foreground `serve` and in
      `setsid -f sudo-agent serve > log`. Only the log format changes, so
      re-running the server cases isn't needed unless the user wants it.
-- [ ] **3b. The unit file, headless.**
+- [x] **3b. The unit file, headless.** Done 2026-10-20: verified on the
+   laptop (sockets, `ssh-add`, unstamped journal lines, the no-backend
+   banner and refusals).
    - `contrib/systemd/sudo-agent.service`:
      `ExecStart=%h/.cargo/bin/sudo-agent serve`, `Restart=on-failure`, no
      socket activation.
+   - `Type=exec`, so a missing binary fails `systemctl start`. Ordered
+     `After=` and `PartOf=graphical-session.target`, `WantedBy=` it; no
+     `Requisite=`, so a manual start without a desktop still works.
+   - Another binary path or options: `systemctl --user edit` overriding
+     `ExecStart` (documented in the file and the README). The unit isn't in
+     the crate package (`cargo install` wouldn't install it anyway); the
+     README links to it in the repository.
    - README: installing the unit, `systemctl --user enable --now
      sudo-agent`, `journalctl --user -u sudo-agent`, `ForwardAgent` and
      `ssh-add` against the default socket paths, and the `setsid -f`
@@ -393,17 +404,31 @@ needs an answer. Design agreed 2026-10-07; open decisions settled
    - Laptop checks without a display: the service starts, both sockets
      exist, `ssh-add` / `ssh-add -l` work, journal lines aren't stamped
      twice; with neither a terminal nor a display the banner says every
-     request is denied, and it is.
-- [ ] **3c. pinentry under systemd**: the service needs `DISPLAY` /
-   `WAYLAND_DISPLAY` and `DBUS_SESSION_BUS_ADDRESS` (see the end of step 2).
-   On the laptop (Cinnamon, X11) the user manager already has `DISPLAY=:0`
+     request is denied, and it is. The user manager has `DISPLAY` here, so
+     "without a display" means a drop-in with `UnsetEnvironment=DISPLAY
+     WAYLAND_DISPLAY`, removed again for 3c.
+- [x] **3c. pinentry under systemd**, done 2026-10-20: the service needs
+   `DISPLAY` / `WAYLAND_DISPLAY` and `DBUS_SESSION_BUS_ADDRESS` (see the
+   end of step 2). On the laptop (Cinnamon, X11) the user manager already has `DISPLAY=:0`
    and the bus address once logged in, and `graphical-session.target` is
    active, so this is about ordering (`graphical-session.target`, decided
    above).
    - Laptop checks: the popup appears and **Allow** works with the agent
-     run by the service; new e2e cases for it.
-- [ ] **3d. Docs wrap-up**: AGENTS.md (status, `log!` convention),
-   `docs/manual-e2e.md` cases for 3b/3c, README, these checkboxes.
+     run by the service; new e2e cases for it. A first try on 2026-10-20
+     (after 3b, no drop-in) worked: banner `Approvals: a pinentry popup (no
+     terminal)`, `sudo` over SSH opened the popup and **Allow** approved it
+     (`Approved (pinentry)`); stop and restart log `Received SIGTERM` and
+     end cleanly. After a reboot the enabled unit started with the desktop
+     session and already had the display (`Approvals: a pinentry popup`),
+     so the ordering is right on Cinnamon. Logging out (twice, the second
+     time with a key loaded) stopped it with `SIGTERM` while the user
+     manager kept running, so `PartOf=` did it; each login started a fresh
+     agent with no keys and the display.
+   - README: a note for desktops without `graphical-session.target`
+     (`import-environment`, then a manual start, or `setsid -f`).
+- [x] **3d. Docs wrap-up**, done 2026-10-20: AGENTS.md (status, `log!`
+   convention), `docs/manual-e2e.md` cases for 3b/3c (24–27), README, these
+   checkboxes.
 - [ ] **4. `sudo-agent approve`**: a terminal client on `control.sock`
    (the long-poll extension) that shows pending requests and takes `y/N`,
    with the same type-ahead flush and `sanitize()`d text as the foreground

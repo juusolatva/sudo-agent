@@ -1,0 +1,31 @@
+# sudo-agent as a systemd user service, started with the desktop session and
+# stopped (keys dropped) when it ends.
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp sudo-agent.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now sudo-agent
+#   journalctl --user -u sudo-agent
+#
+# For another binary path or other options, `systemctl --user edit
+# sudo-agent` and replace the command (the empty line clears the old one):
+#
+#   [Service]
+#   ExecStart=
+#   ExecStart=/usr/local/bin/sudo-agent serve --ttl 30m
+
+[Unit]
+Description=sudo-agent, an SSH agent for human-approved sudo
+Documentation=https://github.com/juusolatva/sudo-agent
+# After the desktop has put DISPLAY and the D-Bus address into the user
+# manager, for approval popups.
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=exec
+ExecStart=%h/.cargo/bin/sudo-agent serve
+Restart=on-failure
+
+[Install]
+WantedBy=graphical-session.target

@@ -127,12 +127,59 @@ Without `$XDG_RUNTIME_DIR`, the sockets go to
 Only one agent runs per user: `serve` refuses to start while another agent
 answers on either socket.
 
-The agent runs in the foreground, and approval prompts appear in its
-terminal, and as popups when there's a display. Ctrl-C at a prompt denies
+`serve` runs in the foreground (or [as a service](#running-in-the-background)),
+and approval prompts appear in its terminal, and as popups when there's a display. Ctrl-C at a prompt denies
 that request; Ctrl-C otherwise (or twice within two seconds, or closing the
 terminal) stops the agent, drops the keys and removes the sockets. A prompt
 or popup is withdrawn if its client goes away (e.g. the SSH connection
 closes) or its key expires.
+
+### Running in the background
+
+As a systemd user service, started with your desktop session and stopped at
+logout. Copy [`contrib/systemd/sudo-agent.service`](contrib/systemd/sudo-agent.service)
+into place and enable it:
+
+```sh
+mkdir -p ~/.config/systemd/user
+cp contrib/systemd/sudo-agent.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now sudo-agent
+journalctl --user -u sudo-agent    # its log
+```
+
+- It runs `~/.cargo/bin/sudo-agent serve`, where `cargo install` puts it.
+  For another path or other options, `systemctl --user edit sudo-agent`
+  and replace the command (the empty `ExecStart=` clears the old one):
+  ```
+  [Service]
+  ExecStart=
+  ExecStart=/usr/local/bin/sudo-agent serve --ttl 30m
+  ```
+- The sockets are the usual ones, so add keys with `ssh-add` and forward
+  `agent.sock` as shown here. The service has no terminal: approvals come
+  only as [popups](#approval-popups), and without a display every request
+  is refused (its first log lines say so).
+- Stopping or restarting it (`systemctl --user restart sudo-agent`), or
+  logging out, drops all keys.
+- It isn't started when you're only logged in over SSH, with no desktop
+  session; `systemctl --user start sudo-agent` starts it by hand.
+- It needs a desktop that starts `graphical-session.target` and passes its
+  display to systemd (GNOME, KDE Plasma and Cinnamon do). Without one,
+  e.g. a bare window manager, it never starts by itself and may get no
+  popups. Run this from the session's startup instead of enabling it, or use
+  `setsid -f` below:
+  ```sh
+  systemctl --user import-environment DISPLAY WAYLAND_DISPLAY DBUS_SESSION_BUS_ADDRESS
+  systemctl --user start sudo-agent
+  ```
+
+Without systemd, detach it from the terminal and log to a file; stop it
+with `pkill -x sudo-agent`:
+
+```sh
+setsid -f sudo-agent serve >>~/.cache/sudo-agent.log 2>&1
+```
 
 ### Approval popups
 
@@ -254,7 +301,6 @@ asking for a password.
 
 Planned, roughly in order:
 
-- running as a background service (a systemd user unit);
 - a `sudo-agent approve` command for approving from any terminal;
 - later: `sudo-agent stop`, lock/unlock, and `sudo-agent status`;
 - showing the forwarding chain (which host a request came through) in the

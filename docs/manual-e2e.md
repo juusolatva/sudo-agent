@@ -47,6 +47,11 @@ SSH_AUTH_SOCK=$XDG_RUNTIME_DIR/sudo-agent/control.sock ssh-add -t 15m ~/.ssh/id_
 (Or load it at startup instead: `sudo-agent serve --key ~/.ssh/id_ed25519
 --ttl 15m`, with the passphrase asked in the agent's terminal.)
 
+Cases 24–27 run it as the systemd user service instead (README → Running in
+the background), which needs `cargo install --path . --locked` (the unit runs
+`~/.cargo/bin/sudo-agent`). Stop the service before running the agent by
+hand: only one may run.
+
 In a second terminal, log in with your normal agent but forward only
 `sudo-agent` (OpenSSH ≥ 8.2 accepts a socket path for `ForwardAgent`):
 
@@ -108,7 +113,7 @@ every `sudo` authenticates anyway.)
 | 10 | `ssh -o ForwardAgent=$XDG_RUNTIME_DIR/sudo-agent/control.sock <server>`, then `ssh-add -l` | `Refused control connection from … ssh …` | `error fetching identities: agent refused operation` |
 | 11 | In a session forwarding `agent.sock`, `ssh-add <some key file>` and `ssh-add -D` on the server | `Refused adding a key …` / `Refused removing all keys …: agent.sock only lists and signs` | Both refused; `ssh-add -l` still lists the key |
 | 12 | `ssh-add -l` on the server, then again a minute later | Nothing (listing never prompts) | Each key's comment ends in its time left, e.g. `laptop (14m30s left)`, about a minute less the second time; it matches `ssh-add -l` on the laptop against `control.sock` |
-| 13 | In the desktop session, `sudo -k; sudo -v`, click **Allow** in the popup | Startup said `Approvals: a pinentry popup or this terminal …`; popup (headed `sudo-agent`, text ending in `This popup closes in 1m without an answer.`) and terminal prompt appear together; the terminal prompt line ends, then `Approved (pinentry) …` | Succeeds |
+| 13 | In the desktop session, `sudo -k; sudo -v`, click **Allow** in the popup | Startup said `Approvals: a pinentry popup or this terminal …`; popup (headed `sudo-agent`, text ending in `This popup closes in 15s without an answer.`) and terminal prompt appear together; the terminal prompt line ends, then `Approved (pinentry) …` | Succeeds |
 | 14 | As 13, but **Deny** (then again with Escape, and with closing the window) | Terminal prompt line ends, then `Refused …: denied (pinentry)` | Falls back to the password prompt |
 | 15 | Agent run in tmux (`tmux new -s sa sudo-agent serve`); in another laptop terminal `(sleep 15; tmux send-keys -t sa y Enter) &`, then within 15 s `sudo -k; sudo -v` and leave the popup alone | At 15 s the terminal answers: the popup disappears; `Approved (terminal) …` | Succeeds |
 | 16 | In another laptop terminal `(sleep 15; pkill -INT -x sudo-agent) &` (what Ctrl-C sends), then within 15 s `sudo -k; sudo -v` and leave the popup alone | At 15 s the popup disappears; `Refused …: denied (terminal)`; the agent keeps running | Falls back to the password prompt |
@@ -119,6 +124,10 @@ every `sudo` authenticates anyway.)
 | 21 | Laptop only: SSH into the laptop (no `DISPLAY`) and run `sudo-agent serve` there | Startup says `Approvals: this terminal only (no pinentry popups: …)`; requests prompt in that terminal only | — |
 | 22 | In another laptop terminal `(sleep 15; pkill -KILL -x sudo-agent) &`, then within 15 s `sudo -k; sudo -v` | The popup closes (pinentry is killed with the agent) | Falls back to the password prompt |
 | 23 | Run the agent without a terminal in the desktop session: `setsid -f sudo-agent serve > /tmp/sudo-agent.log 2>&1`, add the key, `sudo -k; sudo -v`, click **Allow** | The log says `Approvals: a pinentry popup (no terminal)`, then `Approved (pinentry) …` | Succeeds |
+| 24 | Laptop only: the service without a display: a drop-in `~/.config/systemd/user/sudo-agent.service.d/headless.conf` with `[Service]` `UnsetEnvironment=DISPLAY WAYLAND_DISPLAY`, `daemon-reload`, `systemctl --user start sudo-agent`; add the key, `ssh-add -l` against `control.sock`, then `ssh-keygen -Y sign` against `agent.sock`. Remove the drop-in afterwards | `journalctl --user -u sudo-agent`: lines carry only the journal's timestamp; startup says `No way to approve requests: there's no terminal, and no pinentry popups: …; every signature request will be refused`; then `Added key …` and `Refused …: not approved: no approval backend is available` | — |
+| 25 | The service in the desktop session (no drop-in): add the key, `sudo -k; sudo -v`, click **Allow** | Journal: `Approvals: a pinentry popup (no terminal)`, then `Approved (pinentry) …`; `systemctl --user stop sudo-agent` logs `Received SIGTERM, shutting down` | Succeeds |
+| 26 | Laptop only: with the service enabled, reboot (or log out and in) and log in to the desktop | `systemctl --user status sudo-agent` is active; the journal's startup already says `Approvals: a pinentry popup (no terminal)` (the display reached the service) | — |
+| 27 | Laptop only: with the service running, add the key, log out of the desktop and back in (no reboot) | Journal: `Received SIGTERM, shutting down` at logout (same user manager pid in `systemd[…]`), then a fresh start with `No keys loaded yet` | — |
 | 5 | Stop the agent (Ctrl-C with no prompt open), then `sudo -k; sudo -v` | Nothing (agent is gone) | Password prompt: proves `sudo` really authenticates through `sudo-agent`, not some other forwarded agent |
 
 Cases 1, 2 and 6–9 test the terminal prompt: since step 2c, start the agent
@@ -129,6 +138,9 @@ popup instead, which cases 13–19 cover.
 `pinentry-gnome3` holds the keyboard and mouse while its popup is open (seen
 on Cinnamon), so the terminal can't be reached then. Cases 15, 16, 18 and
 22 therefore act on the agent from a timer started beforehand.
+
+Cases 24–27 run the agent as the systemd user service; read its log with
+`journalctl --user -u sudo-agent -b`.
 
 Report: the pam_ssh_agent_auth version, key type, the exact prompt text, and
 any `Refused …` lines from the laptop.
@@ -226,6 +238,22 @@ Fedora 44 Cinnamon through the `pinentry` wrapper):
   and 23 (`setsid -f`, popup only) passed.
 - With `--no-pinentry`, the terminal cases 1, 2 and 6–9 passed on the
   server as before, now logged as `(terminal)`. Released as 0.3.0.
+
+**2026-10-20, laptop + server `palvelin`** (steps 3a–3c: log timestamps,
+the systemd user service, Fedora 44 Cinnamon, systemd 259):
+
+- Timestamps: a foreground `serve` and `setsid -f sudo-agent serve > log`
+  stamp every line; the popup's timeout is now 15 s.
+- Case 24 (no display) passed: one timestamp per journal line, the
+  no-backend startup line, the key added with `ssh-add -t 240m` (`usable
+  for 4h`), and every `ssh-keygen -Y sign` refused.
+- Case 25 passed: the popup appeared through the forwarded `agent.sock`
+  and **Allow** approved it; stopping and restarting logged `Received
+  SIGTERM` and ended cleanly.
+- Case 26 passed after a reboot, and case 27 twice (the second time with a
+  key loaded): the user manager kept running across the logouts, so
+  `PartOf=graphical-session.target` stopped the agent; each login started a
+  fresh one with no keys and the display.
 
 ## Troubleshooting
 
