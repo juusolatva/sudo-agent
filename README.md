@@ -291,10 +291,12 @@ ECDSA should work but is untested. RSA works only when
 the requester asks for `rsa-sha2-512` signatures, which older
 `pam_ssh_agent_auth` versions may not do. RSA signing also uses the
 `rsa` crate, which has an unfixed timing side-channel advisory
-([RUSTSEC-2023-0071]). Every signature waits for your approval, which
-makes the timing hard to measure from a server, but prefer Ed25519.
+([RUSTSEC-2023-0071]; our advisory: [GHSA-wwj9-h88v-6483]). Every
+signature waits for your approval, which makes the timing hard to measure
+from a server, but prefer Ed25519.
 
 [RUSTSEC-2023-0071]: https://rustsec.org/advisories/RUSTSEC-2023-0071
+[GHSA-wwj9-h88v-6483]: https://github.com/juusolatva/sudo-agent/security/advisories/GHSA-wwj9-h88v-6483
 
 ## Server setup
 

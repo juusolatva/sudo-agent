@@ -648,6 +648,8 @@ touches signing or prompting.
       fixed `rsa` reaches `ssh-key` (tracking: RustCrypto/RSA#626). Accepted
       2026-10-18 because every RSA signature waits for a human approval.
       Alternative if it lingers: build `ssh-key` without RSA (drops RSA keys).
+      When it's fixed, also update our advisory GHSA-wwj9-h88v-6483 with the
+      patched sudo-agent version.
 
 ## Someday (only if bothered — not committed, fine to drop)
 

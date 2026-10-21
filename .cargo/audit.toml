@@ -7,6 +7,7 @@ ignore = [
     # RSA key. The only remote path to it is a sign request over the forwarded
     # agent.sock, and every one waits for a human yes/no, whose latency swamps
     # the timing differences the attack needs. Ed25519 is the recommended key
-    # type. Revisit once RustCrypto/RSA#626 is fixed.
+    # type. Revisit once RustCrypto/RSA#626 is fixed. Our advisory:
+    # https://github.com/juusolatva/sudo-agent/security/advisories/GHSA-wwj9-h88v-6483
     "RUSTSEC-2023-0071",
 ]
