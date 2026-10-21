@@ -158,14 +158,14 @@ impl ControlConnection {
         }
     }
 
-    /// Answers a request; fails if it isn't pending any more.
-    fn answer(&self, extension: &Extension) -> Result<(), AgentError> {
+    /// Answers a request; fails unless the answer decided it.
+    async fn answer(&self, extension: &Extension) -> Result<(), AgentError> {
         let reply = match extension.parse_message::<Reply>() {
             Ok(Some(reply)) => reply,
             _ => return Err(AgentError::Failure),
         };
         let from = self.inner.peer().to_string();
-        match self.approve.answer(reply.id, reply.approved, &from) {
+        match self.approve.answer(reply.id, reply.approved, &from).await {
             true => Ok(()),
             false => Err(AgentError::Failure),
         }
@@ -349,7 +349,7 @@ impl Session for ControlConnection {
         self.check()?;
         match extension.name.as_str() {
             approve::WAIT => self.wait().await.map(Some),
-            approve::ANSWER => self.answer(&extension).map(|()| None),
+            approve::ANSWER => self.answer(&extension).await.map(|()| None),
             _ => Err(AgentError::Failure),
         }
     }

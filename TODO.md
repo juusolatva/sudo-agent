@@ -471,6 +471,9 @@ needs an answer. Design agreed 2026-10-07; open decisions settled
        One that arrives as the request ends (another backend answered, it
        timed out) is delivered but loses; the withdrawal event that follows
        says what decided it, and only an answer that decided is logged.
+       The reply says which (changed in 4b): `Success` only if the answer
+       decided the request, so the client can print `Allowed`/`Denied`, or
+       `Too late: <reason>` once the withdrawal comes.
      - Any `control.sock` connection may answer any request: the same
        trust as `ssh-add` adding keys there. Ids are 64-bit and start at a
        random value per daemon (changed in 4a from "plain counting ids
@@ -517,7 +520,9 @@ needs an answer. Design agreed 2026-10-07; open decisions settled
      (no details) returns `string "pending"`, `uint64 id`, `uint32`
      seconds until it closes, `string message`; or `string "withdrawn"`,
      `uint64 id`, `string reason`. An answer is `uint64 id`, `byte` 1/0;
-     `Success` if delivered, `Failure` if the request isn't pending.
+     `Success` if it decided the request, `Failure` if not: not pending, or
+     it ended as the answer came (4a replied `Success` for any delivered
+     answer; changed in 4b).
      Anything left over after a message makes it invalid.
    - The backend: `available()` while at least one event connection is
      open; `confirm()` sends `pending` to every attached queue, waits for
@@ -537,17 +542,45 @@ needs an answer. Design agreed 2026-10-07; open decisions settled
      malformed answers (trailing bytes too) fail, the 5 s grace, ids
      differing between daemons. Test waits have a 5 s deadline, so a
      regression fails instead of hanging (CI jobs also time out at 30 min).
-- [ ] **4b. The `sudo-agent approve` subcommand.**
+- [ ] **4b. The `sudo-agent approve` subcommand.** Implemented 2026-10-21
+   (`src/approver.rs`, `approve` in `main.rs`), awaiting the user's test.
    - Finds `control.sock` like `serve` does (`--control-socket` /
-     `SUDO_AGENT_CONTROL_SOCKET`, `socket::choose_path`).
-   - Shows each pending request with its closing time and takes `y/N`
-     (typed `y`/`yes` + Enter, type-ahead flushed), reusing the terminal
-     prompt code; text `sanitize()`d again on the client. A withdrawn event
-     ends the prompt with a line saying why.
-   - Ctrl-C at a prompt denies that request; with no prompt open it exits
-     the client.
-   - Decide here: whether the client reconnects (with a message) when the
-     daemon restarts, or exits.
+     `SUDO_AGENT_CONTROL_SOCKET`, `socket::choose_path`). Needs a terminal
+     (`/dev/tty`); without one it says so and exits.
+   - Shows each pending request with its closing time (`Allow? (closes in
+     2m00s) [y/N]`) and takes `y/N` (typed `y`/`yes` + Enter, type-ahead
+     flushed): it is `TerminalPrompter`, with no timeout of its own, since
+     the daemon withdraws a request when it times out. Text `sanitize()`d
+     again on the client, line by line. One prompt at a time; requests
+     arriving meanwhile wait their turn, and one withdrawn before it was
+     shown is dropped silently.
+   - After the prompt: `Allowed`/`Denied` if the answer decided the
+     request, else `Too late: <reason>` once its withdrawal comes. A
+     withdrawal while the prompt is open ends it with `Withdrawn:
+     <reason>` (`no answer within 2m`, `answered by approve client pid …`,
+     `answered elsewhere, or no longer needed`).
+   - Ctrl-C at a prompt denies that request (`TerminalPrompter::interrupt`,
+     as in `serve`; again within 2 s quits); with no prompt open it exits
+     the client. SIGTERM/SIGHUP withdraw an open prompt and exit.
+   - **Daemon restarts: reconnect** (decided 2026-10-21). When the event
+     connection closes, an open prompt is withdrawn, the client prints
+     `sudo-agent went away; waiting for it to start again (Ctrl-C quits)`,
+     retries every second, and prints `sudo-agent is back; …` once
+     attached again. At startup, a socket that doesn't answer is an error
+     at once (a wrong path, or the service isn't running), and so is a
+     daemon that refuses the wait (`Failure`: too old, or the connection
+     was refused) or sends something unknown (a different version):
+     reconnecting wouldn't help.
+   - Tests (socket-level, `server.rs`): answers reach the daemon (allow and
+     deny), the message shows the closing time, a prompt answered by
+     another backend is withdrawn, the client attaches again after the
+     daemon restarts, stopping withdraws the open prompt and detaches,
+     `agent.sock` and a missing socket fail at startup; in `approver.rs`,
+     against a scripted daemon: a too-late answer, sanitizing, an unknown
+     reply. Checked on the laptop in a pty (`serve --no-pinentry` under
+     `setsid`, `ssh-keygen -Y sign`): y, n, Ctrl-C, a timeout, a daemon
+     restart with a prompt open, two clients (the other one is told who
+     answered), and the startup errors.
 - [ ] **4c. Docs wrap-up**: README (`approve`, `--approval-timeout`
    wording in the table and `--help`), AGENTS.md, `docs/manual-e2e.md`
    cases from 28 (approve, deny, two clients, popup and client racing,
@@ -569,6 +602,16 @@ touches signing or prompting.
   on both sockets with exact time left per key; `sudo-agent status` on a
   server talks to the forwarded `SSH_AUTH_SOCK`. Needs `sudo-agent`
   installed on the server, which is why key comments come first.
+- **Say why a request was withdrawn** (noted 2026-10-21 in 4b testing):
+  when the popup answers, `sudo-agent approve` only prints `Withdrawn:
+  answered elsewhere, or no longer needed`. That doesn't say whether it was
+  allowed, denied, or `sudo` gave up. The router knows the winner, but it
+  withdraws the other backends through a bare `CancellationToken`, which
+  carries no reason. Let it pass one (allowed/denied by which backend, the
+  requesting client hung up, the key expired), and send that as the
+  withdrawn event's reason, e.g. `Withdrawn: allowed in the pinentry
+  popup`. The router and the backends' cancellation change, not the wire
+  format.
 
 ### Other
 

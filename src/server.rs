@@ -43,6 +43,7 @@ pub async fn serve(
 mod tests {
     use super::*;
     use crate::approve::{self, ApproveClients, Event, Reply};
+    use crate::approver;
     use crate::keys::testing::entry;
     use crate::keys::{KeyEntry, TtlPolicy};
     use crate::prompt::Prompter;
@@ -101,10 +102,19 @@ mod tests {
             others: Vec<(&'static str, Arc<dyn Prompter>)>,
             timeout: Duration,
         ) -> Self {
+            Self::with_approve_in(tempfile::tempdir().unwrap(), keys, others, timeout)
+        }
+
+        fn with_approve_in(
+            dir: tempfile::TempDir,
+            keys: Vec<KeyEntry>,
+            others: Vec<(&'static str, Arc<dyn Prompter>)>,
+            timeout: Duration,
+        ) -> Self {
             let approve = Arc::new(ApproveClients::new(timeout));
             let mut backends = others;
             backends.push(("approve", Arc::clone(&approve) as Arc<dyn Prompter>));
-            Self::launch(keys, Router::new(backends), approve, LONG)
+            Self::launch_in(dir, keys, Router::new(backends), approve, LONG)
         }
 
         fn launch(
@@ -113,7 +123,16 @@ mod tests {
             approve: Arc<ApproveClients>,
             ttl: TtlPolicy,
         ) -> Self {
-            let dir = tempfile::tempdir().unwrap();
+            Self::launch_in(tempfile::tempdir().unwrap(), keys, router, approve, ttl)
+        }
+
+        fn launch_in(
+            dir: tempfile::TempDir,
+            keys: Vec<KeyEntry>,
+            router: Router,
+            approve: Arc<ApproveClients>,
+            ttl: TtlPolicy,
+        ) -> Self {
             let path = dir.path().join("agent.sock");
             let control_path = dir.path().join("control.sock");
             let (agent_listener, agent_file) = socket::bind(&path).unwrap();
@@ -931,5 +950,126 @@ mod tests {
             Response::Failure
         ));
         assert!(matches!(running.answer(42, true).await, Response::Failure));
+    }
+
+    /// `sudo-agent approve` on `running`'s control socket, answering with
+    /// `prompter`, until the returned sender fires.
+    fn approver(
+        running: &Running,
+        prompter: Arc<dyn Prompter>,
+    ) -> (JoinHandle<std::io::Result<()>>, oneshot::Sender<()>) {
+        let (stop, stopped) = oneshot::channel::<()>();
+        let path = running.control_path.clone();
+        let shutdown = async {
+            let _ = stopped.await;
+        };
+        let attending = tokio::spawn(approver::attend(path, prompter, shutdown));
+        (attending, stop)
+    }
+
+    #[tokio::test]
+    async fn approve_client_shows_requests_and_answers_them() {
+        let key = entry("laptop", Duration::from_secs(600));
+        let public = public(&key);
+        let running = Running::with_approve(vec![key], vec![], MINUTE);
+        let prompter = Arc::new(ScriptedPrompter::with_confirms([true, false]));
+        let (attending, stop) = approver(&running, prompter.clone());
+        until(|| running.approve.attached() == 1).await;
+
+        assert!(matches!(
+            running.sign_in_background(&public).await.unwrap(),
+            Response::SignResponse(_)
+        ));
+        assert!(matches!(
+            running.sign_in_background(&public).await.unwrap(),
+            Response::Failure
+        ));
+        let asked = prompter.asked();
+        assert_eq!(asked.len(), 2);
+        assert!(asked[0].contains("key: laptop"), "{asked:?}");
+        assert!(asked[0].contains("Allow? (closes in 1m00s)"), "{asked:?}");
+
+        stop.send(()).unwrap();
+        within(attending).await.unwrap().unwrap();
+        until(|| running.approve.attached() == 0).await;
+    }
+
+    #[tokio::test]
+    async fn approve_client_drops_a_prompt_answered_elsewhere() {
+        let key = entry("laptop", Duration::from_secs(600));
+        let public = public(&key);
+        let popup: Arc<dyn Prompter> = Arc::new(ApprovesAfter::new(Duration::from_millis(50)));
+        let running = Running::with_approve(vec![key], vec![("popup", popup)], MINUTE);
+        let prompter = Arc::new(ApprovesAfter::new(MINUTE));
+        let (_attending, _stop) = approver(&running, prompter.clone());
+        until(|| running.approve.attached() == 1).await;
+
+        assert!(matches!(
+            running.sign_in_background(&public).await.unwrap(),
+            Response::SignResponse(_)
+        ));
+        until(|| prompter.times_cancelled() == 1).await;
+        assert_eq!(prompter.times_asked(), 1);
+    }
+
+    #[tokio::test]
+    async fn approve_client_attaches_again_after_the_agent_restarts() {
+        // The agent before the restart: it takes the client's connection,
+        // then exits (hangs up), leaving its socket file behind.
+        let dir = tempfile::tempdir().unwrap();
+        let control_path = dir.path().join("control.sock");
+        let old = tokio::net::UnixListener::bind(&control_path).unwrap();
+        let prompter = Arc::new(ScriptedPrompter::with_confirms([true]));
+        let shutdown = std::future::pending();
+        let attending = tokio::spawn(approver::attend(control_path, prompter.clone(), shutdown));
+        drop(within(old.accept()).await.unwrap());
+        drop(old);
+
+        let key = entry("laptop", Duration::from_secs(600));
+        let public = public(&key);
+        let running = Running::with_approve_in(dir, vec![key], vec![], MINUTE);
+        until(|| running.approve.attached() == 1).await;
+        assert!(matches!(
+            running.sign_in_background(&public).await.unwrap(),
+            Response::SignResponse(_)
+        ));
+        assert_eq!(prompter.asked().len(), 1);
+        attending.abort();
+    }
+
+    #[tokio::test]
+    async fn approve_client_withdraws_its_prompt_when_stopped() {
+        let key = entry("laptop", Duration::from_secs(600));
+        let public = public(&key);
+        let running = Running::with_approve(vec![key], vec![], MINUTE);
+        let prompter = Arc::new(ApprovesAfter::new(MINUTE));
+        let (attending, stop) = approver(&running, prompter.clone());
+        until(|| running.approve.attached() == 1).await;
+        let signing = running.sign_in_background(&public);
+        until(|| prompter.times_asked() == 1).await;
+
+        stop.send(()).unwrap();
+        within(attending).await.unwrap().unwrap();
+        assert_eq!(prompter.times_cancelled(), 1);
+        signing.abort();
+    }
+
+    #[tokio::test]
+    async fn approve_client_fails_without_an_agent_that_takes_it() {
+        let running = Running::with_approve(vec![], vec![], MINUTE);
+        let prompter: Arc<dyn Prompter> = Arc::new(ScriptedPrompter::default());
+        // `agent.sock` refuses approvals.
+        let refused = approver::attend(
+            running.path.clone(),
+            prompter.clone(),
+            std::future::pending(),
+        );
+        let e = within(refused).await.unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}");
+        let missing = running.path.with_file_name("missing.sock");
+        let e = approver::attend(missing, prompter, std::future::pending())
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{e}");
     }
 }

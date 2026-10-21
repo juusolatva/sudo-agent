@@ -13,6 +13,7 @@ macro_rules! log {
 
 mod agent;
 mod approve;
+mod approver;
 mod cli;
 mod control;
 mod keys;
@@ -36,7 +37,7 @@ use tokio::signal::unix::{SignalKind, signal};
 
 use crate::agent::{SudoAgent, sanitize};
 use crate::approve::ApproveClients;
-use crate::cli::ServeArgs;
+use crate::cli::{ApproveArgs, Run, ServeArgs};
 use crate::control::ControlAgent;
 use crate::keys::{KeyEntry, TtlPolicy};
 use crate::pinentry::Pinentry;
@@ -189,6 +190,33 @@ async fn run(args: ServeArgs) -> Result<(), AgentError> {
     result
 }
 
+/// `sudo-agent approve`: answers the agent's requests at this terminal.
+async fn approve(args: ApproveArgs) -> io::Result<()> {
+    let path = socket::choose_path(
+        args.control_socket,
+        env::var_os(socket::CONTROL_SOCKET_ENV),
+        || socket::default_path("control"),
+    )?;
+    let terminal = Arc::new(TerminalPrompter::new(approver::NO_TIMEOUT));
+    if !terminal.available() {
+        let message = "approve asks at a terminal, and there is none";
+        return Err(io::Error::new(io::ErrorKind::NotFound, message));
+    }
+    // Ctrl-C at a prompt denies that request, as in `serve`.
+    let shutdown = shutdown_signal({
+        let terminal = Arc::clone(&terminal);
+        move || terminal.interrupt()
+    })?;
+    let shutdown = async {
+        if shutdown.await == "SIGINT" {
+            // End the "^C" line.
+            use std::io::Write as _;
+            let _ = io::stderr().write_all(b"\n");
+        }
+    };
+    approver::attend(path, terminal, shutdown).await
+}
+
 /// Whether approval popups are shown, and if not, why.
 enum Popups<'a> {
     /// By this pinentry program.
@@ -268,7 +296,7 @@ fn shutdown_signal(
 const STOP_WINDOW: Duration = Duration::from_secs(2);
 
 fn main() -> ExitCode {
-    let args = cli::parse();
+    let command = cli::parse();
     logging::init();
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
@@ -277,7 +305,10 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let result = runtime.block_on(run(args));
+    let result = match command {
+        Run::Serve(args) => runtime.block_on(run(args)),
+        Run::Approve(args) => runtime.block_on(approve(args)).map_err(AgentError::from),
+    };
     // An approval prompt may still be blocked reading the terminal; dropping
     // the runtime normally would wait for it, so don't.
     runtime.shutdown_background();

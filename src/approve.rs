@@ -10,10 +10,10 @@
 //!   waits on it again and again.
 //! - [`ANSWER`] ([`Reply`]) answers a pending request by id. It goes over a
 //!   second connection, as the first is busy waiting. `Success` means the
-//!   answer was delivered, `Failure` that the request is no longer pending.
-//!   A delivered answer still loses if the request ends at the same moment
-//!   (another backend answered, it timed out); the withdrawal event that
-//!   follows says what decided it.
+//!   answer decided the request, `Failure` that it didn't: the request
+//!   wasn't pending any more, or ended as the answer came (another backend
+//!   answered, it timed out). The withdrawal event that follows says what
+//!   decided it.
 //!
 //! Request ids start at a random value in each daemon, so an answer meant
 //! for a request of an earlier daemon (one that restarted while a client
@@ -82,8 +82,17 @@ struct Open {
     message: String,
     /// On the [`keys::now`] clock.
     deadline: Duration,
-    /// Taken by the first answer, which says who gave it.
-    answer: Option<oneshot::Sender<(bool, String)>>,
+    /// Taken by the first answer.
+    answer: Option<oneshot::Sender<Delivered>>,
+}
+
+/// An answer delivered to an open request.
+struct Delivered {
+    approved: bool,
+    /// The answering client.
+    from: String,
+    /// Told if this answer decided the request; dropped if it didn't.
+    decided: oneshot::Sender<()>,
 }
 
 impl ApproveClients {
@@ -127,9 +136,10 @@ impl ApproveClients {
     }
 
     /// Answers request `id` on behalf of `from` (the answering client).
-    /// Returns whether the answer was delivered: `false` if the request isn't
-    /// pending any more (answered, timed out, withdrawn) or never was.
-    pub fn answer(&self, id: u64, approved: bool, from: &str) -> bool {
+    /// Returns whether the answer decided it: `false` if the request isn't
+    /// pending any more (answered, timed out, withdrawn), never was, or
+    /// ended as the answer came.
+    pub async fn answer(&self, id: u64, approved: bool, from: &str) -> bool {
         let now = keys::now();
         let answer = self
             .state()
@@ -137,7 +147,18 @@ impl ApproveClients {
             .iter_mut()
             .find(|open| open.id == id && now < open.deadline)
             .and_then(|open| open.answer.take());
-        answer.is_some_and(|answer| answer.send((approved, from.to_owned())).is_ok())
+        let Some(answer) = answer else {
+            return false;
+        };
+        let (decided, decision) = oneshot::channel();
+        let delivered = Delivered {
+            approved,
+            from: from.to_owned(),
+            decided,
+        };
+        // `confirm` drops an answer that comes too late, and with it
+        // `decided`.
+        answer.send(delivered).is_ok() && decision.await.is_ok()
     }
 
     /// Resolves once no client has been attached for [`GRACE`] (`grace`)
@@ -171,7 +192,7 @@ impl ApproveClients {
         &self,
         message: &str,
         deadline: Duration,
-    ) -> (Opened<'_>, oneshot::Receiver<(bool, String)>) {
+    ) -> (Opened<'_>, oneshot::Receiver<Delivered>) {
         let (answer, answered) = oneshot::channel();
         let mut state = self.state();
         state.last_id = state.last_id.wrapping_add(1);
@@ -286,18 +307,21 @@ impl Prompter for ApproveClients {
             answer = answered => answer.map_err(|_| io::Error::other("answer lost")),
         };
         let reason = match &result {
-            Ok((approved, from)) => {
+            Ok(answer) => {
                 // Only an answer that is used is logged, before the
                 // request's outcome.
-                let verdict = if *approved { "Allowed" } else { "Denied" };
-                log!("{verdict} by approve client {from}");
-                format!("answered by approve client {from}")
+                let verdict = if answer.approved { "Allowed" } else { "Denied" };
+                log!("{verdict} by approve client {}", answer.from);
+                format!("answered by approve client {}", answer.from)
             }
             Err(e) if e.kind() == ErrorKind::TimedOut => e.to_string(),
             Err(_) => WITHDRAWN.to_owned(),
         };
         opened.close(&reason);
-        result.map(|(approved, _)| approved)
+        result.map(|answer| {
+            let _ = answer.decided.send(());
+            answer.approved
+        })
     }
 
     fn available(&self) -> bool {
@@ -641,10 +665,10 @@ mod tests {
         assert_eq!(message, "Allow?");
         assert!(closes_in > LONG - Duration::from_secs(5) && closes_in <= LONG);
 
-        assert!(clients.answer(id, false, "pid 7"));
+        assert!(within(clients.answer(id, false, "pid 7")).await);
         assert!(!within(asking).await.unwrap().unwrap());
         // Too late: already answered.
-        assert!(!clients.answer(id, true, "pid 8"));
+        assert!(!clients.answer(id, true, "pid 8").await);
         for client in [&one, &two] {
             let reason = "answered by approve client pid 7".to_owned();
             assert_eq!(withdrawn(queued(client)), (id, reason));
@@ -661,7 +685,7 @@ mod tests {
 
         let late = clients.attach();
         let id = pending_id(queued(&late));
-        assert!(clients.answer(id, true, "test"));
+        assert!(within(clients.answer(id, true, "test")).await);
         assert!(within(asking).await.unwrap().unwrap());
     }
 
@@ -678,7 +702,7 @@ mod tests {
         let e = within(asking).await.unwrap().unwrap_err();
         assert_ne!(e.kind(), ErrorKind::TimedOut);
         assert_eq!(withdrawn(queued(&client)), (id, WITHDRAWN.into()));
-        assert!(!clients.answer(id, true, "test"));
+        assert!(!clients.answer(id, true, "test").await);
         assert!(clients.state().open.is_empty());
     }
 
@@ -705,7 +729,7 @@ mod tests {
 
         let again = clients.attach();
         let id = pending_id(queued(&again));
-        assert!(clients.answer(id, true, "test"));
+        assert!(within(clients.answer(id, true, "test")).await);
         assert!(within(asking).await.unwrap().unwrap());
     }
 
@@ -764,34 +788,34 @@ mod tests {
         let id = clients.state().open[0].id;
         cancel.cancel();
         // Delivered or not (if `confirm` has already closed the request), it
-        // loses.
-        clients.answer(id, true, "test");
+        // loses, and is told so.
+        assert!(!within(clients.answer(id, true, "test")).await);
         let result = within(asking).await.unwrap();
         assert!(result.is_err(), "{result:?}");
     }
 
-    #[test]
-    fn answers_past_the_deadline_are_refused() {
+    #[tokio::test]
+    async fn answers_past_the_deadline_are_refused() {
         let clients = ApproveClients::new(LONG);
         let (opened, _answered) = clients.open("Allow?", keys::now());
-        assert!(!clients.answer(opened.id, true, "test"));
+        assert!(!clients.answer(opened.id, true, "test").await);
     }
 
     /// An answer meant for a request of a daemon that has since restarted
     /// must not answer the new daemon's request.
-    #[test]
-    fn request_ids_differ_between_daemons() {
+    #[tokio::test]
+    async fn request_ids_differ_between_daemons() {
         let (old, new) = (ApproveClients::new(LONG), ApproveClients::new(LONG));
         let (old_request, _) = old.open("old", keys::now() + LONG);
         let (new_request, _) = new.open("new", keys::now() + LONG);
         assert_ne!(old_request.id, new_request.id);
-        assert!(!new.answer(old_request.id, true, "stale"));
+        assert!(!new.answer(old_request.id, true, "stale").await);
     }
 
-    #[test]
-    fn unknown_ids_are_not_answered() {
+    #[tokio::test]
+    async fn unknown_ids_are_not_answered() {
         let clients = ApproveClients::new(LONG);
-        assert!(!clients.answer(7, true, "test"));
+        assert!(!clients.answer(7, true, "test").await);
     }
 
     #[test]
@@ -814,15 +838,15 @@ mod tests {
         assert_eq!(queued(&client), None);
     }
 
-    #[test]
-    fn dropping_an_open_request_withdraws_it() {
+    #[tokio::test]
+    async fn dropping_an_open_request_withdraws_it() {
         let clients = ApproveClients::new(LONG);
         let client = clients.attach();
         let (opened, _answered) = clients.open("Allow?", keys::now() + LONG);
         let id = pending_id(queued(&client));
         drop(opened);
         assert_eq!(withdrawn(queued(&client)), (id, WITHDRAWN.into()));
-        assert!(!clients.answer(id, true, "test"));
+        assert!(!clients.answer(id, true, "test").await);
     }
 
     #[test]

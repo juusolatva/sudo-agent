@@ -1,5 +1,6 @@
 //! Command line: `sudo-agent serve [OPTIONS]` runs the agent, and the bare
 //! form `sudo-agent [OPTIONS]` (how 0.1 was invoked) is an alias for it.
+//! `sudo-agent approve` answers a running agent's approval requests.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -25,6 +26,17 @@ struct Cli {
 enum Command {
     /// Run the agent (also what `sudo-agent [OPTIONS]` does).
     Serve(ServeArgs),
+    /// Answer a running agent's approval requests at this terminal.
+    ///
+    /// Any terminal works, e.g. over SSH into this machine. Popups and other
+    /// approve clients are asked at the same time; the first answer counts.
+    Approve(ApproveArgs),
+}
+
+/// What to run.
+pub enum Run {
+    Serve(ServeArgs),
+    Approve(ApproveArgs),
 }
 
 #[derive(Args)]
@@ -45,7 +57,8 @@ pub struct ServeArgs {
     #[arg(long, value_name = "DURATION", default_value = "8h", value_parser = keys::parse_duration)]
     pub max_ttl: Duration,
 
-    /// How long the terminal prompt waits for an answer before giving up.
+    /// How long the terminal prompt, and sudo-agent approve, wait for an
+    /// answer before giving up.
     #[arg(long, value_name = "DURATION", default_value = "2m", value_parser = keys::parse_duration)]
     pub approval_timeout: Duration,
 
@@ -74,18 +87,30 @@ pub struct ServeArgs {
     pub control_socket: Option<PathBuf>,
 }
 
+#[derive(Args)]
+pub struct ApproveArgs {
+    /// The agent's control socket [env: SUDO_AGENT_CONTROL_SOCKET]
+    /// [default: $XDG_RUNTIME_DIR/sudo-agent/control.sock]
+    #[arg(long, value_name = "PATH")]
+    pub control_socket: Option<PathBuf>,
+}
+
 /// Parses the command line, exiting with a usage error if it's invalid.
-pub fn parse() -> ServeArgs {
+pub fn parse() -> Run {
     Cli::try_parse()
-        .and_then(serve_args)
+        .and_then(command)
         .unwrap_or_else(|e| e.exit())
 }
 
-fn serve_args(cli: Cli) -> Result<ServeArgs, clap::Error> {
-    let args = match cli.command {
-        Some(Command::Serve(args)) => args,
-        None => cli.serve,
-    };
+fn command(cli: Cli) -> Result<Run, clap::Error> {
+    match cli.command {
+        Some(Command::Serve(args)) => serve_args(args).map(Run::Serve),
+        Some(Command::Approve(args)) => Ok(Run::Approve(args)),
+        None => serve_args(cli.serve).map(Run::Serve),
+    }
+}
+
+fn serve_args(args: ServeArgs) -> Result<ServeArgs, clap::Error> {
     if args.ttl > args.max_ttl {
         let message = format!(
             "--ttl {} is longer than --max-ttl {}",
@@ -101,9 +126,16 @@ fn serve_args(cli: Cli) -> Result<ServeArgs, clap::Error> {
 mod tests {
     use super::*;
 
-    fn parse(args: &[&str]) -> Result<ServeArgs, clap::Error> {
+    fn run(args: &[&str]) -> Result<Run, clap::Error> {
         Cli::try_parse_from(std::iter::once("sudo-agent").chain(args.iter().copied()))
-            .and_then(serve_args)
+            .and_then(command)
+    }
+
+    fn parse(args: &[&str]) -> Result<ServeArgs, clap::Error> {
+        match run(args)? {
+            Run::Serve(args) => Ok(args),
+            Run::Approve(_) => panic!("{args:?} is approve, not serve"),
+        }
     }
 
     #[test]
@@ -173,6 +205,25 @@ mod tests {
     fn options_before_the_subcommand_are_rejected() {
         // Bare-form options and a subcommand don't mix: which would win?
         assert!(parse(&["--key", "k", "serve", "--key", "k"]).is_err());
+    }
+
+    #[test]
+    fn approve_takes_the_control_socket() {
+        for (args, path) in [
+            (&["approve"][..], None),
+            (
+                &["approve", "--control-socket", "/tmp/c.sock"][..],
+                Some("/tmp/c.sock"),
+            ),
+        ] {
+            let Ok(Run::Approve(parsed)) = run(args) else {
+                panic!("{args:?} isn't approve");
+            };
+            assert_eq!(parsed.control_socket, path.map(PathBuf::from));
+        }
+        // Serving options belong to serve.
+        assert!(run(&["approve", "--key", "k"]).is_err());
+        assert!(run(&["--key", "k", "approve"]).is_err());
     }
 
     #[test]
