@@ -431,7 +431,7 @@ needs an answer. Design agreed 2026-10-07; open decisions settled
 - [x] **3d. Docs wrap-up**, done 2026-10-20: AGENTS.md (status, `log!`
    convention), `docs/manual-e2e.md` cases for 3b/3c (24–27), README, these
    checkboxes.
-- [ ] **4. `sudo-agent approve`**: a terminal client on `control.sock`
+- [x] **4. `sudo-agent approve`**: a terminal client on `control.sock`
    (the long-poll extension) that shows pending requests and takes `y/N`,
    with the same type-ahead flush and `sanitize()`d text as the foreground
    prompt; it joins the routing.
@@ -510,12 +510,11 @@ needs an answer. Design agreed 2026-10-07; open decisions settled
      planned status extension: `approve-wait@…` and `approve-answer@…`
      (settled in 4a). Log lines name the backend `approve` (`Approved
      (approve) …`); clients attaching and detaching are logged too.
-- [ ] **4a. Daemon side**: the two extensions on `control.sock` and the
+- [x] **4a. Daemon side**: the two extensions on `control.sock` and the
    `approve` backend in the router. No client yet; tested with
-   `ssh_agent_lib`'s `Client` in socket-level tests. Implemented
-   2026-10-21 (`src/approve.rs`: `ApproveClients`, the per-connection
-   `Events` queue, the wire format; `ControlConnection::wait`/`answer`),
-   awaiting the user's test.
+   `ssh_agent_lib`'s `Client` in socket-level tests. Done 2026-10-21
+   (`src/approve.rs`: `ApproveClients`, the per-connection `Events` queue,
+   the wire format; `ControlConnection::wait`/`answer`).
    - Wire format (`ssh-encoding`, documented in `src/approve.rs`): a wait
      (no details) returns `string "pending"`, `uint64 id`, `uint32`
      seconds until it closes, `string message`; or `string "withdrawn"`,
@@ -542,8 +541,9 @@ needs an answer. Design agreed 2026-10-07; open decisions settled
      malformed answers (trailing bytes too) fail, the 5 s grace, ids
      differing between daemons. Test waits have a 5 s deadline, so a
      regression fails instead of hanging (CI jobs also time out at 30 min).
-- [ ] **4b. The `sudo-agent approve` subcommand.** Implemented 2026-10-21
-   (`src/approver.rs`, `approve` in `main.rs`), awaiting the user's test.
+- [x] **4b. The `sudo-agent approve` subcommand.** Done 2026-10-21
+   (`src/approver.rs`, `approve` in `main.rs`); the user's test on the
+   laptop and server `vakoilu` passed (e2e cases 28–30, 32).
    - Finds `control.sock` like `serve` does (`--control-socket` /
      `SUDO_AGENT_CONTROL_SOCKET`, `socket::choose_path`). Needs a terminal
      (`/dev/tty`); without one it says so and exits.
@@ -581,11 +581,17 @@ needs an answer. Design agreed 2026-10-07; open decisions settled
      `setsid`, `ssh-keygen -Y sign`): y, n, Ctrl-C, a timeout, a daemon
      restart with a prompt open, two clients (the other one is told who
      answered), and the startup errors.
-- [ ] **4c. Docs wrap-up**: README (`approve`, `--approval-timeout`
-   wording in the table and `--help`), AGENTS.md, `docs/manual-e2e.md`
-   cases from 28 (approve, deny, two clients, popup and client racing,
-   withdrawal, the systemd service with a client over SSH into the
-   laptop), these checkboxes. Then the server cases; candidate for 0.5.0.
+- [x] **4c. Docs wrap-up**, done 2026-10-21: README (`Approving from any
+   terminal`, `--approval-timeout` in the table and `--help`, the service
+   and popup sections, a security note, the roadmap), AGENTS.md,
+   `docs/manual-e2e.md` (cases 28–38: approve, deny, Ctrl-C, two clients,
+   popup and client racing, timeout, hang-up, no client and the 5 s grace,
+   a restart, a client over SSH into the laptop; the startup lines of
+   older cases brought up to date), these checkboxes. To be released as
+   0.4.1 (decided 2026-10-21, not 0.5.0), so the docs reach crates.io. Still to
+   run: the server cases (signing and prompting changed) and the 4b cases
+   not run as written yet (31 and 37 were only checked in a pty against
+   `serve`; 33–36 and 38 not at all).
 
 Re-run the server cases in `docs/manual-e2e.md` after 1b, 2 and 4: each
 touches signing or prompting.

@@ -22,8 +22,9 @@ ssh -o ForwardAgent=<sudo-agent socket> ──┴──────────�
 - The **servers** already have `pam_ssh_agent_auth` set up for `sudo`. They
   hold **no private keys**: the key reaches them only through the forwarded
   agent socket. Do not try to run `sudo-agent` on a server.
-- Approval prompts appear on the **laptop terminal running `sudo-agent`**, not
-  in the SSH session. An AI agent working on a server can neither see nor
+- Approval prompts appear on the **laptop**: on the terminal running
+  `sudo-agent`, as popups, and in any `sudo-agent approve` there, not in the
+  server session. An AI agent working on a server can neither see nor
   answer them; the user does, and relays what they saw.
 - The prompt names the *local* process (the laptop's `ssh` command), not the
   remote `sudo`. That is expected; see the forwarding-chain item in
@@ -47,10 +48,11 @@ SSH_AUTH_SOCK=$XDG_RUNTIME_DIR/sudo-agent/control.sock ssh-add -t 15m ~/.ssh/id_
 (Or load it at startup instead: `sudo-agent serve --key ~/.ssh/id_ed25519
 --ttl 15m`, with the passphrase asked in the agent's terminal.)
 
-Cases 24–27 run it as the systemd user service instead (README → Running in
-the background), which needs `cargo install --path . --locked` (the unit runs
-`~/.cargo/bin/sudo-agent`). Stop the service before running the agent by
-hand: only one may run.
+Cases 24–27 and 28–38 run it as the systemd user service instead (README →
+Running in the background), which needs `cargo install --path . --locked`
+(the unit runs `~/.cargo/bin/sudo-agent`; an older install refuses
+`sudo-agent approve`). Stop the service before running the agent by hand:
+only one may run.
 
 In a second terminal, log in with your normal agent but forward only
 `sudo-agent` (OpenSSH ≥ 8.2 accepts a socket path for `ForwardAgent`):
@@ -113,7 +115,7 @@ every `sudo` authenticates anyway.)
 | 10 | `ssh -o ForwardAgent=$XDG_RUNTIME_DIR/sudo-agent/control.sock <server>`, then `ssh-add -l` | `Refused control connection from … ssh …` | `error fetching identities: agent refused operation` |
 | 11 | In a session forwarding `agent.sock`, `ssh-add <some key file>` and `ssh-add -D` on the server | `Refused adding a key …` / `Refused removing all keys …: agent.sock only lists and signs` | Both refused; `ssh-add -l` still lists the key |
 | 12 | `ssh-add -l` on the server, then again a minute later | Nothing (listing never prompts) | Each key's comment ends in its time left, e.g. `laptop (14m30s left)`, about a minute less the second time; it matches `ssh-add -l` on the laptop against `control.sock` |
-| 13 | In the desktop session, `sudo -k; sudo -v`, click **Allow** in the popup | Startup said `Approvals: a pinentry popup or this terminal …`; popup (headed `sudo-agent`, text ending in `This popup closes in 15s without an answer.`) and terminal prompt appear together; the terminal prompt line ends, then `Approved (pinentry) …` | Succeeds |
+| 13 | In the desktop session, `sudo -k; sudo -v`, click **Allow** in the popup | Startup said `Approvals: a pinentry popup, sudo-agent approve or this terminal …`; popup (headed `sudo-agent`, text ending in `This popup closes in 15s without an answer.`) and terminal prompt appear together; the terminal prompt line ends, then `Approved (pinentry) …` | Succeeds |
 | 14 | As 13, but **Deny** (then again with Escape, and with closing the window) | Terminal prompt line ends, then `Refused …: denied (pinentry)` | Falls back to the password prompt |
 | 15 | Agent run in tmux (`tmux new -s sa sudo-agent serve`); in another laptop terminal `(sleep 15; tmux send-keys -t sa y Enter) &`, then within 15 s `sudo -k; sudo -v` and leave the popup alone | At 15 s the terminal answers: the popup disappears; `Approved (terminal) …` | Succeeds |
 | 16 | In another laptop terminal `(sleep 15; pkill -INT -x sudo-agent) &` (what Ctrl-C sends), then within 15 s `sudo -k; sudo -v` and leave the popup alone | At 15 s the popup disappears; `Refused …: denied (terminal)`; the agent keeps running | Falls back to the password prompt |
@@ -121,19 +123,31 @@ every `sudo` authenticates anyway.)
 | 18 | In another laptop terminal `(sleep 15; pkill -x -n ssh) &` (the newest `ssh`: the server session), then within 15 s `sudo -k; sudo -v` and leave the popup alone | At 15 s popup and terminal prompt are withdrawn; `Refused …: client disconnected` | Connection closed |
 | 19 | As case 8 (`--ttl 1m`, ~10 s left), with the popup open | At expiry the popup and the terminal prompt are withdrawn; `Refused …: key expired while waiting for approval` | Falls back to the password prompt |
 | 20 | Restart with `--pinentry pinentry-curses`, then `sudo -k; sudo -v` twice, answering at the terminal | The terminal prompt works and isn't disturbed; after the first answer `Approval backend failed (logged only once): pinentry: pinentry failed: Inappropriate ioctl for device …`; not repeated the second time | Both as answered |
-| 21 | Laptop only: SSH into the laptop (no `DISPLAY`) and run `sudo-agent serve` there | Startup says `Approvals: this terminal only (no pinentry popups: …)`; requests prompt in that terminal only | — |
+| 21 | Laptop only: SSH into the laptop (no `DISPLAY`) and run `sudo-agent serve` there | Startup says `Approvals: sudo-agent approve or this terminal, whichever answers first (no pinentry popups: …)`; requests prompt in that terminal only | — |
 | 22 | In another laptop terminal `(sleep 15; pkill -KILL -x sudo-agent) &`, then within 15 s `sudo -k; sudo -v` | The popup closes (pinentry is killed with the agent) | Falls back to the password prompt |
-| 23 | Run the agent without a terminal in the desktop session: `setsid -f sudo-agent serve > /tmp/sudo-agent.log 2>&1`, add the key, `sudo -k; sudo -v`, click **Allow** | The log says `Approvals: a pinentry popup (no terminal)`, then `Approved (pinentry) …` | Succeeds |
-| 24 | Laptop only: the service without a display: a drop-in `~/.config/systemd/user/sudo-agent.service.d/headless.conf` with `[Service]` `UnsetEnvironment=DISPLAY WAYLAND_DISPLAY`, `daemon-reload`, `systemctl --user start sudo-agent`; add the key, `ssh-add -l` against `control.sock`, then `ssh-keygen -Y sign` against `agent.sock`. Remove the drop-in afterwards | `journalctl --user -u sudo-agent`: lines carry only the journal's timestamp; startup says `No way to approve requests: there's no terminal, and no pinentry popups: …; every signature request will be refused`; then `Added key …` and `Refused …: not approved: no approval backend is available` | — |
-| 25 | The service in the desktop session (no drop-in): add the key, `sudo -k; sudo -v`, click **Allow** | Journal: `Approvals: a pinentry popup (no terminal)`, then `Approved (pinentry) …`; `systemctl --user stop sudo-agent` logs `Received SIGTERM, shutting down` | Succeeds |
-| 26 | Laptop only: with the service enabled, reboot (or log out and in) and log in to the desktop | `systemctl --user status sudo-agent` is active; the journal's startup already says `Approvals: a pinentry popup (no terminal)` (the display reached the service) | — |
+| 23 | Run the agent without a terminal in the desktop session: `setsid -f sudo-agent serve > /tmp/sudo-agent.log 2>&1`, add the key, `sudo -k; sudo -v`, click **Allow** | The log says `Approvals: a pinentry popup or sudo-agent approve, whichever answers first (no terminal)`, then `Approved (pinentry) …` | Succeeds |
+| 24 | Laptop only: the service without a display: a drop-in `~/.config/systemd/user/sudo-agent.service.d/headless.conf` with `[Service]` `UnsetEnvironment=DISPLAY WAYLAND_DISPLAY`, `daemon-reload`, `systemctl --user start sudo-agent`; add the key, `ssh-add -l` against `control.sock`, then `ssh-keygen -Y sign` against `agent.sock`. Remove the drop-in afterwards | `journalctl --user -u sudo-agent`: lines carry only the journal's timestamp; startup says `Approvals: sudo-agent approve only (there's no terminal, and no pinentry popups: …); signature requests are refused while none is running`; then `Added key …` and `Refused …: not approved: no approval backend is available` | — |
+| 25 | The service in the desktop session (no drop-in): add the key, `sudo -k; sudo -v`, click **Allow** | Journal: `Approvals: a pinentry popup or sudo-agent approve, whichever answers first (no terminal)`, then `Approved (pinentry) …`; `systemctl --user stop sudo-agent` logs `Received SIGTERM, shutting down` | Succeeds |
+| 26 | Laptop only: with the service enabled, reboot (or log out and in) and log in to the desktop | `systemctl --user status sudo-agent` is active; the journal's startup already says `Approvals: a pinentry popup or sudo-agent approve, whichever answers first (no terminal)` (the display reached the service) | — |
 | 27 | Laptop only: with the service running, add the key, log out of the desktop and back in (no reboot) | Journal: `Received SIGTERM, shutting down` at logout (same user manager pid in `systemd[…]`), then a fresh start with `No keys loaded yet` | — |
+| 28 | Headless service (case 24's drop-in), `sudo-agent approve` in a laptop terminal; `sudo -k; sudo -v`, answer **y** in the client | Journal: `Approve client attached: pid …`; the client shows the request ending in `Allow? (closes in 2m00s) [y/N]`, then `Allowed`; journal: `Allowed by approve client pid …`, then `Approved (approve) …` | Succeeds |
+| 29 | As 28, answer **n** | Client: `Denied`; journal: `Denied by approve client pid …`, then `Refused …: denied (approve)` | Falls back to the password prompt |
+| 30 | As 28, Ctrl-C at the client's prompt; more than 2 s later, Ctrl-C again (no prompt open) | `^C`, then `Denied`, and the client keeps running; journal: `Refused …: denied (approve)`. The second Ctrl-C quits the client; journal: `Approve client detached: …` | Falls back to the password prompt |
+| 31 | As 28 with two clients in two laptop terminals; answer **y** in one | Both show the request; the other one's prompt line ends, then `Withdrawn: answered by approve client pid <the first's pid> …` | Succeeds |
+| 32 | The service with the display (no drop-in) and a client; click **Allow** in the popup; then again with **Deny** | Both ask at once. The client's prompt line ends, then `Withdrawn: answered elsewhere, or no longer needed`; journal: `Approved (pinentry) …` / `Refused …: denied (pinentry)` | Succeeds / falls back to the password prompt |
+| 33 | As 32, leave the popup alone and answer **y** in the client after the popup closed by itself | The popup closes at 15 s, the client's prompt stays open; then `Allowed`, journal `Approved (approve) …` | Succeeds |
+| 34 | As 28, answer nothing | At 2 min the client's prompt line ends, then `Withdrawn: no answer within 2m`; journal: `Refused …: not approved: no answer within 2m` | Falls back to the password prompt |
+| 35 | As 28, then end the SSH connection with `~.` while the client's prompt is open | Client: `Withdrawn: answered elsewhere, or no longer needed`; journal: `Refused …: client disconnected` | Connection closed |
+| 36 | Headless service with **no** client: `sudo -k; sudo -v`. Then start a client, `sudo -k; sudo -v`, and with its prompt open stop it from another laptop terminal with `pkill -f 'sudo-agent approve'` (Ctrl-C there would deny) | Without a client: refused at once, `not approved: no approval backend is available`. Stopping it mid-request: its prompt line ends and it exits; `Approve client detached: …`, and 5 s later `Refused …: not approved: every sudo-agent approve detached` | Falls back to the password prompt both times, the second after ~5 s |
+| 37 | A client running: `systemctl --user restart sudo-agent`. Add the key again, `sudo -k; sudo -v`, and with the client's prompt open restart it again; add the key once more and `sudo -k; sudo -v` | Each restart, in the client: `sudo-agent went away; waiting for it to start again (Ctrl-C quits)`, then `sudo-agent is back; waiting for approval requests` (the second time, the prompt line ends first); journal: `Approve client attached` in each new agent. The last `sudo` prompts in the client | With the prompt open: falls back to the password prompt; after re-adding the key, succeeds |
+| 38 | Laptop over SSH: the service runs in the desktop session; from another machine, SSH into the laptop and run `sudo-agent approve` there; `sudo -k; sudo -v` on a server as usual, answer **y** in that SSH session | The request shows in the SSH session (and as the popup on the desktop); `Approved (approve) …` | Succeeds |
 | 5 | Stop the agent (Ctrl-C with no prompt open), then `sudo -k; sudo -v` | Nothing (agent is gone) | Password prompt: proves `sudo` really authenticates through `sudo-agent`, not some other forwarded agent |
 
 Cases 1, 2 and 6–9 test the terminal prompt: since step 2c, start the agent
-with `--no-pinentry` for them (startup says `Approvals: this terminal only
-(pinentry popups are off with --no-pinentry)`), or they're answered in the
-popup instead, which cases 13–19 cover.
+with `--no-pinentry` for them (startup says `Approvals: sudo-agent approve
+or this terminal, whichever answers first (pinentry popups are off with
+--no-pinentry)`), or they're answered in the popup instead, which cases
+13–19 cover. Run no `sudo-agent approve` during them.
 
 `pinentry-gnome3` holds the keyboard and mouse while its popup is open (seen
 on Cinnamon), so the terminal can't be reached then. Cases 15, 16, 18 and
@@ -143,6 +157,12 @@ terminal, so with it cases 15 and 16 can be answered there directly.
 
 Cases 24–27 run the agent as the systemd user service; read its log with
 `journalctl --user -u sudo-agent -b`.
+
+Cases 28–38 test `sudo-agent approve` (step 4), against the service. With
+case 24's headless drop-in (28–31, 34–36), the client is the only backend,
+so nothing else answers first; 32, 33, 37 and 38 run without it, popup
+included. The client's own lines go to its terminal; the agent's go to the
+journal.
 
 Report: the pam_ssh_agent_auth version, key type, the exact prompt text, and
 any `Refused …` lines from the laptop.
@@ -273,6 +293,35 @@ foreground `serve`):
   open, Alt+Tab reached the terminal and Ctrl-C there logged `denied
   (terminal)`, withdrawing the popup (case 16 without the timer).
 
+**2026-10-21, laptop + server `vakoilu`** (step 4b: the service built from
+the 4b tree, `pinentry-gnome3`, a release-build `sudo-agent approve` in a
+laptop terminal; five requests through one `ssh -o
+ForwardAgent=…/agent.sock vakoilu` session):
+
+- Popup **Allow**, then **Deny**, each with the client's prompt open: the
+  client printed `Withdrawn: answered elsewhere, or no longer needed`, the
+  journal `Approved (pinentry)` / `denied (pinentry)` (case 32).
+- **y** and **n** in the client: `Allowed` / `Denied`, journal `Allowed by
+  approve client pid …` / `Denied by approve client pid …` and `(approve)`
+  outcomes (cases 28, 29). Ctrl-C at its prompt denied, and Ctrl-C with no
+  prompt quit it, logged `Approve client detached` (case 30).
+- Found: after a popup answer, the client can't say whether it allowed or
+  denied (the router withdraws other backends without a reason). Noted in
+  `TODO.md` → Later.
+- On the way: the first try printed `refused to send approval requests (too
+  old for sudo-agent approve? …)`. The service still ran an older install
+  (`~/.cargo/bin/sudo-agent`); `cargo install --path . --locked` and a
+  restart fixed it.
+
+Before that, the same day, on the laptop only (driven from a script in a
+pty, `serve --no-pinentry` under `setsid`, `ssh-keygen -Y sign` against
+`agent.sock`): y, n, Ctrl-C, a timeout (`--approval-timeout 4s`:
+`Withdrawn: no answer within 4s`), an agent restart with the prompt open,
+two clients, and the startup errors (no terminal, no
+agent, `agent.sock` given as the control socket) behaved as described.
+That run stood in for cases 31 and 37 against `serve` rather than the
+service; they're still to be run as written.
+
 ## Troubleshooting
 
 - **No prompt on the laptop, and sudo asks for a password**:
@@ -288,6 +337,17 @@ foreground `serve`):
   different key than the one passed to `--key`.
 - **Laptop logs `Refused …: RSA signature requested without rsa-sha2-512`**:
   the key is RSA. Use an Ed25519 key.
+- **The login fails with `signing failed … agent refused operation`, and
+  `sudo-agent` logs nothing**: the login uses your normal agent
+  (`SSH_AUTH_SOCK`), not the forwarded one, and that agent doesn't have the
+  key decrypted (e.g. it was only added to `sudo-agent`). Add it to your
+  normal agent too, or log in through `sudo-agent` (see step 1).
+- **`sudo-agent approve` says `refused to send approval requests (too old
+  for sudo-agent approve? …)`**: usually the agent running is an older
+  version (often the service's `~/.cargo/bin/sudo-agent`): install the new
+  one and restart the service. Otherwise the agent refused the connection
+  (its log says why), or `--control-socket` / `SUDO_AGENT_CONTROL_SOCKET`
+  names `agent.sock`.
 - **More detail**:
   - Server: the user can add `debug` to the `pam_ssh_agent_auth` line, then
     read `journalctl -t sudo --since -5min`, or `/var/log/auth.log` on Debian.
