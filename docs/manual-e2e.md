@@ -320,7 +320,10 @@ pty, `serve --no-pinentry` under `setsid`, `ssh-keygen -Y sign` against
 two clients, and the startup errors (no terminal, no
 agent, `agent.sock` given as the control socket) behaved as described.
 That run stood in for cases 31 and 37 against `serve` rather than the
-service; they're still to be run as written.
+service.
+
+Later the same day the user ran cases 31, 33, 34, 35 and 37 as written,
+against the service: all passed. Cases 36 and 38 are still to be run.
 
 ## Troubleshooting
 

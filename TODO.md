@@ -588,10 +588,9 @@ needs an answer. Design agreed 2026-10-07; open decisions settled
    popup and client racing, timeout, hang-up, no client and the 5 s grace,
    a restart, a client over SSH into the laptop; the startup lines of
    older cases brought up to date), these checkboxes. To be released as
-   0.4.1 (decided 2026-10-21, not 0.5.0), so the docs reach crates.io. Still to
-   run: the server cases (signing and prompting changed) and the 4b cases
-   not run as written yet (31 and 37 were only checked in a pty against
-   `serve`; 33–36 and 38 not at all).
+   0.4.1 (decided 2026-10-21, not 0.5.0), so the docs reach crates.io. Cases 31, 33,
+   34, 35 and 37 passed the same day. Still to run: the server cases
+   (signing and prompting changed) and approve cases 36 and 38.
 
 Re-run the server cases in `docs/manual-e2e.md` after 1b, 2 and 4: each
 touches signing or prompting.
