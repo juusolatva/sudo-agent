@@ -71,7 +71,8 @@ pub struct ServeArgs {
     #[arg(long, value_name = "DURATION", default_value = "15s", value_parser = keys::parse_duration)]
     pub pinentry_timeout: Duration,
 
-    /// Don't show pinentry popups; approve at this terminal only.
+    /// Don't show pinentry popups; approve at this terminal or with
+    /// sudo-agent approve.
     #[arg(long, conflicts_with_all = ["pinentry", "pinentry_timeout"])]
     pub no_pinentry: bool,
 

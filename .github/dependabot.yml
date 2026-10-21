@@ -1,0 +1,28 @@
+# Version updates. Dependabot alerts and security updates are switched on in
+# the repository settings; this file adds weekly PRs for Cargo dependencies
+# and the SHA-pinned actions (the `# vX.Y.Z` comments are updated with them).
+# Not covered: the tool versions given to taiki-e/install-action (`tool:`)
+# and the `stable` toolchain.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    # Let a new release settle for a week first (yanks, compromised
+    # publishes). Security updates are not delayed.
+    cooldown:
+      default-days: 7
+    groups:
+      cargo:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]

@@ -65,10 +65,11 @@ ssh-add ─► control.sock ─┐                         sudo
 ## Install
 
 ```sh
-cargo install sudo-agent
+cargo install --locked sudo-agent
 ```
 
-Or from a checkout: `cargo build --release`.
+`--locked` builds with the dependency versions this release was tested and
+audited with. Or from a checkout: `cargo build --release --locked`.
 
 ## Usage
 
