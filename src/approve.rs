@@ -439,7 +439,7 @@ pub enum Event {
 }
 
 impl MessageExtension for Event {
-    const NAME: &'static str = WAIT;
+    const NAME: &str = WAIT;
 }
 
 const PENDING: &str = "pending";
@@ -540,7 +540,7 @@ pub struct Reply {
 }
 
 impl MessageExtension for Reply {
-    const NAME: &'static str = ANSWER;
+    const NAME: &str = ANSWER;
 }
 
 impl Encode for Reply {
