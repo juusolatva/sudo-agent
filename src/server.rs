@@ -9,28 +9,27 @@ use tokio::net::UnixListener;
 
 use crate::agent::SudoAgent;
 use crate::control::ControlAgent;
-use crate::keys::TtlPolicy;
 
 /// The agent's listening sockets.
 pub struct Listeners {
     /// `agent.sock`, the one forwarded: listing and approval-gated signing
     /// only.
     pub agent: UnixListener,
-    /// `control.sock`, never forwarded: also adding and removing keys.
+    /// `control.sock`, never forwarded: also adding and removing keys, and
+    /// `sudo-agent approve`.
     pub control: UnixListener,
 }
 
-/// Serves `agent` on both sockets until accepting fails on either or
-/// `shutdown` resolves. Keys added over `control.sock` get their TTL from
-/// `ttl`. Connections still being served then are left to the runtime's
+/// Serves `agent` on `agent.sock` and `control` (the same agent's control
+/// side) on `control.sock`, until accepting fails on either or `shutdown`
+/// resolves. Connections still being served then are left to the runtime's
 /// shutdown.
 pub async fn serve(
     listeners: Listeners,
     agent: SudoAgent,
-    ttl: TtlPolicy,
+    control: ControlAgent,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), AgentError> {
-    let control = ControlAgent::new(agent.clone(), ttl);
     tokio::select! {
         result = listen(listeners.agent, agent) => result,
         result = listen(listeners.control, control) => result,
@@ -43,8 +42,9 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keys::KeyEntry;
+    use crate::approve::{self, ApproveClients, Event, Reply};
     use crate::keys::testing::entry;
+    use crate::keys::{KeyEntry, TtlPolicy};
     use crate::prompt::Prompter;
     use crate::prompt::testing::{ApprovesAfter, ScriptedPrompter};
     use crate::routing::Router;
@@ -77,6 +77,9 @@ mod tests {
         _dir: tempfile::TempDir,
         path: PathBuf,
         control_path: PathBuf,
+        /// The `sudo-agent approve` backend clients of `control.sock` attach
+        /// to; in the routing only with [`Running::with_approve`].
+        approve: Arc<ApproveClients>,
         stop: Option<oneshot::Sender<()>>,
         served: JoinHandle<Result<(), AgentError>>,
     }
@@ -87,6 +90,29 @@ mod tests {
         }
 
         fn with_ttl(keys: Vec<KeyEntry>, prompter: Arc<dyn Prompter>, ttl: TtlPolicy) -> Self {
+            let approve = Arc::new(ApproveClients::new(Duration::from_secs(60)));
+            Self::launch(keys, Router::only(prompter), approve, ttl)
+        }
+
+        /// Approvals go to `sudo-agent approve` clients, which wait up to
+        /// `timeout`, and to `others` at the same time.
+        fn with_approve(
+            keys: Vec<KeyEntry>,
+            others: Vec<(&'static str, Arc<dyn Prompter>)>,
+            timeout: Duration,
+        ) -> Self {
+            let approve = Arc::new(ApproveClients::new(timeout));
+            let mut backends = others;
+            backends.push(("approve", Arc::clone(&approve) as Arc<dyn Prompter>));
+            Self::launch(keys, Router::new(backends), approve, LONG)
+        }
+
+        fn launch(
+            keys: Vec<KeyEntry>,
+            router: Router,
+            approve: Arc<ApproveClients>,
+            ttl: TtlPolicy,
+        ) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("agent.sock");
             let control_path = dir.path().join("control.sock");
@@ -96,13 +122,14 @@ mod tests {
                 agent: agent_listener,
                 control: control_listener,
             };
-            let agent = SudoAgent::new(Arc::new(Mutex::new(keys)), Router::only(prompter));
+            let agent = SudoAgent::new(Arc::new(Mutex::new(keys)), router);
+            let control = ControlAgent::new(agent.clone(), ttl, Arc::clone(&approve));
             let (stop, stopped) = oneshot::channel::<()>();
             let served = tokio::spawn(async move {
                 let shutdown = async {
                     let _ = stopped.await;
                 };
-                let result = serve(listeners, agent, ttl, shutdown).await;
+                let result = serve(listeners, agent, control, shutdown).await;
                 drop((agent_file, control_file));
                 result
             });
@@ -110,6 +137,7 @@ mod tests {
                 _dir: dir,
                 path,
                 control_path,
+                approve,
                 stop: Some(stop),
                 served,
             }
@@ -142,6 +170,93 @@ mod tests {
         async fn stop(&mut self) -> Result<(), AgentError> {
             self.stop.take().unwrap().send(()).unwrap();
             (&mut self.served).await.unwrap()
+        }
+    }
+
+    /// `sudo-agent approve`'s wait: the connection's next approval event.
+    fn approve_wait() -> Request {
+        Request::Extension(Extension {
+            name: approve::WAIT.into(),
+            details: Vec::new().into(),
+        })
+    }
+
+    fn approve_answer(id: u64, approved: bool) -> Request {
+        Request::Extension(Extension::new_message(Reply { id, approved }).unwrap())
+    }
+
+    /// `future`'s result, failing the test rather than hanging it if it
+    /// doesn't come (e.g. a hang-up isn't noticed).
+    async fn within<T>(future: impl Future<Output = T>) -> T {
+        let limit = Duration::from_secs(5);
+        tokio::time::timeout(limit, future)
+            .await
+            .expect("timed out")
+    }
+
+    /// The next approval event for `client`, attaching it first if it isn't
+    /// yet.
+    async fn next_event(client: &mut Client<UnixStream>) -> Event {
+        match within(client.handle(approve_wait())).await.unwrap() {
+            Response::ExtensionResponse(extension) => extension.parse_message().unwrap().unwrap(),
+            other => panic!("expected an approval event, got {other:?}"),
+        }
+    }
+
+    /// A client's wait for its next event, in the background.
+    type Waiting = JoinHandle<(Client<UnixStream>, Event)>;
+
+    fn wait_for_event(mut client: Client<UnixStream>) -> Waiting {
+        tokio::spawn(async move {
+            let event = next_event(&mut client).await;
+            (client, event)
+        })
+    }
+
+    fn pending_id(event: &Event) -> u64 {
+        match event {
+            Event::Pending { id, .. } => *id,
+            other => panic!("expected a pending request, got {other:?}"),
+        }
+    }
+
+    async fn until(condition: impl Fn() -> bool) {
+        within(async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+    }
+
+    impl Running {
+        /// Attaches a `sudo-agent approve` client over `control.sock`, and
+        /// returns its first wait.
+        async fn attach(&self) -> Waiting {
+            let before = self.approve.attached();
+            let waiting = wait_for_event(self.control().await);
+            until(|| self.approve.attached() > before).await;
+            waiting
+        }
+
+        /// Answers request `id` the way `sudo-agent approve` does, over a
+        /// connection of its own.
+        async fn answer(&self, id: u64, approved: bool) -> Response {
+            let mut control = self.control().await;
+            within(control.handle(approve_answer(id, approved)))
+                .await
+                .unwrap()
+        }
+
+        /// A signature request on `agent.sock`, in the background.
+        fn sign_in_background(&self, key: &KeyData) -> JoinHandle<Response> {
+            let (path, request) = (self.path.clone(), sign_request(key));
+            tokio::spawn(async move {
+                let mut client = Client::new(UnixStream::connect(path).await.unwrap());
+                within(client.handle(Request::SignRequest(request)))
+                    .await
+                    .unwrap()
+            })
         }
     }
 
@@ -587,5 +702,234 @@ mod tests {
             running.control().await.handle(add).await,
             Ok(Response::Success)
         ));
+    }
+
+    const MINUTE: Duration = Duration::from_secs(60);
+
+    #[tokio::test]
+    async fn approve_clients_answer_and_the_rest_are_withdrawn() {
+        for approved in [true, false] {
+            let key = entry("laptop", Duration::from_secs(600));
+            let public = public(&key);
+            let popup = Arc::new(ApprovesAfter::new(MINUTE));
+            let running = Running::with_approve(vec![key], vec![("popup", popup.clone())], MINUTE);
+            let (one, two) = (running.attach().await, running.attach().await);
+            let signing = running.sign_in_background(&public);
+
+            // Both clients are shown the same request.
+            let (mut one, first) = one.await.unwrap();
+            let (mut two, second) = two.await.unwrap();
+            assert_eq!(pending_id(&first), pending_id(&second));
+            let Event::Pending {
+                id,
+                closes_in,
+                message,
+            } = first
+            else {
+                unreachable!()
+            };
+            assert!(
+                message.starts_with("Signature request from pid "),
+                "{message}"
+            );
+            assert!(message.contains("\n  key: laptop (SHA256:"), "{message}");
+            assert!(closes_in > MINUTE - Duration::from_secs(5) && closes_in <= MINUTE);
+
+            assert!(matches!(
+                running.answer(id, approved).await,
+                Response::Success
+            ));
+            match signing.await.unwrap() {
+                Response::SignResponse(_) if approved => {}
+                Response::Failure if !approved => {}
+                other => panic!("approved {approved}, got {other:?}"),
+            }
+            // The popup and both clients are withdrawn.
+            assert_eq!(popup.times_cancelled(), 1);
+            for client in [&mut one, &mut two] {
+                let Event::Withdrawn { id: gone, reason } = next_event(client).await else {
+                    panic!("not withdrawn");
+                };
+                assert_eq!(gone, id);
+                assert!(
+                    reason.starts_with("answered by approve client pid "),
+                    "{reason}"
+                );
+            }
+            // Already answered.
+            assert!(matches!(running.answer(id, true).await, Response::Failure));
+        }
+    }
+
+    /// The withdrawal comes while the client isn't waiting, so it is queued
+    /// for its next wait.
+    #[tokio::test]
+    async fn another_backend_answering_withdraws_the_request_from_clients() {
+        let key = entry("laptop", Duration::from_secs(600));
+        let public = public(&key);
+        let popup = Arc::new(ApprovesAfter::new(Duration::from_millis(50)));
+        let running = Running::with_approve(vec![key], vec![("popup", popup)], MINUTE);
+        let waiting = running.attach().await;
+        let signing = running.sign_in_background(&public);
+
+        let (mut client, event) = waiting.await.unwrap();
+        let id = pending_id(&event);
+        assert!(matches!(signing.await.unwrap(), Response::SignResponse(_)));
+        let withdrawn = Event::Withdrawn {
+            id,
+            reason: approve::WITHDRAWN.into(),
+        };
+        assert_eq!(next_event(&mut client).await, withdrawn);
+        assert!(matches!(running.answer(id, true).await, Response::Failure));
+    }
+
+    #[tokio::test]
+    async fn without_an_attached_client_requests_are_refused_at_once() {
+        let key = entry("laptop", Duration::from_secs(600));
+        let public = public(&key);
+        let running = Running::with_approve(vec![key], vec![], MINUTE);
+        let signing = running.sign_in_background(&public);
+        let response = tokio::time::timeout(Duration::from_secs(5), signing).await;
+        assert!(matches!(response.unwrap().unwrap(), Response::Failure));
+    }
+
+    #[tokio::test]
+    async fn a_client_attaching_later_is_shown_the_request_in_flight() {
+        let key = entry("laptop", Duration::from_secs(600));
+        let public = public(&key);
+        let running = Running::with_approve(vec![key], vec![], MINUTE);
+        let early = running.attach().await;
+        let signing = running.sign_in_background(&public);
+        let (_early, event) = early.await.unwrap();
+        let id = pending_id(&event);
+
+        let (_late, late_event) = wait_for_event(running.control().await).await.unwrap();
+        assert_eq!(pending_id(&late_event), id);
+        assert!(matches!(running.answer(id, true).await, Response::Success));
+        assert!(matches!(signing.await.unwrap(), Response::SignResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_request_is_withdrawn_with_the_reason() {
+        let key = entry("laptop", Duration::from_secs(600));
+        let public = public(&key);
+        let running = Running::with_approve(vec![key], vec![], Duration::from_millis(200));
+        let waiting = running.attach().await;
+        let signing = running.sign_in_background(&public);
+        let (mut client, event) = waiting.await.unwrap();
+        let id = pending_id(&event);
+
+        assert!(matches!(signing.await.unwrap(), Response::Failure));
+        let Event::Withdrawn { id: gone, reason } = next_event(&mut client).await else {
+            panic!("not withdrawn");
+        };
+        assert_eq!(gone, id);
+        assert!(reason.starts_with("no answer within "), "{reason}");
+        assert!(matches!(running.answer(id, true).await, Response::Failure));
+
+        // Hanging up between waits detaches it.
+        drop(client);
+        until(|| running.approve.attached() == 0).await;
+    }
+
+    /// The session is busy in the wait then, so this is the socket watch,
+    /// not the protocol loop seeing EOF.
+    #[tokio::test]
+    async fn a_client_hanging_up_while_waiting_detaches() {
+        let running = Running::with_approve(vec![], vec![], MINUTE);
+        let waiting = running.attach().await;
+        waiting.abort();
+        until(|| running.approve.attached() == 0).await;
+    }
+
+    /// Through forwarding, a server must not be able to approve anything.
+    #[tokio::test]
+    async fn agent_socket_refuses_the_approve_extensions() {
+        let key = entry("laptop", Duration::from_secs(600));
+        let public = public(&key);
+        let running = Running::with_approve(vec![key], vec![], MINUTE);
+        let mut forwarded = running.client().await;
+        assert!(matches!(
+            forwarded.handle(approve_wait()).await.unwrap(),
+            Response::Failure
+        ));
+        assert_eq!(running.approve.attached(), 0);
+
+        let waiting = running.attach().await;
+        let signing = running.sign_in_background(&public);
+        let (_client, event) = waiting.await.unwrap();
+        let id = pending_id(&event);
+        assert!(matches!(
+            forwarded.handle(approve_answer(id, true)).await.unwrap(),
+            Response::Failure
+        ));
+        // Still pending: denying it over control.sock works.
+        assert!(matches!(running.answer(id, false).await, Response::Success));
+        assert!(matches!(signing.await.unwrap(), Response::Failure));
+    }
+
+    fn session_bind() -> Request {
+        Request::Extension(Extension {
+            name: "session-bind@openssh.com".into(),
+            details: Vec::new().into(),
+        })
+    }
+
+    /// An accidental `ForwardAgent …/control.sock`: once `ssh` binds the
+    /// connection it is refused for good, so it can neither see nor answer
+    /// requests.
+    #[tokio::test]
+    async fn a_connection_refused_for_session_bind_cannot_approve() {
+        let key = entry("laptop", Duration::from_secs(600));
+        let public = public(&key);
+        let running = Running::with_approve(vec![key], vec![], MINUTE);
+        let waiting = running.attach().await;
+        let signing = running.sign_in_background(&public);
+        let (_client, event) = waiting.await.unwrap();
+        let id = pending_id(&event);
+
+        let mut forwarded = running.control().await;
+        for request in [session_bind(), approve_answer(id, true), approve_wait()] {
+            let response = within(forwarded.handle(request)).await.unwrap();
+            assert!(matches!(response, Response::Failure), "{response:?}");
+        }
+        assert_eq!(running.approve.attached(), 1);
+        // Still pending: denying it over a clean connection works.
+        assert!(matches!(running.answer(id, false).await, Response::Success));
+        assert!(matches!(signing.await.unwrap(), Response::Failure));
+    }
+
+    /// At once rather than when the connection closes, or `approve` would
+    /// still count as available.
+    #[tokio::test]
+    async fn session_bind_detaches_an_attached_connection() {
+        let key = entry("laptop", Duration::from_secs(600));
+        let public = public(&key);
+        let running = Running::with_approve(vec![key], vec![], MINUTE);
+        let waiting = running.attach().await;
+        let signing = running.sign_in_background(&public);
+        let (mut client, event) = waiting.await.unwrap();
+
+        let response = within(client.handle(session_bind())).await.unwrap();
+        assert!(matches!(response, Response::Failure));
+        assert_eq!(running.approve.attached(), 0);
+        let id = pending_id(&event);
+        assert!(matches!(running.answer(id, true).await, Response::Success));
+        assert!(matches!(signing.await.unwrap(), Response::SignResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn malformed_and_unknown_answers_fail() {
+        let running = Running::with_approve(vec![], vec![], MINUTE);
+        let mut control = running.control().await;
+        let malformed = Request::Extension(Extension {
+            name: approve::ANSWER.into(),
+            details: vec![0, 0].into(),
+        });
+        assert!(matches!(
+            control.handle(malformed).await.unwrap(),
+            Response::Failure
+        ));
+        assert!(matches!(running.answer(42, true).await, Response::Failure));
     }
 }

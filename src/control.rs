@@ -1,10 +1,12 @@
 //! The control socket (`control.sock`): what `agent.sock` serves, plus adding
-//! and removing keys (`ssh-add`). It must never be usable through SSH agent
-//! forwarding, where a server could add keys (or, later, answer approvals),
-//! so every connection is checked three ways; see [`refusal`] and
+//! and removing keys (`ssh-add`) and answering approvals (`sudo-agent
+//! approve`, see [`approve`](crate::approve)). It must never be usable
+//! through SSH agent forwarding, where a server could add keys or answer
+//! approvals, so every connection is checked three ways; see [`refusal`] and
 //! [`ControlConnection::extension`].
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -18,6 +20,7 @@ use ssh_key::{HashAlg, PrivateKey, Signature};
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::agent::{Connection, SudoAgent, sanitize};
+use crate::approve::{self, ApproveClients, Events, Reply};
 use crate::keys::{self, KeyEntry, TtlPolicy};
 
 /// Sent by OpenSSH (≥ 8.9) on every agent connection it uses for a login or
@@ -32,11 +35,18 @@ const RESTRICT_DESTINATION: &str = "restrict-destination-v00@openssh.com";
 pub struct ControlAgent {
     agent: SudoAgent,
     ttl: TtlPolicy,
+    approve: Arc<ApproveClients>,
 }
 
 impl ControlAgent {
-    pub fn new(agent: SudoAgent, ttl: TtlPolicy) -> Self {
-        Self { agent, ttl }
+    /// `approve` is the `sudo-agent approve` backend in `agent`'s routing,
+    /// which clients of this socket attach to.
+    pub fn new(agent: SudoAgent, ttl: TtlPolicy, approve: Arc<ApproveClients>) -> Self {
+        Self {
+            agent,
+            ttl,
+            approve,
+        }
     }
 }
 
@@ -61,6 +71,8 @@ impl Agent<UnixListener> for ControlAgent {
             inner,
             ttl: self.ttl,
             refused,
+            approve: Arc::clone(&self.approve),
+            attached: None,
         }
     }
 }
@@ -95,6 +107,22 @@ pub struct ControlConnection {
     inner: Connection,
     ttl: TtlPolicy,
     refused: Option<String>,
+    approve: Arc<ApproveClients>,
+    /// Set by the first [`approve::WAIT`]: this connection's events, as an
+    /// attached `sudo-agent approve`.
+    attached: Option<Attached>,
+}
+
+/// An attached approve client's queue; detaches (and logs it) when dropped.
+struct Attached {
+    events: Arc<Events>,
+    peer: String,
+}
+
+impl Drop for Attached {
+    fn drop(&mut self) {
+        log!("Approve client detached: {}", self.peer);
+    }
 }
 
 impl ControlConnection {
@@ -102,6 +130,44 @@ impl ControlConnection {
         match self.refused {
             Some(_) => Err(AgentError::Failure),
             None => Ok(()),
+        }
+    }
+
+    /// Returns the next approval event, attaching this connection first if
+    /// it isn't yet. A client that hangs up while waiting is detached.
+    async fn wait(&mut self) -> Result<Extension, AgentError> {
+        let attached = self.attached.get_or_insert_with(|| {
+            let peer = self.inner.peer().to_string();
+            log!("Approve client attached: {peer}");
+            Attached {
+                events: self.approve.attach(),
+                peer,
+            }
+        });
+        let events = Arc::clone(&attached.events);
+        let event = tokio::select! {
+            event = events.next() => Some(event),
+            () = self.inner.hung_up() => None,
+        };
+        match event {
+            Some(event) => Ok(Extension::new_message(event)?),
+            None => {
+                self.attached = None;
+                Err(AgentError::Failure)
+            }
+        }
+    }
+
+    /// Answers a request; fails if it isn't pending any more.
+    fn answer(&self, extension: &Extension) -> Result<(), AgentError> {
+        let reply = match extension.parse_message::<Reply>() {
+            Ok(Some(reply)) => reply,
+            _ => return Err(AgentError::Failure),
+        };
+        let from = self.inner.peer().to_string();
+        match self.approve.answer(reply.id, reply.approved, &from) {
+            true => Ok(()),
+            false => Err(AgentError::Failure),
         }
     }
 
@@ -266,8 +332,8 @@ impl Session for ControlConnection {
     }
 
     /// `session-bind@openssh.com` means the connection came through `ssh`:
-    /// refuse it, and everything after it, for good. Other extensions aren't
-    /// supported yet.
+    /// refuse it, and everything after it, for good. The others are
+    /// `sudo-agent approve`'s ([`approve`]).
     async fn extension(&mut self, extension: Extension) -> Result<Option<Extension>, AgentError> {
         if extension.name == SESSION_BIND && self.refused.is_none() {
             let reason = "it came through ssh (session-bind); control.sock must never be \
@@ -277,8 +343,15 @@ impl Session for ControlConnection {
                 self.inner.peer()
             );
             self.refused = Some(reason.into());
+            // Detached at once, rather than when the connection closes.
+            self.attached = None;
         }
-        Err(AgentError::Failure)
+        self.check()?;
+        match extension.name.as_str() {
+            approve::WAIT => self.wait().await.map(Some),
+            approve::ANSWER => self.answer(&extension).map(|()| None),
+            _ => Err(AgentError::Failure),
+        }
     }
 }
 

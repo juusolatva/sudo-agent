@@ -13,6 +13,9 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    # Something hung (e.g. a test) fails the job instead of running for
+    # GitHub's 6-hour limit.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Install Rust toolchain
@@ -26,6 +29,9 @@ jobs:
   sonarqube:
     name: SonarQube
     runs-on: ubuntu-latest
+    # Something hung (e.g. a test) fails the job instead of running for
+    # GitHub's 6-hour limit.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:

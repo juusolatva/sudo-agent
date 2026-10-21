@@ -456,17 +456,40 @@ needs an answer. Design agreed 2026-10-07; open decisions settled
      - A hang-up during a wait isn't seen by the session (it isn't reading
        the socket then), so watch the socket like `sign()` does
        (`AsyncFd`, read-closed). Between waits `ssh-agent-lib` should drop
-       the session on EOF: check it, and pin it with a test.
-     - The queue is bounded (requests are routed one at a time, so it
-       holds at most a pending and a withdrawn event); a client that
-       overflows it is disconnected.
+       the session on EOF: checked (`handle_socket` returns, dropping the
+       session), and pinned with a test.
+     - The queue can't grow without bound: a withdrawal of a request the
+       client was never shown removes its `pending` instead of being
+       queued, so it holds at most the open requests plus one withdrawal
+       for each request shown (changed in 4a from "bounded, and a client
+       that overflows it is disconnected": nothing can overflow).
      - A frozen client (Ctrl-Z) still counts as attached, so the request
        waits for the timeout instead of being denied when the other
        backends give up. Accepted; the timeout bounds it.
      - An answer to a request that is already withdrawn gets a reply
        saying so, and the client prints that it was answered elsewhere.
+       One that arrives as the request ends (another backend answered, it
+       timed out) is delivered but loses; the withdrawal event that follows
+       says what decided it, and only an answer that decided is logged.
      - Any `control.sock` connection may answer any request: the same
-       trust as `ssh-add` adding keys there, so plain counting ids do.
+       trust as `ssh-add` adding keys there. Ids are 64-bit and start at a
+       random value per daemon (changed in 4a from "plain counting ids
+       do", found in review), so an answer to a request of a daemon that
+       has since restarted can't answer the new one's request with the same
+       number. 4b's client also drops its prompts when its event connection
+       closes.
+       So any process of the user's can approve (it could also run
+       `sudo-agent approve` in a pty of its own, so checking the client
+       wouldn't help). It's seen, though: the popup and other clients
+       show the request until then, and the answer is logged with the
+       answering process (`Allowed by approve client pid …`), which
+       other clients are also told.
+     - If every client detaches while a request is open, it waits 5 s for
+       one to attach again (restarted), counted from the last detach, then
+       gives up (decided 2026-10-21
+       after review: waiting the whole timeout would hang `sudo` with
+       nobody left to answer). Giving up that way isn't logged as a backend
+       failure.
    - **Available only while a client is attached** when the request
      arrives. Otherwise, under systemd with no client running, a request
      the popup doesn't answer would hang `sudo` for the full timeout
@@ -481,12 +504,21 @@ needs an answer. Design agreed 2026-10-07; open decisions settled
      the event lets the client say when the prompt closes, as the popup
      does.
    - Extension names under `sudo-agent.juusolatva.github.io`, like the
-     planned status extension (e.g. `approve-wait@…`,
-     `approve-answer@…`; settle in 4a). Log lines name the backend
-     `approve` (`Approved (approve) …`).
+     planned status extension: `approve-wait@…` and `approve-answer@…`
+     (settled in 4a). Log lines name the backend `approve` (`Approved
+     (approve) …`); clients attaching and detaching are logged too.
 - [ ] **4a. Daemon side**: the two extensions on `control.sock` and the
    `approve` backend in the router. No client yet; tested with
-   `ssh_agent_lib`'s `Client` in socket-level tests.
+   `ssh_agent_lib`'s `Client` in socket-level tests. Implemented
+   2026-10-21 (`src/approve.rs`: `ApproveClients`, the per-connection
+   `Events` queue, the wire format; `ControlConnection::wait`/`answer`),
+   awaiting the user's test.
+   - Wire format (`ssh-encoding`, documented in `src/approve.rs`): a wait
+     (no details) returns `string "pending"`, `uint64 id`, `uint32`
+     seconds until it closes, `string message`; or `string "withdrawn"`,
+     `uint64 id`, `string reason`. An answer is `uint64 id`, `byte` 1/0;
+     `Success` if delivered, `Failure` if the request isn't pending.
+     Anything left over after a message makes it invalid.
    - The backend: `available()` while at least one event connection is
      open; `confirm()` sends `pending` to every attached queue, waits for
      an answer or the timeout or its token, then sends `withdrawn`.
@@ -499,7 +531,12 @@ needs an answer. Design agreed 2026-10-07; open decisions settled
      withdraws the rest (the popup and the other clients), events queued
      between waits, hang-up mid-wait and between waits detaches, late
      attach sees the request in flight, answer after withdrawal, timeout,
-     overflow disconnects, `agent.sock` refuses both extensions.
+     coalescing keeps the queue short, `agent.sock` refuses both
+     extensions (and can't answer a pending request), a connection refused
+     for `session-bind` can't attach or answer and is detached at once,
+     malformed answers (trailing bytes too) fail, the 5 s grace, ids
+     differing between daemons. Test waits have a 5 s deadline, so a
+     regression fails instead of hanging (CI jobs also time out at 30 min).
 - [ ] **4b. The `sudo-agent approve` subcommand.**
    - Finds `control.sock` like `serve` does (`--control-socket` /
      `SUDO_AGENT_CONTROL_SOCKET`, `socket::choose_path`).

@@ -1,7 +1,9 @@
 //! The SSH agent protocol side: listing identities and approving signatures.
 
 use std::fmt;
+use std::fs::File;
 use std::future;
+use std::io::Read;
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -27,6 +29,10 @@ use crate::routing::Router;
 
 /// Longest command line shown in an approval prompt, in characters.
 const MAX_COMMAND_CHARS: usize = 200;
+
+/// How much of `/proc/<pid>/cmdline` is read: plenty for
+/// [`MAX_COMMAND_CHARS`], however long the argument list is.
+const MAX_CMDLINE_BYTES: usize = 4096;
 
 const KEY_EXPIRED_WHILE_WAITING: &str = "key expired while waiting for approval";
 
@@ -166,6 +172,12 @@ impl Connection {
 
     pub fn peer(&self) -> &Peer {
         &self.peer
+    }
+
+    /// Resolves once the client has closed its end of the connection; see
+    /// [`hung_up`].
+    pub async fn hung_up(&self) {
+        hung_up(self.client.as_ref()).await;
     }
 
     fn refuse_management(&self, what: &str) -> Result<(), AgentError> {
@@ -384,7 +396,14 @@ impl fmt::Display for Peer {
 
 /// Reads `/proc/<pid>/cmdline` (falling back to `comm`), made safe to print.
 fn command_line(pid: i32) -> Option<String> {
-    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let mut raw = Vec::new();
+    File::open(format!("/proc/{pid}/cmdline"))
+        .ok()?
+        .take(MAX_CMDLINE_BYTES as u64 + 1)
+        .read_to_end(&mut raw)
+        .ok()?;
+    let cut = raw.len() > MAX_CMDLINE_BYTES;
+    raw.truncate(MAX_CMDLINE_BYTES);
     let args: Vec<_> = raw
         .split(|&b| b == 0)
         .filter(|arg| !arg.is_empty())
@@ -396,7 +415,7 @@ fn command_line(pid: i32) -> Option<String> {
         args.join(" ")
     };
     let command = command.trim_end();
-    if command.chars().count() > MAX_COMMAND_CHARS {
+    if cut || command.chars().count() > MAX_COMMAND_CHARS {
         let truncated: String = command.chars().take(MAX_COMMAND_CHARS).collect();
         Some(format!("{}…", sanitize(&truncated)))
     } else {
@@ -434,6 +453,42 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     const CHALLENGE: &[u8] = b"pam_ssh_agent_auth challenge";
+
+    /// `sh` with `args`, once its command line is in place (`spawn`
+    /// returns while the kernel may still be setting it up).
+    fn shell(args: &[&str]) -> (std::process::Child, i32) {
+        let child = std::process::Command::new("sh").args(args).spawn().unwrap();
+        let pid = i32::try_from(child.id()).unwrap();
+        while std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|raw| raw.is_empty()) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        (child, pid)
+    }
+
+    #[test]
+    fn long_command_lines_are_read_only_in_part() {
+        // `; :` keeps the shell from replacing itself with `sleep`.
+        let (mut child, pid) = shell(&["-c", "sleep 30; :", "sh", &"x".repeat(100_000)]);
+        let command = command_line(pid);
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        let command = command.unwrap();
+        assert!(command.starts_with("sh -c sleep 30; : sh xxx"), "{command}");
+        assert!(command.ends_with('…'), "{command}");
+        assert_eq!(command.chars().count(), MAX_COMMAND_CHARS + 1);
+
+        // Short once empty arguments are dropped, but cut off when read: the
+        // rest isn't known, so it is marked.
+        let mut args = vec!["-c", "sleep 30; :", "sh"];
+        args.extend([""; MAX_CMDLINE_BYTES]);
+        args.push("hidden");
+        let (mut child, pid) = shell(&args);
+        let command = command_line(pid);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(command.as_deref(), Some("sh -c sleep 30; : sh…"));
+    }
 
     fn request(entry: &KeyEntry) -> SignRequest {
         SignRequest {

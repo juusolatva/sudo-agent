@@ -85,6 +85,13 @@ impl TerminalPrompter {
         open.inspect(CancellationToken::cancel).is_some()
     }
 
+    /// Whether an approval prompt is on the terminal, its line not ended
+    /// yet. Something else printed now (on shutdown) needs a newline first.
+    pub fn prompt_open(&self) -> bool {
+        let open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
+        open.is_some()
+    }
+
     async fn with_tty<T, F>(&self, f: F) -> io::Result<T>
     where
         T: Send + 'static,

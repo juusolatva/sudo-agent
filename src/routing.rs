@@ -97,12 +97,13 @@ impl Router {
     }
 
     /// The failures among `gave_up` not reported before. A timeout isn't a
-    /// failure: the user just answered somewhere else.
+    /// failure: the user just answered somewhere else. Nor is a backend left
+    /// with nobody to ask (`NotConnected`: every `sudo-agent approve` went).
     fn new_problems(&self, gave_up: &[(&'static str, io::Error)]) -> Vec<String> {
         let mut reported = self.reported.lock().unwrap_or_else(PoisonError::into_inner);
         gave_up
             .iter()
-            .filter(|(_, e)| e.kind() != ErrorKind::TimedOut)
+            .filter(|(_, e)| !matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::NotConnected))
             .map(|(name, e)| format!("{name}: {e}"))
             .filter(|problem| reported.insert(problem.clone()))
             .collect()
@@ -202,6 +203,22 @@ mod tests {
         assert!(result.problems.is_empty());
         assert_eq!(gives_up.times_asked(), 1);
         assert_eq!(approves.times_cancelled(), 0);
+    }
+
+    /// `sudo-agent approve` giving up because every client went isn't a
+    /// failure either.
+    #[tokio::test]
+    async fn nobody_left_to_ask_is_not_a_problem() {
+        let router = route_to(vec![
+            ("approve", Arc::new(GivesUp::new(ErrorKind::NotConnected))),
+            (
+                "approves",
+                Arc::new(ApprovesAfter::new(Duration::from_millis(20))),
+            ),
+        ]);
+        let result = ask(&router).await.unwrap();
+        assert!(result.approved);
+        assert!(result.problems.is_empty(), "{:?}", result.problems);
     }
 
     #[tokio::test]

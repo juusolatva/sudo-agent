@@ -14,11 +14,17 @@ static STAMPED: OnceLock<bool> = OnceLock::new();
 
 /// Decides once whether log lines get timestamps. `main` calls it before
 /// anything is logged, so the check (an `fstat` of stderr) never runs inside
-/// async code; [`line`] falls back to it if not.
+/// async code; [`line`] falls back to it if not. With timestamps, it also
+/// makes one, so the time zone is loaded (which reads `TZ` from the
+/// environment) before the runtime starts its threads.
 pub fn init() -> bool {
     *STAMPED.get_or_init(|| {
         let journal = std::env::var_os("JOURNAL_STREAM");
-        !stderr_id().is_ok_and(|id| is_journal(journal.as_deref(), id))
+        let stamped = !stderr_id().is_ok_and(|id| is_journal(journal.as_deref(), id));
+        if stamped {
+            let _ = timestamp();
+        }
+        stamped
     })
 }
 

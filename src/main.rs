@@ -12,6 +12,7 @@ macro_rules! log {
 }
 
 mod agent;
+mod approve;
 mod cli;
 mod control;
 mod keys;
@@ -33,8 +34,10 @@ use ssh_agent_lib::error::AgentError;
 use ssh_key::HashAlg;
 use tokio::signal::unix::{SignalKind, signal};
 
-use crate::agent::SudoAgent;
+use crate::agent::{SudoAgent, sanitize};
+use crate::approve::ApproveClients;
 use crate::cli::ServeArgs;
+use crate::control::ControlAgent;
 use crate::keys::{KeyEntry, TtlPolicy};
 use crate::pinentry::Pinentry;
 use crate::prompt::{Prompter, TerminalPrompter};
@@ -55,7 +58,7 @@ fn spawn_expiry_reaper(store: Arc<Mutex<Vec<KeyEntry>>>) {
             tick.tick().await;
             let now = keys::now().saturating_sub(DELAY);
             for comment in keys::purge_expired(&store, now) {
-                log!("Key expired and was removed: {comment}");
+                log!("Key expired and was removed: {}", sanitize(&comment));
             }
         }
     });
@@ -116,6 +119,7 @@ async fn run(args: ServeArgs) -> Result<(), AgentError> {
         let terminal = Arc::clone(&terminal);
         move || terminal.interrupt()
     })?;
+    let prompts = Arc::clone(&terminal);
     let mut backends: Vec<(&'static str, Arc<dyn Prompter>)> = Vec::new();
     let popups = if args.no_pinentry {
         Popups::Off
@@ -130,6 +134,9 @@ async fn run(args: ServeArgs) -> Result<(), AgentError> {
     };
     let approvals_line = approvals_line(terminal.available(), popups);
     backends.insert(0, ("terminal", terminal));
+    // Clients attach over control.sock; available while one is.
+    let approve = Arc::new(ApproveClients::new(args.approval_timeout));
+    backends.push(("approve", Arc::clone(&approve) as Arc<dyn Prompter>));
     let approvals = Router::new(backends);
 
     let store = Arc::new(Mutex::new(loaded));
@@ -153,9 +160,10 @@ async fn run(args: ServeArgs) -> Result<(), AgentError> {
     );
     let shutdown = async {
         let signal = shutdown.await;
-        // Ctrl-C echoes "^C" with no newline (possibly after a prompt); end
-        // that line first, so the timestamp starts the next one.
-        if signal == "SIGINT" {
+        // Ctrl-C echoes "^C" with no newline, and an open prompt (`Allow?
+        // [y/N] `, when SIGTERM comes) has none either; end that line first,
+        // so the timestamp starts the next one.
+        if signal == "SIGINT" || prompts.prompt_open() {
             use std::io::Write as _;
             let _ = io::stderr().write_all(b"\n");
         }
@@ -170,7 +178,8 @@ async fn run(args: ServeArgs) -> Result<(), AgentError> {
         default: args.ttl,
         max: args.max_ttl,
     };
-    let result = server::serve(listeners, agent, ttl, shutdown).await;
+    let control = ControlAgent::new(agent.clone(), ttl, approve);
+    let result = server::serve(listeners, agent, control, shutdown).await;
 
     // Drop (and so zeroize) the keys now rather than relying on destructors
     // running at exit: main doesn't wait for in-flight tasks.
@@ -189,26 +198,35 @@ enum Popups<'a> {
     Off,
 }
 
-/// The startup line saying how requests can be approved.
+/// The startup line saying how requests can be approved. `sudo-agent
+/// approve` always can, while one is running.
 fn approvals_line(terminal: bool, popups: Popups) -> String {
     let no_popups = match popups {
         Popups::Program(program) if terminal => {
             return format!(
-                "Approvals: a {} popup or this terminal, whichever answers first",
+                "Approvals: a {} popup, sudo-agent approve or this terminal, whichever answers \
+                 first",
                 program.display()
             );
         }
         Popups::Program(program) => {
-            return format!("Approvals: a {} popup (no terminal)", program.display());
+            return format!(
+                "Approvals: a {} popup or sudo-agent approve, whichever answers first (no \
+                 terminal)",
+                program.display()
+            );
         }
         Popups::NoDisplay => "no pinentry popups: neither DISPLAY nor WAYLAND_DISPLAY is set",
         Popups::Off => "pinentry popups are off with --no-pinentry",
     };
     match terminal {
-        true => format!("Approvals: this terminal only ({no_popups})"),
+        true => format!(
+            "Approvals: sudo-agent approve or this terminal, whichever answers first \
+             ({no_popups})"
+        ),
         false => format!(
-            "No way to approve requests: there's no terminal, and {no_popups}; every signature \
-             request will be refused"
+            "Approvals: sudo-agent approve only (there's no terminal, and {no_popups}); \
+             signature requests are refused while none is running"
         ),
     }
 }

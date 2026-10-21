@@ -10,9 +10,11 @@
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder, Permissions};
 use std::io::{self, ErrorKind};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+use socket2::{Domain, SockAddr, Socket, Type};
 use tokio::net::UnixListener;
 
 const APP_DIR: &str = "sudo-agent";
@@ -91,10 +93,29 @@ pub fn bind(path: &Path) -> io::Result<(UnixListener, SocketFile)> {
     }
 
     remove_stale(path)?;
-    let listener = UnixListener::bind(path)?;
+    let listener = listen_private(path)?;
     let file = SocketFile::new(path)?;
+    // Already so; a cheap check that it stays that way.
     fs::set_permissions(path, Permissions::from_mode(0o600))?;
     Ok((listener, file))
+}
+
+/// Listens on a new socket at `path`, created with mode `0600`: Linux gives
+/// the socket file the mode set on the socket before `bind` (minus the
+/// umask). Binding first and changing the mode after would leave a moment in
+/// which others could connect, and such a connection would stay open; that
+/// matters for a `--agent-socket` or `--control-socket` path in a shared
+/// directory such as `/tmp` (the default directory is private anyway).
+fn listen_private(path: &Path) -> io::Result<UnixListener> {
+    let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
+    // SAFETY: the descriptor is valid for as long as `socket` lives.
+    if unsafe { libc::fchmod(socket.as_raw_fd(), 0o600) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    socket.bind(&SockAddr::unix(path)?)?;
+    socket.listen(128)?;
+    socket.set_nonblocking(true)?;
+    UnixListener::from_std(socket.into())
 }
 
 /// The socket file this process bound; removed on drop.
@@ -164,8 +185,10 @@ fn ensure_private_dir(dir: &Path) -> io::Result<()> {
     }
 
     let meta = fs::symlink_metadata(dir)?;
-    // SAFETY: getuid() has no preconditions and cannot fail.
-    let uid = unsafe { libc::getuid() };
+    // The effective uid, which owns the files we create; `control.sock`
+    // compares peers with it too.
+    // SAFETY: geteuid() has no preconditions and cannot fail.
+    let uid = unsafe { libc::geteuid() };
     let insecure = if !meta.file_type().is_dir() {
         Some("is not a directory")
     } else if meta.uid() != uid {
@@ -218,6 +241,17 @@ mod tests {
         // a path was given.
         let unreachable = || -> io::Result<PathBuf> { panic!("default computed") };
         choose_path(flag(), None, unreachable).unwrap();
+    }
+
+    /// Without the mode set before `bind`, the usual umask (022) would give
+    /// `0755` until the `chmod`.
+    #[tokio::test]
+    async fn socket_is_created_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.sock");
+        let _listener = listen_private(&path).unwrap();
+        let mode = fs::symlink_metadata(&path).unwrap().mode();
+        assert_eq!(mode & 0o777, 0o600, "mode {mode:o}");
     }
 
     #[tokio::test]
