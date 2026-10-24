@@ -456,12 +456,16 @@ mod tests {
 
     const CHALLENGE: &[u8] = b"pam_ssh_agent_auth challenge";
 
-    /// `sh` with `args`, once its command line is in place (`spawn`
-    /// returns while the kernel may still be setting it up).
+    /// `sh` with `args`, once its command line is in place. `spawn` can
+    /// return while the child's `exec` is still under way: first it shows
+    /// our own command line (the vfork parent is woken before the child's
+    /// memory is switched), then an empty one.
     fn shell(args: &[&str]) -> (std::process::Child, i32) {
         let child = std::process::Command::new("sh").args(args).spawn().unwrap();
         let pid = i32::try_from(child.id()).unwrap();
-        while std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|raw| raw.is_empty()) {
+        while std::fs::read(format!("/proc/{pid}/cmdline"))
+            .is_ok_and(|raw| !raw.starts_with(b"sh\0"))
+        {
             std::thread::sleep(Duration::from_millis(1));
         }
         (child, pid)
