@@ -106,7 +106,7 @@ Work on this project happens on two kinds of machine, and an agent must know whi
 - `.github/dependabot.yml`: weekly version-update PRs for Cargo dependencies and the workflows' actions (7-day cooldown, minor/patch grouped). Not covered: the `tool:` versions given to `taiki-e/install-action` and the `stable` toolchain. Actions are pinned by full commit SHA with a `# vX.Y.Z` comment; keep that form when editing workflows. Dependabot PRs get only Dependabot secrets, so `SONAR_TOKEN` must be one too or their SonarQube job fails.
 - Outside the repository (GitHub settings): CodeQL default setup (Rust + Actions, on pushes and weekly), Dependabot alerts and security updates.
 - `deny.toml`: cargo-deny config (Linux targets, license allow-list, crates.io only, no wildcards). Advisories are left to cargo-audit.
-- `.cargo/audit.toml`: cargo-audit ignores, each with its reason (currently RUSTSEC-2023-0071, `rsa` via `ssh-key`; see `TODO.md` → Other).
+- `.cargo/audit.toml`: cargo-audit ignores, each with its reason (currently RUSTSEC-2023-0071, `rsa` via `ssh-key`, and RUSTSEC-2026-0387, `crypto-bigint` 0.5 via `ssh-key`'s ECDSA curves; see `TODO.md` → Other).
 
 ## Common Development Commands
 
@@ -136,7 +136,7 @@ cargo audit --deny warnings
 cargo deny --locked check bans licenses sources
 ```
 
-- **CI is strict**: any Clippy warning, RustSec advisory or warning (unmaintained, yanked, …), disallowed license or non-crates.io source fails it. When adding or updating dependencies, run `cargo audit` and `cargo deny check` locally. Don't silence findings to get green: a new license goes into `deny.toml`'s allow-list, and an advisory into `.cargo/audit.toml`'s `ignore`, only with the user's agreement and a comment giving the reason. The `syn` duplicate warning from `cargo deny` (2.x via `curve25519-dalek-derive`, 3.x elsewhere) is known and harmless. A full `cargo deny check` also reports RUSTSEC-2023-0071, because cargo-deny doesn't read `.cargo/audit.toml`.
+- **CI is strict**: any Clippy warning, RustSec advisory or warning (unmaintained, yanked, …), disallowed license or non-crates.io source fails it. When adding or updating dependencies, run `cargo audit` and `cargo deny check` locally. Don't silence findings to get green: a new license goes into `deny.toml`'s allow-list, and an advisory into `.cargo/audit.toml`'s `ignore`, only with the user's agreement and a comment giving the reason. The `syn` duplicate warning from `cargo deny` (2.x via `curve25519-dalek-derive`, 3.x elsewhere) is known and harmless. A full `cargo deny check` also reports RUSTSEC-2023-0071 and RUSTSEC-2026-0387, because cargo-deny doesn't read `.cargo/audit.toml`.
 
 - **After `cargo publish` / `cargo package`** (even `--dry-run`), run `cargo clean -p sudo-agent`. Packaging rewrites the dev binary's fingerprint to track `target/package/…/src`, after which `cargo build` silently reuses a stale `target/debug/sudo-agent` (tests are unaffected, so it looks like code passes tests but fails when run).
 - **SonarQube Cloud** analyses pushed `main` and PRs through `build.yml`, with test coverage, and the quality gate (including coverage on new code) must pass (public project `juusolatva_sudo-agent`). Since 2026-10-20 the gate is the free plan's Sonar way, whose maintainability condition is a debt-ratio rating, so new code smells can pass it; aim for zero open issues before a release, not just a green gate. Open issues: `curl -s 'https://sonarcloud.io/api/issues/search?componentKeys=juusolatva_sudo-agent&resolved=false'`.

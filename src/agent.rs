@@ -332,9 +332,11 @@ fn find<'a>(keys: &'a [KeyEntry], key_data: &KeyData, now: Duration) -> Option<&
 async fn hung_up(client: Option<&OwnedFd>) {
     // Registered on our own duplicate of the socket, so the protocol loop's
     // registration of the original is left alone.
-    let Some(socket) =
-        client.and_then(|fd| AsyncFd::with_interest(fd.as_fd(), Interest::READABLE).ok())
-    else {
+    // SAFETY: the `BorrowedFd` borrows `client` for as long as `socket` lives,
+    // so the descriptor stays open and is the same one throughout.
+    let Some(socket) = client.and_then(|fd| {
+        unsafe { AsyncFd::register_with_interest(fd.as_fd(), Interest::READABLE) }.ok()
+    }) else {
         return future::pending().await;
     };
     loop {

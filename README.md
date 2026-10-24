@@ -288,16 +288,20 @@ The prompt names the local `ssh` process that carries the forwarded
 request. It can't see which command runs on the server.
 
 **Key types**: Ed25519 is recommended and the one tested end to end.
-ECDSA should work but is untested. RSA works only when
+ECDSA should work but is untested, and its signing uses `crypto-bigint`
+0.5, which has a timing advisory ([RUSTSEC-2026-0387]; our advisory:
+[GHSA-rj9x-w6xp-x994]). RSA works only when
 the requester asks for `rsa-sha2-512` signatures, which older
 `pam_ssh_agent_auth` versions may not do. RSA signing also uses the
 `rsa` crate, which has an unfixed timing side-channel advisory
 ([RUSTSEC-2023-0071]; our advisory: [GHSA-wwj9-h88v-6483]). Every
 signature waits for your approval, which makes the timing hard to measure
-from a server, but prefer Ed25519.
+from a server (ECDSA likewise), but prefer Ed25519.
 
 [RUSTSEC-2023-0071]: https://rustsec.org/advisories/RUSTSEC-2023-0071
 [GHSA-wwj9-h88v-6483]: https://github.com/juusolatva/sudo-agent/security/advisories/GHSA-wwj9-h88v-6483
+[RUSTSEC-2026-0387]: https://rustsec.org/advisories/RUSTSEC-2026-0387
+[GHSA-rj9x-w6xp-x994]: https://github.com/juusolatva/sudo-agent/security/advisories/GHSA-rj9x-w6xp-x994
 
 ## Server setup
 
