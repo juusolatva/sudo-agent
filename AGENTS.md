@@ -45,6 +45,7 @@ Agents modifying or extending this codebase must strictly preserve the following
 2. **Approval Prompt is Yes/No, Never Passphrase Re-entry**:
    - The key passphrase is required **once**, only when decrypting the key into agent memory at load time.
    - Per-signature approval is strictly a cheap confirmation (yes/no keypress). It serves as a sanity check and a detection mechanism against silent elevation (e.g. by another process reaching the socket). Requiring passphrases on every sign defeats usability.
+   - Two accepted dependency advisories rely on every signature being approved by a person: the timing side channels in RSA signing ([GHSA-wwj9-h88v-6483](https://github.com/juusolatva/sudo-agent/security/advisories/GHSA-wwj9-h88v-6483), RUSTSEC-2023-0071) and ECDSA signing ([GHSA-rj9x-w6xp-x994](https://github.com/juusolatva/sudo-agent/security/advisories/GHSA-rj9x-w6xp-x994), RUSTSEC-2026-0387). Any change that weakens or bypasses approval (auto-approve, remembering approvals, unattended signing) must revisit them and the `.cargo/audit.toml` ignores first.
 3. **Pluggable Prompt Abstraction with Terminal First**:
    - Design a single prompt abstraction supporting two kinds of interaction: secret input (passphrase at load) and binary confirmation (yes/no on sign).
    - Start with a terminal-based backend. It must remain functional even after other backends (GUI, desktop notifications) are introduced.
