@@ -650,6 +650,18 @@ touches signing or prompting.
       Alternative if it lingers: build `ssh-key` without RSA (drops RSA keys).
       When it's fixed, also update our advisory GHSA-wwj9-h88v-6483 with the
       patched sudo-agent version.
+- [ ] **Drop the RUSTSEC-2026-0387 ignore** in `.cargo/audit.toml`
+      (`crypto-bigint` 0.5 timing variability, pulled in by `ssh-key`'s
+      ECDSA curves) once `ssh-key` 0.7 is released and `ssh-agent-lib` moves
+      to it (fixed in `crypto-bigint` 0.7.6). Accepted 2026-10-24 because
+      every ECDSA signature waits for a human approval. The same upgrade
+      unblocks `signature` 3 (Dependabot PR #3, closed). When it's fixed,
+      also update our advisory GHSA-rj9x-w6xp-x994 with the patched
+      sudo-agent version. Meanwhile, if RUSTSEC-2026-0387 gets a CVE or
+      GHSA alias (none on 2026-10-24; upstream RustCrypto/crypto-bigint#1365),
+      add it to the advisory's CVE field and References, as
+      GHSA-wwj9-h88v-6483 reuses CVE-2023-49092. Don't request our own CVE:
+      the flaw is upstream's.
 
 ## Someday (only if bothered — not committed, fine to drop)
 

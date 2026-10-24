@@ -10,4 +10,12 @@ ignore = [
     # type. Revisit once RustCrypto/RSA#626 is fixed. Our advisory:
     # https://github.com/juusolatva/sudo-agent/security/advisories/GHSA-wwj9-h88v-6483
     "RUSTSEC-2023-0071",
+    # crypto-bigint 0.5: timing variability in operations meant to be
+    # constant-time. Pulled in by ssh-key's `crypto` feature (p256/p384/p521);
+    # used only when signing with an ECDSA key. Same reasoning as above: the
+    # only remote path is an approval-gated sign over agent.sock. The fix
+    # (crypto-bigint 0.7.6) needs ssh-key 0.7 and an ssh-agent-lib built on it.
+    # Our advisory:
+    # https://github.com/juusolatva/sudo-agent/security/advisories/GHSA-rj9x-w6xp-x994
+    "RUSTSEC-2026-0387",
 ]
