@@ -2,10 +2,18 @@
 //! got loaded and what stops the process.
 
 use std::future::Future;
+use std::io;
+use std::sync::Arc;
+use std::time::Duration;
 
-use ssh_agent_lib::agent::listen;
+use ssh_agent_lib::agent::{Agent, Session};
 use ssh_agent_lib::error::AgentError;
-use tokio::net::UnixListener;
+use ssh_agent_lib::proto::{Request, Response};
+use ssh_agent_lib::ssh_encoding::{Decode, Encode};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::Semaphore;
+use tokio::time::timeout;
 
 use crate::agent::SudoAgent;
 use crate::control::ControlAgent;
@@ -20,10 +28,42 @@ pub struct Listeners {
     pub control: UnixListener,
 }
 
+/// What one socket allows its clients, so a hostile one can't use up the
+/// daemon's memory or descriptors.
+#[derive(Clone, Copy)]
+struct Limits {
+    /// Connections served at once; the next one waits in the listen backlog.
+    connections: usize,
+    /// Largest request frame (OpenSSH's own agent limit); a bigger length
+    /// ends the connection before anything is buffered.
+    frame: u32,
+    /// How long a client may stay silent between requests; `None` for the
+    /// trusted local sockets that legitimately idle.
+    idle: Option<Duration>,
+    /// How long the rest of a frame may take once its length has arrived.
+    body: Duration,
+}
+
+/// `agent.sock` is reachable by forwarding, so it gets tight limits.
+const AGENT_LIMITS: Limits = Limits {
+    connections: 64,
+    frame: 256 * 1024,
+    idle: Some(Duration::from_secs(60)),
+    body: Duration::from_secs(10),
+};
+
+/// `control.sock` only takes our own uid (see `control.rs`); a client may
+/// idle, but not hold unlimited descriptors.
+const CONTROL_LIMITS: Limits = Limits {
+    idle: None,
+    connections: 32,
+    ..AGENT_LIMITS
+};
+
 /// Serves `agent` on `agent.sock` and `control` (the same agent's control
-/// side) on `control.sock`, until accepting fails on either or `shutdown`
-/// resolves. Connections still being served then are left to the runtime's
-/// shutdown.
+/// side) on `control.sock`, until accepting fails fatally on either or
+/// `shutdown` resolves. Connections still being served then are left to the
+/// runtime's shutdown.
 pub async fn serve(
     listeners: Listeners,
     agent: SudoAgent,
@@ -31,10 +71,143 @@ pub async fn serve(
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), AgentError> {
     tokio::select! {
-        result = listen(listeners.agent, agent) => result,
-        result = listen(listeners.control, control) => result,
+        result = listen(listeners.agent, agent, AGENT_LIMITS) => result,
+        result = listen(listeners.control, control, CONTROL_LIMITS) => result,
         () = shutdown => Ok(()),
     }
+}
+
+/// Accepts connections and serves each on its own task, within `limits`.
+/// Running out of descriptors (or memory) is waited out rather than ending
+/// the agent.
+async fn listen(
+    socket: UnixListener,
+    mut agent: impl Agent<UnixListener>,
+    limits: Limits,
+) -> Result<(), AgentError> {
+    let slots = Arc::new(Semaphore::new(limits.connections));
+    let mut starved = false;
+    loop {
+        let slot = Arc::clone(&slots)
+            .acquire_owned()
+            .await
+            .expect("the semaphore is never closed");
+        match socket.accept().await {
+            Ok((stream, _)) => {
+                starved = false;
+                let session = agent.new_session(&stream);
+                tokio::spawn(async move {
+                    if let Err(e) = serve_connection(session, stream, limits).await {
+                        log!("Connection ended: {e}");
+                    }
+                    drop(slot);
+                });
+            }
+            Err(e) if transient(&e) => {
+                if !starved {
+                    log!("Cannot accept connections for now ({e}); retrying");
+                    starved = true;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => return Err(AgentError::IO(e)),
+        }
+    }
+}
+
+/// An `accept()` failure that passes: the connection went away already, or
+/// the process is out of descriptors or memory.
+fn transient(e: &io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(
+            libc::EMFILE
+                | libc::ENFILE
+                | libc::ENOBUFS
+                | libc::ENOMEM
+                | libc::ECONNABORTED
+                | libc::EINTR
+                | libc::EPROTO
+        )
+    ) || e.kind() == io::ErrorKind::ConnectionAborted
+}
+
+fn timed_out(what: &str) -> AgentError {
+    AgentError::IO(io::Error::new(io::ErrorKind::TimedOut, what.to_string()))
+}
+
+/// Reads one request frame: `Ok(None)` when the client hung up between
+/// frames.
+async fn read_request(
+    stream: &mut UnixStream,
+    limits: &Limits,
+) -> Result<Option<Request>, AgentError> {
+    let mut header = [0u8; 4];
+    let first = async {
+        match stream.read_exact(&mut header).await {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+            Err(e) => Err(e),
+        }
+    };
+    let arrived = match limits.idle {
+        Some(idle) => timeout(idle, first)
+            .await
+            .map_err(|_| timed_out("idle connection"))??,
+        None => first.await?,
+    };
+    if !arrived {
+        return Ok(None);
+    }
+    let length = u32::from_be_bytes(header);
+    if length > limits.frame {
+        return Err(AgentError::IO(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "request of {length} bytes is over the {} limit",
+                limits.frame
+            ),
+        )));
+    }
+    // Grown as bytes arrive, not reserved up front.
+    let mut body = Vec::new();
+    timeout(
+        limits.body,
+        stream.take(u64::from(length)).read_to_end(&mut body),
+    )
+    .await
+    .map_err(|_| timed_out("incomplete request"))??;
+    if body.len() != length as usize {
+        return Err(AgentError::IO(io::ErrorKind::UnexpectedEof.into()));
+    }
+    Ok(Some(Request::decode(&mut body.as_slice())?))
+}
+
+/// Answers requests on `stream` until the client leaves or breaks a limit.
+async fn serve_connection(
+    mut session: impl Session,
+    mut stream: UnixStream,
+    limits: Limits,
+) -> Result<(), AgentError> {
+    while let Some(request) = read_request(&mut stream, &limits).await? {
+        let response = match session.handle(request).await {
+            Ok(response) => response,
+            Err(AgentError::ExtensionFailure) => Response::ExtensionFailure,
+            Err(_) => Response::Failure,
+        };
+        let mut frame = Vec::new();
+        let length = response
+            .encoded_len()
+            .map_err(ssh_agent_lib::proto::ProtoError::SshEncoding)?;
+        (length as u32)
+            .encode(&mut frame)
+            .map_err(ssh_agent_lib::proto::ProtoError::SshEncoding)?;
+        response
+            .encode(&mut frame)
+            .map_err(ssh_agent_lib::proto::ProtoError::SshEncoding)?;
+        stream.write_all(&frame).await?;
+    }
+    Ok(())
 }
 
 /// Socket-level tests: the agent served on a real socket, driven by
@@ -61,9 +234,11 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixStream;
     use tokio::sync::oneshot;
     use tokio::task::JoinHandle;
+    use tokio::time::timeout;
 
     const CHALLENGE: &[u8] = b"pam_ssh_agent_auth challenge";
 
@@ -1071,5 +1246,72 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{e}");
+    }
+
+    /// A bare `agent.sock` served within `limits`.
+    fn limited(limits: Limits) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.sock");
+        let (listener, file) = socket::bind(&path).unwrap();
+        let agent = SudoAgent::new(
+            Arc::new(Mutex::new(vec![entry("k", LONG.default)])),
+            Router::only(Arc::new(ScriptedPrompter::with_confirms([]))),
+        );
+        tokio::spawn(async move {
+            let _file = file;
+            let _ = listen(listener, agent, limits).await;
+        });
+        (dir, path)
+    }
+
+    const SMALL: Limits = Limits {
+        connections: 2,
+        frame: 1024,
+        idle: Some(Duration::from_millis(200)),
+        body: Duration::from_millis(200),
+    };
+
+    /// True once the daemon has closed `stream`.
+    async fn closed(stream: &mut UnixStream) -> bool {
+        let mut byte = [0u8; 1];
+        matches!(
+            timeout(Duration::from_secs(2), stream.read(&mut byte)).await,
+            Ok(Ok(0) | Err(_))
+        )
+    }
+
+    #[tokio::test]
+    async fn oversized_frame_is_refused_before_buffering() {
+        let (_dir, path) = limited(SMALL);
+        let mut stream = UnixStream::connect(&path).await.unwrap();
+        stream.write_all(&u32::MAX.to_be_bytes()).await.unwrap();
+        assert!(closed(&mut stream).await);
+    }
+
+    #[tokio::test]
+    async fn unfinished_frame_times_out() {
+        let (_dir, path) = limited(SMALL);
+        let mut stream = UnixStream::connect(&path).await.unwrap();
+        stream.write_all(&[0, 0, 0, 100, 11]).await.unwrap();
+        assert!(closed(&mut stream).await);
+    }
+
+    #[tokio::test]
+    async fn idle_connection_times_out_and_frees_its_slot() {
+        let (_dir, path) = limited(SMALL);
+        let mut idle = vec![
+            UnixStream::connect(&path).await.unwrap(),
+            UnixStream::connect(&path).await.unwrap(),
+        ];
+        // Both slots are taken, so this one is not served until one frees.
+        let mut third = Client::new(UnixStream::connect(&path).await.unwrap());
+        for stream in &mut idle {
+            assert!(closed(stream).await);
+        }
+        let listed = timeout(Duration::from_secs(2), third.request_identities())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(listed.len(), 1);
     }
 }
