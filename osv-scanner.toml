@@ -1,0 +1,10 @@
+# OSV-Scanner configuration (read by `osv-scanner`, including osv-scanner.yml).
+# Keep in sync with `.cargo/audit.toml`.
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2023-0071"
+reason = "rsa Marvin Attack timing side channel (via ssh-key); every RSA signature is gated on human approval, whose latency swamps timing differences. Tracked in GHSA-wwj9-h88v-6483 and RustCrypto/RSA#626."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0387"
+reason = "crypto-bigint 0.5 timing variability (via ssh-key ECDSA curves); every ECDSA signature is gated on human approval. Waiting on ssh-key 0.7 + ssh-agent-lib update. Tracked in GHSA-rj9x-w6xp-x994."
