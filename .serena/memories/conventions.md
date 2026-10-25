@@ -9,4 +9,4 @@
 - `confirm()`: `Ok(bool)` only for a real answer (approve/deny); timeouts, withdrawal and failures are `Err` (no answer), which routing doesn't count as a denial. Backends implement `available()` and must not log while asking (a line would land inside the terminal prompt): failures reach the log through `Router`'s `Answer::problems` or the refusal reason.
 - No blocking file I/O inside `async fn`: `tokio::fs` or `spawn_blocking` (SonarQube `rust:S7493`).
 - Formatting: default `rustfmt` (no rustfmt.toml/clippy.toml); clippy defaults.
-- Git: never commit, not even for version bumps/publishing; the user makes all commits.
+- Git: commits are allowed; pull requests on feature branches are preferred over pushing directly to `main`.
