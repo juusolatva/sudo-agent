@@ -626,10 +626,13 @@ touches signing or prompting.
   - Warning thresholds/behavior as a key's TTL approaches expiry.
   - Grows as other items land: which approval backend (pinentry / `approve`
     client / foreground), maximum TTL, approval timeout.
-- [ ] **Native secrets-manager passphrase fetch.** Mostly covered by step 1,
-      since `ssh-load` with `rbw` + `SSH_ASKPASS` + `ssh-add` keeps working
-      against `control.sock`. A native fetch in `sudo-agent add` (no askpass
-      shim) is optional polish on top.
+- **Passphrases stay outside the daemon** (decided 2026-10-26; replaces
+  the old "native secrets-manager passphrase fetch" item). How a key's
+  passphrase is supplied is up to the user's `ssh-add` setup against
+  `control.sock`: typed, or fetched by an `SSH_ASKPASS` helper from a
+  password manager (`rbw get …`, as in README → Adding keys). `sudo-agent`
+  gets only the decrypted key. No built-in fetch and no `sudo-agent add`
+  for it, so people stay free to choose how they load keys.
 - [ ] **Show the forwarding chain in the approval prompt.** Today a request
       over a forwarded agent only shows the local client (`ssh -A bastion`),
       so multi-hop requests and login-vs-forwarded use look identical. Handle
@@ -692,8 +695,8 @@ Pick up only if genuinely motivated to; dropping any of them costs nothing.
     request that looks like login auth, which is the classic
     agent-forwarding hijack.
   - Builds on the forwarding-chain item under "Next".
-- **Bitwarden SSH agent protocol interop**: not the `rbw` CLI passphrase
-  fetch above — this is `sudo-agent` proxying to Bitwarden desktop's own
+- **Bitwarden SSH agent protocol interop**: not about passphrases (those
+  stay outside the daemon, see "Other" under "Next") — this is `sudo-agent` proxying to Bitwarden desktop's own
   SSH-agent-protocol implementation as a key source. A materially different
   architecture (this agent becoming a client of another live agent), wanted
   later purely for convenience.
