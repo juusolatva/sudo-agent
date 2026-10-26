@@ -107,6 +107,26 @@ SSH_AUTH_SOCK=$XDG_RUNTIME_DIR/sudo-agent/control.sock ssh-add -t 4h ~/.ssh/id_e
   restrictions) and other constraints are refused rather than silently
   ignored, as are certificates and smartcard keys.
 
+The passphrase is `ssh-add`'s business, so any way of supplying it works;
+`sudo-agent` only receives the decrypted key. For example, an
+`SSH_ASKPASS` helper that reads it from a password manager (here `rbw`,
+a Bitwarden client):
+
+```sh
+#!/bin/sh
+# ~/.local/bin/askpass-rbw: $1 is ssh-add's prompt, which names the key.
+case "$1" in
+    *id_ed25519*) exec rbw get ssh-passphrase-id_ed25519 ;;
+    *) exit 1 ;;
+esac
+```
+
+```sh
+SSH_AUTH_SOCK=$XDG_RUNTIME_DIR/sudo-agent/control.sock \
+    SSH_ASKPASS=$HOME/.local/bin/askpass-rbw SSH_ASKPASS_REQUIRE=force \
+    ssh-add -t 4h ~/.ssh/id_ed25519
+```
+
 Or load keys at startup, with the passphrase asked in the agent's terminal:
 `sudo-agent serve --key ~/.ssh/id_ed25519` (repeatable).
 
