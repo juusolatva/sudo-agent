@@ -225,8 +225,11 @@ impl Connection {
         Err(AgentError::Failure)
     }
 
-    fn refuse(&self, reason: &str) -> Result<Signature, AgentError> {
-        log!("Refused signature request from {}: {reason}", self.peer);
+    fn refuse(&self, payload: &Payload, reason: &str) -> Result<Signature, AgentError> {
+        log!(
+            "Refused signature request for {payload} from {}: {reason}",
+            self.peer
+        );
         Err(AgentError::Failure)
     }
 }
@@ -296,6 +299,8 @@ impl Session for Connection {
     }
 
     async fn sign(&mut self, request: SignRequest) -> Result<Signature, AgentError> {
+        // Named in the prompt and in every log line about the request.
+        let payload = Payload::of(&request.data);
         // A client that goes away (e.g. its SSH connection closes) leaves the
         // queue, or has its prompt withdrawn.
         let hung_up = hung_up(self.client.as_ref());
@@ -303,19 +308,19 @@ impl Session for Connection {
 
         let _turn = tokio::select! {
             turn = self.agent.requests.lock() => turn,
-            () = &mut hung_up => return self.refuse("client disconnected"),
+            () = &mut hung_up => return self.refuse(&payload, "client disconnected"),
         };
 
         let key_data = request.credential.key_data();
         let key = match self.agent.describe(key_data, request.flags) {
             Ok(key) => key,
-            Err(reason) => return self.refuse(&reason),
+            Err(reason) => return self.refuse(&payload, &reason),
         };
-        let payload = Payload::of(&request.data);
         if self.forwarded && !payload.forwardable() {
-            return self.refuse(&format!(
-                "agent.sock signs only sudo (pam_ssh_agent_auth) challenges and SSH logins, not {payload}"
-            ));
+            return self.refuse(
+                &payload,
+                "agent.sock signs only sudo (pam_ssh_agent_auth) challenges and SSH logins",
+            );
         }
 
         let message = format!(
@@ -338,31 +343,31 @@ impl Session for Connection {
                 cancel.cancel();
                 // Returns once the prompt is gone, so the log follows it.
                 let _ = confirm.await;
-                return self.refuse(reason);
+                return self.refuse(&payload, reason);
             }
         };
         let answer = match answer {
             Ok(answer) => answer,
             // No backend answered: that counts as a denial.
-            Err(e) => return self.refuse(&format!("not approved: {e}")),
+            Err(e) => return self.refuse(&payload, &format!("not approved: {e}")),
         };
         for problem in &answer.problems {
             log!("Approval backend failed (logged only once): {problem}");
         }
         if !answer.approved {
-            return self.refuse(&format!("denied ({})", answer.by));
+            return self.refuse(&payload, &format!("denied ({})", answer.by));
         }
 
         match self.agent.sign_with(key_data, &request.data) {
             Ok(signature) => {
                 log!(
-                    "Approved ({}) signature request from {}",
+                    "Approved ({}) signature request for {payload} from {}",
                     answer.by,
                     self.peer
                 );
                 Ok(signature)
             }
-            Err(reason) => self.refuse(&reason),
+            Err(reason) => self.refuse(&payload, &reason),
         }
     }
 }
