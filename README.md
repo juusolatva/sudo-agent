@@ -303,7 +303,7 @@ Signature request from pid 402599, uid 1000: ssh server
   key: laptop (SHA256:…), 12m30s left
   signing: a sudo challenge for user excali
 Allow? [y/N] y
-Approved (terminal) signature request for a sudo challenge for user excali from pid 402599, uid 1000: ssh server
+Approved (terminal) signature request for a sudo challenge for user excali with key laptop (SHA256:…) from pid 402599, uid 1000: ssh server
 ```
 
 The popup shows the same text, says when it closes by itself

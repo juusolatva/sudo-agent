@@ -81,6 +81,20 @@ impl SudoAgent {
         }
     }
 
+    /// Names the requested key for log lines: its comment and fingerprint,
+    /// or just the fingerprint if it isn't loaded.
+    fn key_name(&self, key_data: &KeyData) -> String {
+        let fingerprint = key_data.fingerprint(HashAlg::Sha256);
+        let keys = self.keys.lock().unwrap();
+        match keys
+            .iter()
+            .find(|k| k.private_key.public_key().key_data() == key_data)
+        {
+            Some(entry) => format!("{} ({fingerprint})", sanitize(entry.private_key.comment())),
+            None => fingerprint.to_string(),
+        }
+    }
+
     /// Describes the requested key for the approval prompt, or says why the
     /// request can't be served. Called before prompting so the user is never
     /// asked to approve something that would fail anyway.
@@ -225,9 +239,11 @@ impl Connection {
         Err(AgentError::Failure)
     }
 
-    fn refuse(&self, payload: &Payload, reason: &str) -> Result<Signature, AgentError> {
+    /// Logs the refusal of a request for `subject` (what it signs, with which
+    /// key).
+    fn refuse(&self, subject: &str, reason: &str) -> Result<Signature, AgentError> {
         log!(
-            "Refused signature request for {payload} from {}: {reason}",
+            "Refused signature request for {subject} from {}: {reason}",
             self.peer
         );
         Err(AgentError::Failure)
@@ -299,8 +315,11 @@ impl Session for Connection {
     }
 
     async fn sign(&mut self, request: SignRequest) -> Result<Signature, AgentError> {
-        // Named in the prompt and in every log line about the request.
+        // Named in the prompt; it and the key in every log line about the
+        // request.
         let payload = Payload::of(&request.data);
+        let key_data = request.credential.key_data();
+        let subject = format!("{payload} with key {}", self.agent.key_name(key_data));
         // A client that goes away (e.g. its SSH connection closes) leaves the
         // queue, or has its prompt withdrawn.
         let hung_up = hung_up(self.client.as_ref());
@@ -308,17 +327,16 @@ impl Session for Connection {
 
         let _turn = tokio::select! {
             turn = self.agent.requests.lock() => turn,
-            () = &mut hung_up => return self.refuse(&payload, "client disconnected"),
+            () = &mut hung_up => return self.refuse(&subject, "client disconnected"),
         };
 
-        let key_data = request.credential.key_data();
         let key = match self.agent.describe(key_data, request.flags) {
             Ok(key) => key,
-            Err(reason) => return self.refuse(&payload, &reason),
+            Err(reason) => return self.refuse(&subject, &reason),
         };
         if self.forwarded && !payload.forwardable() {
             return self.refuse(
-                &payload,
+                &subject,
                 "agent.sock signs only sudo (pam_ssh_agent_auth) challenges and SSH logins",
             );
         }
@@ -343,31 +361,31 @@ impl Session for Connection {
                 cancel.cancel();
                 // Returns once the prompt is gone, so the log follows it.
                 let _ = confirm.await;
-                return self.refuse(&payload, reason);
+                return self.refuse(&subject, reason);
             }
         };
         let answer = match answer {
             Ok(answer) => answer,
             // No backend answered: that counts as a denial.
-            Err(e) => return self.refuse(&payload, &format!("not approved: {e}")),
+            Err(e) => return self.refuse(&subject, &format!("not approved: {e}")),
         };
         for problem in &answer.problems {
             log!("Approval backend failed (logged only once): {problem}");
         }
         if !answer.approved {
-            return self.refuse(&payload, &format!("denied ({})", answer.by));
+            return self.refuse(&subject, &format!("denied ({})", answer.by));
         }
 
         match self.agent.sign_with(key_data, &request.data) {
             Ok(signature) => {
                 log!(
-                    "Approved ({}) signature request for {payload} from {}",
+                    "Approved ({}) signature request for {subject} from {}",
                     answer.by,
                     self.peer
                 );
                 Ok(signature)
             }
-            Err(reason) => self.refuse(&payload, &reason),
+            Err(reason) => self.refuse(&subject, &reason),
         }
     }
 }
@@ -713,6 +731,31 @@ mod tests {
         assert!(
             asked[0].contains("\n  signing: a sudo challenge for user excali\n"),
             "{asked:?}"
+        );
+    }
+
+    #[test]
+    fn log_lines_name_the_key() {
+        let loaded = entry("laptop\x1b[2K", Duration::from_secs(60));
+        let loaded_data = loaded.private_key.public_key().key_data().clone();
+        let other = entry("other", Duration::from_secs(60));
+        let other_data = other.private_key.public_key().key_data().clone();
+        let agent = SudoAgent::new(
+            Arc::new(Mutex::new(vec![loaded])),
+            Router::only(Arc::new(ScriptedPrompter::with_confirms([true]))),
+        );
+
+        assert_eq!(
+            agent.key_name(&loaded_data),
+            format!(
+                "laptop\\u{{1b}}[2K ({})",
+                loaded_data.fingerprint(HashAlg::Sha256)
+            )
+        );
+        // Not loaded: the fingerprint is all there is.
+        assert_eq!(
+            agent.key_name(&other_data),
+            other_data.fingerprint(HashAlg::Sha256).to_string()
         );
     }
 
