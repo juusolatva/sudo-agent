@@ -61,9 +61,10 @@ In a second terminal, log in with your normal agent but forward only
 ssh -o ForwardAgent="$XDG_RUNTIME_DIR/sudo-agent/agent.sock" <server>
 ```
 
-There is an alternative: `SSH_AUTH_SOCK=<sudo-agent socket> ssh -A <server>`.
-It also works, but then the SSH login itself asks `sudo-agent` for a signature,
-so you'll get one approval prompt for the login as well.
+Don't log in with `SSH_AUTH_SOCK=<agent.sock> ssh -A <server>`. `agent.sock`
+signs only `pam_ssh_agent_auth` challenges, so it refuses the login's
+signature (`Refused …: agent.sock signs only sudo (pam_ssh_agent_auth)
+challenges, not an SSH login as user …`).
 
 Forward `agent.sock` only, never `control.sock`. `ssh` forwards an agent only
 if it has one of its own (`SSH_AUTH_SOCK` or `IdentityAgent` set); without
@@ -104,7 +105,7 @@ every `sudo` authenticates anyway.)
 
 | # | Action | Expected on laptop | Expected on server |
 |---|--------|--------------------|--------------------|
-| 1 | `sudo -k; sudo -v`, answer **y** | Prompt names the `ssh … <server>` process, the key, and time left; then `Approved (terminal) signature request …` | Succeeds with **no password prompt** |
+| 1 | `sudo -k; sudo -v`, answer **y** | Prompt names the `ssh … <server>` process, the key, and time left, and says `signing: a sudo challenge for user <you>`; then `Approved (terminal) signature request …` | Succeeds with **no password prompt** |
 | 2 | `sudo -k; sudo -v`, answer **n** (or Enter) | `Refused signature request …: denied (terminal)` | Falls back to the password prompt (or fails if there's no fallback) |
 | 3 | Restart the agent with `--ttl 1m` (no need to reconnect: the forwarded channel reconnects to the socket path for every request), wait > 1 min, then `sudo -k; sudo -v` | `Key expired and was removed: …`, **no** prompt | `ssh-add -l` shows no identities; sudo falls back to the password |
 | 4 | Two sessions run `sudo -k; sudo -v` at the same time | Prompts appear one after another; each request's `Approved`/`Refused` line comes before the next prompt, nothing interleaved | Each succeeds once approved |
@@ -126,7 +127,7 @@ every `sudo` authenticates anyway.)
 | 21 | Laptop only: SSH into the laptop (no `DISPLAY`) and run `sudo-agent serve` there | Startup says `Approvals: sudo-agent approve or this terminal, whichever answers first (no pinentry popups: …)`; requests prompt in that terminal only | — |
 | 22 | In another laptop terminal `(sleep 15; pkill -KILL -x sudo-agent) &`, then within 15 s `sudo -k; sudo -v` | The popup closes (pinentry is killed with the agent) | Falls back to the password prompt |
 | 23 | Run the agent without a terminal in the desktop session: `setsid -f sudo-agent serve > /tmp/sudo-agent.log 2>&1`, add the key, `sudo -k; sudo -v`, click **Allow** | The log says `Approvals: a pinentry popup or sudo-agent approve, whichever answers first (no terminal)`, then `Approved (pinentry) …` | Succeeds |
-| 24 | Laptop only: the service without a display: a drop-in `~/.config/systemd/user/sudo-agent.service.d/headless.conf` with `[Service]` `UnsetEnvironment=DISPLAY WAYLAND_DISPLAY`, `daemon-reload`, `systemctl --user start sudo-agent`; add the key, `ssh-add -l` against `control.sock`, then `ssh-keygen -Y sign` against `agent.sock`. Remove the drop-in afterwards | `journalctl --user -u sudo-agent`: lines carry only the journal's timestamp; startup says `Approvals: sudo-agent approve only (there's no terminal, and no pinentry popups: …); signature requests are refused while none is running`; then `Added key …` and `Refused …: not approved: no approval backend is available` | — |
+| 24 | Laptop only: the service without a display: a drop-in `~/.config/systemd/user/sudo-agent.service.d/headless.conf` with `[Service]` `UnsetEnvironment=DISPLAY WAYLAND_DISPLAY`, `daemon-reload`, `systemctl --user start sudo-agent`; add the key, `ssh-add -l` against `control.sock`, then `ssh-keygen -Y sign` against `control.sock` (`agent.sock` refuses it before asking). Remove the drop-in afterwards | `journalctl --user -u sudo-agent`: lines carry only the journal's timestamp; startup says `Approvals: sudo-agent approve only (there's no terminal, and no pinentry popups: …); signature requests are refused while none is running`; then `Added key …` and `Refused …: not approved: no approval backend is available` | — |
 | 25 | The service in the desktop session (no drop-in): add the key, `sudo -k; sudo -v`, click **Allow** | Journal: `Approvals: a pinentry popup or sudo-agent approve, whichever answers first (no terminal)`, then `Approved (pinentry) …`; `systemctl --user stop sudo-agent` logs `Received SIGTERM, shutting down` | Succeeds |
 | 26 | Laptop only: with the service enabled, reboot (or log out and in) and log in to the desktop | `systemctl --user status sudo-agent` is active; the journal's startup already says `Approvals: a pinentry popup or sudo-agent approve, whichever answers first (no terminal)` (the display reached the service) | — |
 | 27 | Laptop only: with the service running, add the key, log out of the desktop and back in (no reboot) | Journal: `Received SIGTERM, shutting down` at logout (same user manager pid in `systemd[…]`), then a fresh start with `No keys loaded yet` | — |
@@ -315,7 +316,8 @@ ForwardAgent=…/agent.sock vakoilu` session):
 
 Before that, the same day, on the laptop only (driven from a script in a
 pty, `serve --no-pinentry` under `setsid`, `ssh-keygen -Y sign` against
-`agent.sock`): y, n, Ctrl-C, a timeout (`--approval-timeout 4s`:
+`agent.sock`, which now refuses it: a re-run uses `control.sock`): y, n,
+Ctrl-C, a timeout (`--approval-timeout 4s`:
 `Withdrawn: no answer within 4s`), an agent restart with the prompt open,
 two clients, and the startup errors (no terminal, no
 agent, `agent.sock` given as the control socket) behaved as described.
@@ -344,7 +346,8 @@ against the service: all passed. Cases 36 and 38 are still to be run.
   `sudo-agent` logs nothing**: the login uses your normal agent
   (`SSH_AUTH_SOCK`), not the forwarded one, and that agent doesn't have the
   key decrypted (e.g. it was only added to `sudo-agent`). Add it to your
-  normal agent too, or log in through `sudo-agent` (see step 1).
+  normal agent too: `sudo-agent`'s `agent.sock` doesn't sign logins (see
+  step 1).
 - **`sudo-agent approve` says `refused to send approval requests (too old
   for sudo-agent approve? …)`**: usually the agent running is an older
   version (often the service's `~/.cargo/bin/sudo-agent`): install the new

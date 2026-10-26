@@ -3,7 +3,8 @@
 //! approve`, see [`approve`](crate::approve)). It must never be usable
 //! through SSH agent forwarding, where a server could add keys or answer
 //! approvals, so every connection is checked three ways; see [`refusal`] and
-//! [`ControlConnection::extension`].
+//! [`ControlConnection::extension`]. Unlike `agent.sock`, it signs any data
+//! (still only once approved), not just `sudo` challenges.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -52,7 +53,7 @@ impl ControlAgent {
 
 impl Agent<UnixListener> for ControlAgent {
     fn new_session(&mut self, socket: &UnixStream) -> impl Session {
-        let inner = Connection::new(self.agent.clone(), socket);
+        let inner = Connection::control(self.agent.clone(), socket);
         let refused = match socket.peer_cred() {
             Ok(cred) => {
                 let exe = cred

@@ -21,7 +21,7 @@ use crate::control::ControlAgent;
 /// The agent's listening sockets.
 pub struct Listeners {
     /// `agent.sock`, the one forwarded: listing and approval-gated signing
-    /// only.
+    /// of `sudo` challenges only.
     pub agent: UnixListener,
     /// `control.sock`, never forwarded: also adding and removing keys, and
     /// `sudo-agent approve`.
@@ -215,6 +215,7 @@ async fn serve_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::testing::{ssh_login, sshsig, sudo_challenge};
     use crate::approve::{self, ApproveClients, Event, Reply};
     use crate::approver;
     use crate::keys::testing::entry;
@@ -240,8 +241,6 @@ mod tests {
     use tokio::sync::oneshot;
     use tokio::task::JoinHandle;
     use tokio::time::timeout;
-
-    const CHALLENGE: &[u8] = b"pam_ssh_agent_auth challenge";
 
     /// A TTL policy for tests that don't look at TTLs.
     const LONG: TtlPolicy = TtlPolicy {
@@ -477,10 +476,15 @@ mod tests {
         }
     }
 
+    /// What `pam_ssh_agent_auth` sends when `sudo` asks for `key`.
     fn sign_request(key: &KeyData) -> SignRequest {
+        signing(key, sudo_challenge(key, "excali"))
+    }
+
+    fn signing(key: &KeyData, data: Vec<u8>) -> SignRequest {
         SignRequest {
             credential: key.clone().into(),
-            data: CHALLENGE.to_vec(),
+            data,
             flags: 0,
         }
     }
@@ -527,14 +531,51 @@ mod tests {
         let prompter = Arc::new(ScriptedPrompter::with_confirms([true]));
         let running = Running::start(vec![key], prompter.clone());
 
-        let signature = running
-            .client()
-            .await
-            .sign(sign_request(&public))
-            .await
-            .unwrap();
-        public.verify(CHALLENGE, &signature).unwrap();
+        let request = sign_request(&public);
+        let challenge = request.data.clone();
+        let signature = running.client().await.sign(request).await.unwrap();
+        public.verify(&challenge, &signature).unwrap();
         assert_eq!(prompter.asked().len(), 1);
+    }
+
+    /// Through forwarding, a server could otherwise have a login to another
+    /// host, or a `git` signature, approved as if it were `sudo`.
+    #[tokio::test]
+    async fn agent_socket_signs_only_sudo_challenges() {
+        let key = entry("laptop", Duration::from_secs(60));
+        let public = public(&key);
+        let prompter = Arc::new(ScriptedPrompter::with_confirms([true; 3]));
+        let running = Running::start(vec![key], prompter.clone());
+        let others = [
+            ssh_login(&public, "excali"),
+            sshsig("git"),
+            b"anything".to_vec(),
+        ];
+
+        let mut forwarded = running.client().await;
+        for other in &others {
+            let request = Request::SignRequest(signing(&public, other.clone()));
+            let response = forwarded.handle(request).await;
+            assert!(matches!(response, Ok(Response::Failure)), "{response:?}");
+        }
+        assert!(prompter.asked().is_empty());
+
+        // `control.sock` signs them, once approved, saying what they are.
+        let mut control = running.control().await;
+        for other in &others {
+            let request = signing(&public, other.clone());
+            let signature = control.sign(request).await.unwrap();
+            public.verify(other, &signature).unwrap();
+        }
+        let asked = prompter.asked();
+        assert_eq!(asked.len(), 3);
+        for (asked, what) in asked.iter().zip([
+            "an SSH login as user excali",
+            "an ssh-keygen -Y sign signature, namespace git",
+            "unrecognized data",
+        ]) {
+            assert!(asked.contains(&format!("\n  signing: {what}\n")), "{asked}");
+        }
     }
 
     #[tokio::test]
@@ -674,15 +715,12 @@ mod tests {
         assert_eq!(running.listed().await, ["laptop"]);
 
         // Signing works on both sockets, approval-gated on both.
-        let signature = running
-            .client()
-            .await
-            .sign(sign_request(&public))
-            .await
-            .unwrap();
-        public.verify(CHALLENGE, &signature).unwrap();
+        let request = sign_request(&public);
+        let challenge = request.data.clone();
+        let signature = running.client().await.sign(request).await.unwrap();
+        public.verify(&challenge, &signature).unwrap();
         let signature = control.sign(sign_request(&public)).await.unwrap();
-        public.verify(CHALLENGE, &signature).unwrap();
+        public.verify(&challenge, &signature).unwrap();
         assert_eq!(prompter.asked().len(), 2);
     }
 
