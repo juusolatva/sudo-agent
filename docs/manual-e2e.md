@@ -330,7 +330,35 @@ That run stood in for cases 31 and 37 against `serve` rather than the
 service.
 
 Later the same day the user ran cases 31, 33, 34, 35 and 37 as written,
-against the service: all passed. Cases 36 and 38 are still to be run.
+against the service: all passed. Case 36 passed on 2026-10-26 (below);
+case 38 is still to be run.
+
+**2026-10-26, the security fixes for 0.4.3** (payload labels, `agent.sock`
+signing only `sudo` challenges and SSH logins, escaped log lines), on
+`server-a` and `server-b`, the service with pinentry popups:
+
+- Case 1 on both servers: the popup said `signing: a sudo challenge for
+  user excali`, and `sudo` succeeded once allowed. So the parser reads real
+  0.10.3 and 0.10.4 challenges. Denying (case 2) logged `denied
+  (pinentry)`.
+- An onward login from `server-b` through the forwarded `agent.sock`: the
+  popup said `signing: an SSH login as user excali`; allowing let it
+  through, denying refused it.
+- Case 24, with `ssh-keygen -Y sign` against `control.sock`: headless, it
+  was refused only for lack of an approval backend. In the desktop
+  session it was allowed in the popup, and `ssh-keygen -Y
+  check-novalidate` said `Good "test" signature`. Against `agent.sock` it
+  was refused before any prompt.
+- Case 36 passed as written. Killing the client also logs `Connection
+  ended: … Broken pipe`: the agent answering the client's connection after
+  it's gone. Harmless.
+- Case 39 on `server-a`: a sudo-only key (in the `file=` list, `-t 5m`)
+  next to the login key. Each popup named the right key and what it
+  signed, with one prompt per operation. When the sudo key expired, only
+  it was removed, and logins with the other key kept working.
+- Not run: case 38 (no second machine to SSH into the laptop from), and
+  adding a security key (no FIDO key at hand; the socket tests cover the
+  refusal).
 
 ## Troubleshooting
 
