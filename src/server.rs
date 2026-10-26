@@ -1390,4 +1390,29 @@ mod tests {
             .unwrap();
         assert_eq!(listed.len(), 1);
     }
+
+    #[tokio::test]
+    async fn undecodable_request_is_logged_escaped() {
+        // A sign request whose key blob names an escape sequence as its
+        // algorithm: the decoding error quotes it.
+        let label = "\x1b[2K\x1b]52;c;aGk=\x07";
+        let mut blob = Vec::new();
+        label.as_bytes().encode(&mut blob).unwrap();
+        let mut body = vec![13]; // SSH_AGENTC_SIGN_REQUEST
+        blob.encode(&mut body).unwrap();
+        let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+        frame.extend(&body);
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        client.write_all(&frame).await.unwrap();
+        let e = read_request(&mut server, &AGENT_LIMITS).await.unwrap_err();
+        assert!(e.to_string().contains(label), "{e}");
+
+        // What `listen` logs for it.
+        let line = crate::logging::line(format_args!("Connection ended: {e}"));
+        assert!(
+            line.contains("\\u{1b}[2K\\u{1b}]52;c;aGk=\\u{7}"),
+            "{line:?}"
+        );
+        assert_eq!(line.matches(char::is_control).collect::<String>(), "\n");
+    }
 }

@@ -1,5 +1,6 @@
 //! Log line formatting for the `log!` macro: a local timestamp in front,
-//! except when stderr is the journal, which stamps lines itself.
+//! except when stderr is the journal, which stamps lines itself, and the
+//! message's control characters escaped.
 
 use std::ffi::OsStr;
 use std::fmt;
@@ -9,6 +10,8 @@ use std::os::fd::AsFd;
 use std::os::unix::fs::MetadataExt;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::agent::sanitize;
 
 static STAMPED: OnceLock<bool> = OnceLock::new();
 
@@ -28,11 +31,15 @@ pub fn init() -> bool {
     })
 }
 
-/// `args` as one log line, newline included.
+/// `args` as one log line, newline included. The message goes through
+/// [`sanitize`]: it can quote a peer's bytes (a library error naming what it
+/// couldn't decode, say), which must not reach the terminal that shows the
+/// approval prompts as escape sequences or line breaks.
 pub fn line(args: fmt::Arguments) -> String {
+    let message = sanitize(&args.to_string());
     match init().then(timestamp).flatten() {
-        Some(stamp) => format!("{stamp} {args}\n"),
-        None => format!("{args}\n"),
+        Some(stamp) => format!("{stamp} {message}\n"),
+        None => format!("{message}\n"),
     }
 }
 
@@ -136,5 +143,20 @@ mod tests {
     fn line_ends_with_the_message_and_a_newline() {
         let line = line(format_args!("Approved {}", "x"));
         assert!(line.ends_with("Approved x\n"), "{line:?}");
+    }
+
+    #[test]
+    fn line_escapes_control_characters_in_the_message() {
+        let quoted = "\x1b[2K\x1b]52;c;aGk=\x07\r\nfake\u{202E}";
+        let line = line(format_args!("Connection ended: invalid label: '{quoted}'"));
+        assert!(
+            line.ends_with(
+                "Connection ended: invalid label: \
+                 '\\u{1b}[2K\\u{1b}]52;c;aGk=\\u{7}\\u{d}\\u{a}fake\\u{202e}'\n"
+            ),
+            "{line:?}"
+        );
+        // The newline at the end is the only control character left.
+        assert_eq!(line.matches(char::is_control).collect::<String>(), "\n");
     }
 }
