@@ -350,12 +350,19 @@ async fn hung_up(client: Option<&OwnedFd>) {
     }
 }
 
+/// Why a request for a key of type `algorithm` can't be served, if it
+/// can't. Keys that can't sign at all are refused when loaded
+/// ([`keys::unsignable`]); checked again here, before the prompt, in case
+/// one gets in some other way.
+///
 /// `ssh-key` signs RSA only with SHA-512, so an RSA request must ask for
 /// `rsa-sha2-512`; answering a SHA-1 or SHA-256 request with it would just
 /// fail verification on the other end.
 fn unsupported(algorithm: Algorithm, flags: u32) -> Option<&'static str> {
-    (algorithm.is_rsa() && flags & RSA_SHA2_512 == 0)
-        .then_some("RSA signature requested without rsa-sha2-512 (use an Ed25519 key)")
+    keys::unsignable(&algorithm).or_else(|| {
+        (algorithm.is_rsa() && flags & RSA_SHA2_512 == 0)
+            .then_some("RSA signature requested without rsa-sha2-512 (use an Ed25519 key)")
+    })
 }
 
 /// The process on the other end of the socket, from `SO_PEERCRED` at connect
@@ -547,6 +554,22 @@ mod tests {
         let mut conn = connect(vec![loaded], prompter.clone());
 
         assert!(conn.sign(request(&other)).await.is_err());
+        assert!(prompter.asked().is_empty());
+    }
+
+    /// Loading refuses such keys; this is the backstop, should one get in.
+    #[tokio::test]
+    async fn key_that_cannot_sign_is_refused_without_prompting() {
+        let key = KeyEntry {
+            private_key: keys::testing::security_key("token"),
+            expires_at: keys::now() + Duration::from_secs(60),
+        };
+        let mut request = request(&key);
+        request.flags = RSA_SHA2_512;
+        let prompter = Arc::new(ScriptedPrompter::with_confirms([true]));
+        let mut conn = connect(vec![key], prompter.clone());
+
+        assert!(conn.sign(request).await.is_err());
         assert!(prompter.asked().is_empty());
     }
 

@@ -218,7 +218,7 @@ mod tests {
     use crate::approve::{self, ApproveClients, Event, Reply};
     use crate::approver;
     use crate::keys::testing::entry;
-    use crate::keys::{KeyEntry, TtlPolicy};
+    use crate::keys::{self, KeyEntry, TtlPolicy};
     use crate::prompt::Prompter;
     use crate::prompt::testing::{ApprovesAfter, ScriptedPrompter};
     use crate::routing::Router;
@@ -227,8 +227,9 @@ mod tests {
     use ssh_agent_lib::agent::Session;
     use ssh_agent_lib::client::Client;
     use ssh_agent_lib::proto::{
-        AddIdentity, AddIdentityConstrained, Extension, KeyConstraint, PrivateCredential,
-        RemoveIdentity, Request, Response, SignRequest,
+        AddIdentity, AddIdentityConstrained, AddSmartcardKeyConstrained, Extension, KeyConstraint,
+        PrivateCredential, PrivateKeyData, RemoveIdentity, Request, Response, SignRequest,
+        SmartcardKey,
     };
     use ssh_key::public::KeyData;
     use std::path::PathBuf;
@@ -852,6 +853,81 @@ mod tests {
                 Ok(Response::Failure)
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn certificates_are_refused() {
+        let running = Running::start(Vec::new(), Arc::new(ScriptedPrompter::default()));
+        let mut control = running.control().await;
+        let key = entry("certified", Duration::ZERO);
+        let ca = entry("ca", Duration::ZERO);
+        let mut builder =
+            ssh_key::certificate::Builder::new(vec![0; 16], public(&key), 0, i64::MAX as u64)
+                .unwrap();
+        builder.all_principals_valid().unwrap();
+        let certificate = builder.sign(&ca.private_key).unwrap();
+
+        let add = Request::AddIdentity(AddIdentity {
+            credential: PrivateCredential::Cert {
+                algorithm: key.private_key.algorithm(),
+                certificate: Box::new(certificate),
+                privkey: PrivateKeyData::Ed25519(
+                    key.private_key.key_data().ed25519().unwrap().clone(),
+                ),
+                comment: "certified".into(),
+            },
+        });
+        let response = control.handle(add).await;
+        assert!(matches!(response, Ok(Response::Failure)), "{response:?}");
+        assert!(running.listed().await.is_empty());
+    }
+
+    /// `ssh-add` of a key we can't sign with (an `ed25519-sk` key, say) is
+    /// refused, rather than having every request approved and then fail.
+    #[tokio::test]
+    async fn keys_that_cannot_sign_are_refused() {
+        let running = Running::start(Vec::new(), Arc::new(ScriptedPrompter::default()));
+        let mut control = running.control().await;
+        for private_key in [
+            keys::testing::security_key("token"),
+            keys::testing::opaque_key("opaque"),
+        ] {
+            let key = KeyEntry {
+                private_key,
+                expires_at: Duration::ZERO,
+            };
+            for constraints in [Vec::new(), vec![KeyConstraint::Lifetime(60)]] {
+                let response = control.handle(add_request(&key, constraints)).await;
+                assert!(
+                    matches!(response, Ok(Response::Failure)),
+                    "{}: {response:?}",
+                    key.private_key.algorithm()
+                );
+            }
+        }
+        assert!(running.listed().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn smartcard_keys_are_refused() {
+        let running = Running::start(Vec::new(), Arc::new(ScriptedPrompter::default()));
+        let mut control = running.control().await;
+        let card = || SmartcardKey {
+            id: "/usr/lib64/opensc-pkcs11.so".into(),
+            pin: "123456".to_owned().into(),
+        };
+        for request in [
+            Request::AddSmartcardKey(card()),
+            Request::AddSmartcardKeyConstrained(AddSmartcardKeyConstrained {
+                key: card(),
+                constraints: vec![KeyConstraint::Lifetime(60)],
+            }),
+            Request::RemoveSmartcardKey(card()),
+        ] {
+            let response = control.handle(request).await;
+            assert!(matches!(response, Ok(Response::Failure)), "{response:?}");
+        }
+        assert!(running.listed().await.is_empty());
     }
 
     /// What `ssh` sends before forwarding a connection (or using it for a

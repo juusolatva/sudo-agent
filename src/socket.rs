@@ -48,11 +48,24 @@ pub fn choose_path(
 /// creating its parent directory with mode `0700` and verifying
 /// ownership/permissions if it already exists.
 pub fn default_path(name: &str) -> io::Result<PathBuf> {
-    let (dir, file_name) = match env_dir("XDG_RUNTIME_DIR") {
+    let (dir, file_name) = default_location(name, |var| std::env::var_os(var), hostname)?;
+    ensure_private_dir(&dir)?;
+    Ok(dir.join(file_name))
+}
+
+/// The directory and file name of the default `name` socket, given a way to
+/// read environment variables (`var`) and the hostname. Touches nothing.
+fn default_location(
+    name: &str,
+    var: impl Fn(&str) -> Option<OsString>,
+    hostname: impl FnOnce() -> Option<String>,
+) -> io::Result<(PathBuf, String)> {
+    let dir = |variable: &str| env_dir(var(variable));
+    let location = match dir("XDG_RUNTIME_DIR") {
         Some(runtime) => (runtime.join(APP_DIR), format!("{name}.sock")),
         None => {
-            let cache = env_dir("XDG_CACHE_HOME")
-                .or_else(|| env_dir("HOME").map(|home| home.join(".cache")))
+            let cache = dir("XDG_CACHE_HOME")
+                .or_else(|| dir("HOME").map(|home| home.join(".cache")))
                 .ok_or_else(|| {
                     io::Error::new(
                         ErrorKind::NotFound,
@@ -69,9 +82,7 @@ pub fn default_path(name: &str) -> io::Result<PathBuf> {
             (cache.join(APP_DIR), file_name)
         }
     };
-
-    ensure_private_dir(&dir)?;
-    Ok(dir.join(file_name))
+    Ok(location)
 }
 
 /// Binds the agent socket at `path`, replacing a stale socket left behind by a
@@ -208,17 +219,20 @@ fn ensure_private_dir(dir: &Path) -> io::Result<()> {
     }
 }
 
-/// Reads an environment variable holding a directory, ignoring unset, empty
-/// or relative values (as the XDG Base Directory spec requires).
-fn env_dir(var: &str) -> Option<PathBuf> {
-    std::env::var_os(var)
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
+/// The value of an environment variable holding a directory, ignoring unset,
+/// empty or relative values (as the XDG Base Directory spec requires).
+fn env_dir(value: Option<OsString>) -> Option<PathBuf> {
+    value.map(PathBuf::from).filter(|path| path.is_absolute())
 }
 
 fn hostname() -> Option<String> {
-    let host = fs::read_to_string("/proc/sys/kernel/hostname").ok()?;
-    let host = host.trim();
+    usable_hostname(&fs::read_to_string("/proc/sys/kernel/hostname").ok()?)
+}
+
+/// `raw` trimmed, unless that leaves nothing or something that can't be part
+/// of a file name.
+fn usable_hostname(raw: &str) -> Option<String> {
+    let host = raw.trim();
     (!host.is_empty() && !host.contains('/')).then(|| host.to_owned())
 }
 
@@ -274,5 +288,173 @@ mod tests {
         fs::write(&path, "someone else's").unwrap();
         drop(file);
         assert!(path.exists());
+    }
+
+    fn mode(path: &Path) -> u32 {
+        fs::symlink_metadata(path).unwrap().mode() & 0o777
+    }
+
+    #[test]
+    fn missing_directory_is_created_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let private = dir.path().join("cache").join(APP_DIR);
+        ensure_private_dir(&private).unwrap();
+        assert!(private.is_dir());
+        assert_eq!(mode(&private), 0o700);
+        // And an existing private one is accepted as it is.
+        ensure_private_dir(&private).unwrap();
+    }
+
+    #[test]
+    fn directory_open_to_others_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = dir.path().join(APP_DIR);
+        fs::create_dir(&open).unwrap();
+        for mode in [0o750, 0o705, 0o755, 0o777] {
+            fs::set_permissions(&open, Permissions::from_mode(mode)).unwrap();
+            let err = ensure_private_dir(&open).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::PermissionDenied, "mode {mode:o}");
+        }
+        // Refusing doesn't tighten the mode behind the user's back.
+        assert_eq!(mode(&open), 0o777);
+    }
+
+    #[test]
+    fn symlink_or_file_instead_of_a_directory_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("elsewhere");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, Permissions::from_mode(0o700)).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let file = dir.path().join("file");
+        fs::write(&file, "").unwrap();
+
+        for path in [&link, &file] {
+            let err = ensure_private_dir(path).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                ErrorKind::PermissionDenied,
+                "{}",
+                path.display()
+            );
+            assert!(err.to_string().contains("is not a directory"), "{err}");
+        }
+    }
+
+    #[test]
+    fn runtime_dir_beats_cache_home_beats_home() {
+        let place = |vars: &[(&str, &str)], host: Option<&str>| {
+            let vars: Vec<(String, OsString)> = vars
+                .iter()
+                .map(|(k, v)| (k.to_string(), OsString::from(v)))
+                .collect();
+            let var = |name: &str| vars.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
+            let (dir, file) = default_location("agent", var, || host.map(String::from))?;
+            Ok::<_, io::Error>(dir.join(file))
+        };
+        let path = |s: &str| PathBuf::from(s);
+        let all = [
+            ("XDG_RUNTIME_DIR", "/run/user/1000"),
+            ("XDG_CACHE_HOME", "/home/me/cache"),
+            ("HOME", "/home/me"),
+        ];
+
+        // The runtime directory is per-machine already: no hostname.
+        let got = place(&all, Some("laptop")).unwrap();
+        assert_eq!(got, path("/run/user/1000/sudo-agent/agent.sock"));
+        let got = place(&all[1..], Some("laptop")).unwrap();
+        assert_eq!(got, path("/home/me/cache/sudo-agent/agent-laptop.sock"));
+        let got = place(&all[2..], Some("laptop")).unwrap();
+        assert_eq!(got, path("/home/me/.cache/sudo-agent/agent-laptop.sock"));
+        let got = place(&all[2..], None).unwrap();
+        assert_eq!(got, path("/home/me/.cache/sudo-agent/agent.sock"));
+
+        // Empty and relative values count as unset.
+        let ignored = [
+            ("XDG_RUNTIME_DIR", ""),
+            ("XDG_CACHE_HOME", "relative/cache"),
+            ("HOME", "/home/me"),
+        ];
+        let got = place(&ignored, None).unwrap();
+        assert_eq!(got, path("/home/me/.cache/sudo-agent/agent.sock"));
+
+        let err = place(&[("HOME", "")], None).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+        assert!(err.to_string().contains("--agent-socket"), "{err}");
+    }
+
+    #[test]
+    fn hostname_must_make_a_file_name() {
+        assert_eq!(usable_hostname("laptop\n").as_deref(), Some("laptop"));
+        assert_eq!(usable_hostname(" \n"), None);
+        assert_eq!(usable_hostname("../../etc"), None);
+    }
+
+    /// A socket left behind by a run that didn't clean up (`std`'s listener
+    /// doesn't remove its file).
+    fn dead_socket(path: &Path) {
+        drop(std::os::unix::net::UnixListener::bind(path).unwrap());
+        assert!(fs::symlink_metadata(path).unwrap().file_type().is_socket());
+    }
+
+    #[tokio::test]
+    async fn stale_socket_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.sock");
+        dead_socket(&path);
+        let (_listener, _file) = bind(&path).unwrap();
+        tokio::net::UnixStream::connect(&path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_socket_is_not_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.sock");
+        let (_listener, _file) = bind(&path).unwrap();
+        let err = bind(&path).err().unwrap();
+        assert_eq!(err.kind(), ErrorKind::AddrInUse);
+        // The first agent still answers.
+        tokio::net::UnixStream::connect(&path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn something_else_at_the_path_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("agent.sock");
+        fs::write(&file, "not a socket").unwrap();
+        // A symlink to a dead socket isn't followed, nor removed.
+        let socket = dir.path().join("dead.sock");
+        dead_socket(&socket);
+        let link = dir.path().join("link.sock");
+        std::os::unix::fs::symlink(&socket, &link).unwrap();
+
+        for path in [&file, &link] {
+            let err = bind(path).err().unwrap();
+            assert_eq!(err.kind(), ErrorKind::AlreadyExists, "{}", path.display());
+        }
+        assert_eq!(fs::read_to_string(&file).unwrap(), "not a socket");
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            fs::symlink_metadata(&socket)
+                .unwrap()
+                .file_type()
+                .is_socket()
+        );
+    }
+
+    #[tokio::test]
+    async fn too_long_path_is_refused_before_touching_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = "s".repeat(SUN_PATH_LEN);
+        let path = dir.path().join(name);
+        let err = bind(&path).err().unwrap();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(!path.exists());
     }
 }

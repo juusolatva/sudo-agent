@@ -225,6 +225,9 @@ impl ControlConnection {
             Ok(key) => key,
             Err(e) => return self.refuse_key(&comment, &format!("unusable key: {e}")),
         };
+        if let Some(reason) = keys::unsignable(&private_key.algorithm()) {
+            return self.refuse_key(&comment, reason);
+        }
 
         let (ttl, capped) = self.ttl.ttl(lifetime);
         let description = format!(

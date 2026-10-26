@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use ssh_key::PrivateKey;
+use ssh_key::{Algorithm, PrivateKey};
 
 use crate::prompt::Prompter;
 
@@ -89,6 +89,22 @@ pub fn purge_expired(keys: &Mutex<Vec<KeyEntry>>, now: Duration) -> Vec<String> 
     expired
 }
 
+/// Why keys of type `algorithm` can't be used, if they can't: `ssh-key`, as
+/// built here (`crypto`), signs only with Ed25519, ECDSA and RSA keys. Such
+/// keys are refused when loaded or added, so no one is asked to approve a
+/// signature that would then fail. Security keys (`sk-…`) would need the
+/// hardware token.
+pub fn unsignable(algorithm: &Algorithm) -> Option<&'static str> {
+    match algorithm {
+        Algorithm::Ed25519 | Algorithm::Ecdsa { .. } | Algorithm::Rsa { .. } => None,
+        Algorithm::SkEd25519 | Algorithm::SkEcdsaSha2NistP256 => {
+            Some("security keys (sk-…) aren't supported (use an Ed25519 key)")
+        }
+        Algorithm::Dsa => Some("DSA keys aren't supported (use an Ed25519 key)"),
+        _ => Some("unsupported key type (use an Ed25519 key)"),
+    }
+}
+
 /// Reads an OpenSSH private key, asking for its passphrase if it is
 /// encrypted. The TTL starts once the key is decrypted.
 pub async fn load(path: &Path, ttl: Duration, prompter: &dyn Prompter) -> io::Result<KeyEntry> {
@@ -96,6 +112,13 @@ pub async fn load(path: &Path, ttl: Duration, prompter: &dyn Prompter) -> io::Re
         .await
         .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
     let key = PrivateKey::from_openssh(pem).map_err(|e| key_error(path, e))?;
+    // The algorithm is in the clear, so this is known before the passphrase.
+    if let Some(reason) = unsignable(&key.algorithm()) {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            format!("{}: {reason}", path.display()),
+        ));
+    }
     let private_key = if key.is_encrypted() {
         decrypt(&key, path, prompter).await?
     } else {
@@ -197,6 +220,14 @@ mod tests {
     fn write_key(name: &str, passphrase: Option<&str>) -> (tempfile::TempDir, PathBuf) {
         let mut key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
         key.set_comment(name);
+        write(key, name, passphrase)
+    }
+
+    fn write(
+        mut key: PrivateKey,
+        name: &str,
+        passphrase: Option<&str>,
+    ) -> (tempfile::TempDir, PathBuf) {
         if let Some(passphrase) = passphrase {
             key = key.encrypt(&mut OsRng, passphrase).unwrap();
         }
@@ -204,6 +235,80 @@ mod tests {
         let path = dir.path().join(name);
         key.write_openssh_file(&path, LineEnding::LF).unwrap();
         (dir, path)
+    }
+
+    #[test]
+    fn only_keys_ssh_key_signs_with_are_usable() {
+        use ssh_key::{EcdsaCurve, HashAlg};
+        let usable = [
+            Algorithm::Ed25519,
+            Algorithm::Ecdsa {
+                curve: EcdsaCurve::NistP256,
+            },
+            Algorithm::Ecdsa {
+                curve: EcdsaCurve::NistP384,
+            },
+            Algorithm::Ecdsa {
+                curve: EcdsaCurve::NistP521,
+            },
+            Algorithm::Rsa { hash: None },
+            Algorithm::Rsa {
+                hash: Some(HashAlg::Sha512),
+            },
+        ];
+        for algorithm in usable {
+            assert_eq!(unsignable(&algorithm), None, "{algorithm}");
+        }
+        let unusable = [
+            (Algorithm::SkEd25519, "security keys"),
+            (Algorithm::SkEcdsaSha2NistP256, "security keys"),
+            (Algorithm::Dsa, "DSA"),
+            (
+                Algorithm::new("unknown@example.com").unwrap(),
+                "unsupported",
+            ),
+        ];
+        for (algorithm, reason) in unusable {
+            let got = unsignable(&algorithm);
+            assert!(
+                got.is_some_and(|got| got.contains(reason)),
+                "{algorithm}: {got:?}"
+            );
+        }
+    }
+
+    /// The list above matches what `ssh-key` does, for the kinds of key
+    /// that are cheap to make (no RSA in debug builds; DSA needs a feature
+    /// we don't build).
+    #[test]
+    fn usable_means_ssh_key_can_sign() {
+        use signature::Signer;
+        let ecdsa = Algorithm::Ecdsa {
+            curve: ssh_key::EcdsaCurve::NistP256,
+        };
+        let keys = [
+            PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap(),
+            PrivateKey::random(&mut OsRng, ecdsa).unwrap(),
+            testing::security_key("sk"),
+            testing::opaque_key("opaque"),
+        ];
+        for key in keys {
+            let signs = Signer::<ssh_key::Signature>::try_sign(&key, b"data").is_ok();
+            let usable = unsignable(&key.algorithm()).is_none();
+            assert_eq!(signs, usable, "{}", key.algorithm());
+        }
+    }
+
+    #[tokio::test]
+    async fn security_key_is_refused_before_its_passphrase() {
+        let (_dir, path) = write(testing::security_key("token"), "token", Some("right"));
+        let prompter = ScriptedPrompter::with_passphrases(["right"]);
+        let err = load(&path, TTL, &prompter).await.err().unwrap();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        let message = err.to_string();
+        assert!(message.contains("security keys"), "{message}");
+        assert!(message.contains(&*path.to_string_lossy()), "{message}");
+        assert!(prompter.asked().is_empty());
     }
 
     #[tokio::test]
@@ -330,5 +435,25 @@ pub mod testing {
             private_key,
             expires_at: now() + ttl,
         }
+    }
+
+    /// What `ssh-keygen -t ed25519-sk` writes: a public key and a handle
+    /// for the token, which holds the private half.
+    pub fn security_key(comment: &str) -> PrivateKey {
+        let ed25519 = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let public = ssh_key::public::SkEd25519::new(
+            *ed25519.public_key().key_data().ed25519().unwrap(),
+            "ssh:",
+        );
+        let keypair = ssh_key::private::SkEd25519::new(public, 0x01, vec![7; 64]).unwrap();
+        PrivateKey::new(keypair.into(), comment).unwrap()
+    }
+
+    /// A key of an algorithm `ssh-key` doesn't know, kept as opaque bytes.
+    pub fn opaque_key(comment: &str) -> PrivateKey {
+        let algorithm = Algorithm::new("unknown@example.com").unwrap();
+        let public = ssh_key::public::OpaquePublicKey::new(vec![1; 32], algorithm);
+        let keypair = ssh_key::private::OpaqueKeypair::new(vec![2; 32], public);
+        PrivateKey::new(ssh_key::private::KeypairData::Other(keypair), comment).unwrap()
     }
 }
