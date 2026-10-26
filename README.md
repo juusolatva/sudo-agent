@@ -1,6 +1,7 @@
 # sudo-agent
 
 [![crates.io](https://img.shields.io/crates/v/sudo-agent.svg)](https://crates.io/crates/sudo-agent)
+[![Rust](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Fjuusolatva%2Fsudo-agent%2Fmain%2FCargo.toml&query=%24.package.rust-version&label=rust&suffix=%2B)](https://github.com/juusolatva/sudo-agent/actions/workflows/build.yml)
 [![Build](https://github.com/juusolatva/sudo-agent/actions/workflows/build.yml/badge.svg)](https://github.com/juusolatva/sudo-agent/actions/workflows/build.yml)
 [![Security](https://github.com/juusolatva/sudo-agent/actions/workflows/security.yml/badge.svg)](https://github.com/juusolatva/sudo-agent/actions/workflows/security.yml)
 [![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=juusolatva_sudo-agent&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=juusolatva_sudo-agent)
@@ -70,6 +71,7 @@ cargo install --locked sudo-agent
 
 `--locked` builds with the dependency versions this release was tested and
 audited with. Or from a checkout: `cargo build --release --locked`.
+Building needs Rust 1.88 or newer.
 
 ## Usage
 
