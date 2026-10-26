@@ -218,7 +218,7 @@ mod tests {
     use crate::approve::{self, ApproveClients, Event, Reply};
     use crate::approver;
     use crate::keys::testing::entry;
-    use crate::keys::{KeyEntry, TtlPolicy};
+    use crate::keys::{self, KeyEntry, TtlPolicy};
     use crate::prompt::Prompter;
     use crate::prompt::testing::{ApprovesAfter, ScriptedPrompter};
     use crate::routing::Router;
@@ -879,6 +879,32 @@ mod tests {
         });
         let response = control.handle(add).await;
         assert!(matches!(response, Ok(Response::Failure)), "{response:?}");
+        assert!(running.listed().await.is_empty());
+    }
+
+    /// `ssh-add` of a key we can't sign with (an `ed25519-sk` key, say) is
+    /// refused, rather than having every request approved and then fail.
+    #[tokio::test]
+    async fn keys_that_cannot_sign_are_refused() {
+        let running = Running::start(Vec::new(), Arc::new(ScriptedPrompter::default()));
+        let mut control = running.control().await;
+        for private_key in [
+            keys::testing::security_key("token"),
+            keys::testing::opaque_key("opaque"),
+        ] {
+            let key = KeyEntry {
+                private_key,
+                expires_at: Duration::ZERO,
+            };
+            for constraints in [Vec::new(), vec![KeyConstraint::Lifetime(60)]] {
+                let response = control.handle(add_request(&key, constraints)).await;
+                assert!(
+                    matches!(response, Ok(Response::Failure)),
+                    "{}: {response:?}",
+                    key.private_key.algorithm()
+                );
+            }
+        }
         assert!(running.listed().await.is_empty());
     }
 

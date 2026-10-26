@@ -296,7 +296,9 @@ the requester asks for `rsa-sha2-512` signatures, which older
 `rsa` crate, which has an unfixed timing side-channel advisory
 ([RUSTSEC-2023-0071]; our advisory: [GHSA-wwj9-h88v-6483]). Every
 signature waits for your approval, which makes the timing hard to measure
-from a server (ECDSA likewise), but prefer Ed25519.
+from a server (ECDSA likewise), but prefer Ed25519. Security keys
+(`ed25519-sk`, `ecdsa-sk`) and DSA keys aren't supported: `--key` and
+`ssh-add` refuse them.
 
 [RUSTSEC-2023-0071]: https://rustsec.org/advisories/RUSTSEC-2023-0071
 [GHSA-wwj9-h88v-6483]: https://github.com/juusolatva/sudo-agent/security/advisories/GHSA-wwj9-h88v-6483
