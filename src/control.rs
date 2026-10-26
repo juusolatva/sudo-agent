@@ -4,7 +4,7 @@
 //! through SSH agent forwarding, where a server could add keys or answer
 //! approvals, so every connection is checked three ways; see [`refusal`] and
 //! [`ControlConnection::extension`]. Unlike `agent.sock`, it signs any data
-//! (still only once approved), not just `sudo` challenges.
+//! (still only once approved), not just `sudo` challenges and SSH logins.
 
 use std::path::Path;
 use std::sync::Arc;

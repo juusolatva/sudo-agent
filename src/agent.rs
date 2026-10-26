@@ -176,20 +176,21 @@ pub struct Connection {
     /// while its request waits; see [`hung_up`]. `None` if it couldn't be
     /// duplicated, which just means a stale request waits until answered.
     client: Option<OwnedFd>,
-    /// Signs only `pam_ssh_agent_auth` challenges ([`Payload::Sudo`]), as on
-    /// `agent.sock`, which servers reach through forwarding: anything else
-    /// (an SSH login elsewhere, say) is refused before prompting.
-    sudo_only: bool,
+    /// Signs only what a forwarded agent is for ([`Payload::forwardable`]),
+    /// as on `agent.sock`, which servers reach through forwarding: anything
+    /// else (a `git` signature, say) is refused before prompting.
+    forwarded: bool,
 }
 
 impl Connection {
-    /// A connection to `agent.sock`: signs only `sudo` challenges.
+    /// A connection to `agent.sock`: signs only `sudo` challenges and SSH
+    /// logins.
     pub fn new(agent: SudoAgent, socket: &UnixStream) -> Self {
         Self {
             agent,
             peer: Peer::of(socket),
             client: socket.as_fd().try_clone_to_owned().ok(),
-            sudo_only: true,
+            forwarded: true,
         }
     }
 
@@ -197,7 +198,7 @@ impl Connection {
     /// approved.
     pub fn control(agent: SudoAgent, socket: &UnixStream) -> Self {
         Self {
-            sudo_only: false,
+            forwarded: false,
             ..Self::new(agent, socket)
         }
     }
@@ -311,9 +312,9 @@ impl Session for Connection {
             Err(reason) => return self.refuse(&reason),
         };
         let payload = Payload::of(&request.data);
-        if self.sudo_only && !matches!(payload, Payload::Sudo { .. }) {
+        if self.forwarded && !payload.forwardable() {
             return self.refuse(&format!(
-                "agent.sock signs only sudo (pam_ssh_agent_auth) challenges, not {payload}"
+                "agent.sock signs only sudo (pam_ssh_agent_auth) challenges and SSH logins, not {payload}"
             ));
         }
 
@@ -411,8 +412,9 @@ fn unsupported(algorithm: Algorithm, flags: u32) -> Option<&'static str> {
 }
 
 /// What a signature request asks to have signed, as far as its data tells.
-/// Named in the prompt; `agent.sock` signs only [`Payload::Sudo`]. The text
-/// held is from the request, already made safe to show ([`shown`]).
+/// Named in the prompt; `agent.sock` signs only the
+/// [`forwardable`](Self::forwardable) kinds. The text held is from the
+/// request, already made safe to show ([`shown`]).
 #[derive(Debug, PartialEq)]
 enum Payload {
     /// A `pam_ssh_agent_auth` challenge, from `sudo` run by `user`.
@@ -432,6 +434,14 @@ impl Payload {
             return Self::Sshsig { namespace };
         }
         Self::userauth(data).unwrap_or(Self::Unknown)
+    }
+
+    /// Whether `agent.sock` signs it: a `sudo` challenge, or an SSH login
+    /// (onward `ssh`, `scp` or `git push` from the server). Both are still
+    /// approved one by one, and the prompt says which it is, so a login
+    /// swapped in for the `sudo` the user just ran stands out.
+    fn forwardable(&self) -> bool {
+        matches!(self, Self::Sudo { .. } | Self::Login { .. })
     }
 
     /// Reads an SSH public key user authentication request (RFC 4252 § 7),
@@ -676,7 +686,7 @@ mod tests {
             agent: SudoAgent::new(Arc::new(Mutex::new(keys)), Router::only(prompter)),
             peer: Peer::default(),
             client: None,
-            sudo_only: true,
+            forwarded: true,
         }
     }
 
@@ -701,17 +711,32 @@ mod tests {
         );
     }
 
-    /// On `agent.sock` a hostile server could otherwise have a login to
-    /// another host, or a `git` signature, approved as if it were `sudo`.
+    /// On `agent.sock` a hostile server could otherwise have a `git`
+    /// signature approved as if it were `sudo`. Logins are signed, saying
+    /// so in the prompt.
     #[tokio::test]
-    async fn only_sudo_challenges_are_signed_on_the_agent_socket() {
+    async fn agent_socket_signs_only_sudo_challenges_and_logins() {
         let key = entry("laptop", Duration::from_secs(60));
         let key_data = key.private_key.public_key().key_data().clone();
         let prompter = Arc::new(ScriptedPrompter::with_confirms([true; 4]));
         let mut conn = connect(vec![key], prompter.clone());
 
+        let login = testing::ssh_login(&key_data, "excali");
+        let request = SignRequest {
+            credential: key_data.clone().into(),
+            data: login.clone(),
+            flags: 0,
+        };
+        let signature = conn.sign(request).await.unwrap();
+        key_data.verify(&login, &signature).unwrap();
+        let asked = prompter.asked();
+        assert_eq!(asked.len(), 1);
+        assert!(
+            asked[0].contains("\n  signing: an SSH login as user excali\n"),
+            "{asked:?}"
+        );
+
         for data in [
-            testing::ssh_login(&key_data, "excali"),
             testing::sshsig("git"),
             b"pam_ssh_agent_auth challenge".to_vec(),
             Vec::new(),
@@ -723,7 +748,8 @@ mod tests {
             };
             assert!(matches!(conn.sign(request).await, Err(AgentError::Failure)));
         }
-        assert!(prompter.asked().is_empty());
+        // Refused without asking.
+        assert_eq!(prompter.asked().len(), 1);
     }
 
     #[tokio::test]
@@ -732,7 +758,7 @@ mod tests {
         let key_data = key.private_key.public_key().key_data().clone();
         let prompter = Arc::new(ScriptedPrompter::with_confirms([true, false]));
         let mut conn = connect(vec![key], prompter.clone());
-        conn.sudo_only = false;
+        conn.forwarded = false;
 
         let login = testing::ssh_login(&key_data, "excali");
         let request = |data: &[u8]| SignRequest {
@@ -801,12 +827,20 @@ mod tests {
         let other_type = testing::userauth(51, key, "excali", "pam_ssh_agent_auth");
         assert_eq!(Payload::of(&other_type), Payload::Unknown);
 
-        assert_eq!(
-            Payload::of(&testing::ssh_login(key, "excali")),
-            Payload::Login {
-                user: "excali".into()
-            }
+        let login = || Payload::Login {
+            user: "excali".into(),
+        };
+        assert_eq!(Payload::of(&testing::ssh_login(key, "excali")), login());
+        // OpenSSH 8.9+ logs in with "publickey-hostbound-v00@openssh.com"
+        // where the server supports it.
+        let hostbound = testing::userauth_with_method(
+            USERAUTH_REQUEST,
+            key,
+            "excali",
+            "ssh-connection",
+            "publickey-hostbound-v00@openssh.com",
         );
+        assert_eq!(Payload::of(&hostbound), login());
         assert_eq!(
             Payload::of(&testing::sshsig("git")),
             Payload::Sshsig {
@@ -922,7 +956,7 @@ mod tests {
             agent: SudoAgent::new(store, Router::only(prompter)),
             peer: Peer::default(),
             client: None,
-            sudo_only: true,
+            forwarded: true,
         };
 
         assert!(matches!(conn.sign(request).await, Err(AgentError::Failure)));
@@ -963,13 +997,13 @@ mod tests {
             agent: agent.clone(),
             peer: Peer::default(),
             client: None,
-            sudo_only: true,
+            forwarded: true,
         };
         let mut b = Connection {
             agent,
             peer: Peer::default(),
             client: None,
-            sudo_only: true,
+            forwarded: true,
         };
 
         let (a, b) = tokio::join!(a.sign(first), b.sign(second));
@@ -987,7 +1021,7 @@ mod tests {
             agent,
             peer: Peer::default(),
             client: Some(ours.as_fd().try_clone_to_owned().unwrap()),
-            sudo_only: true,
+            forwarded: true,
         };
         (conn, theirs)
     }
@@ -1042,7 +1076,7 @@ mod tests {
             agent: agent.clone(),
             peer: Peer::default(),
             client: None,
-            sudo_only: true,
+            forwarded: true,
         };
         let (mut second, client) = with_client(agent);
 
@@ -1132,12 +1166,23 @@ pub mod testing {
 
     /// A public key user authentication request of message type `kind`.
     pub fn userauth(kind: u8, key: &KeyData, user: &str, service: &str) -> Vec<u8> {
+        userauth_with_method(kind, key, user, service, "publickey")
+    }
+
+    /// [`userauth`] with another method name.
+    pub fn userauth_with_method(
+        kind: u8,
+        key: &KeyData,
+        user: &str,
+        service: &str,
+        method: &str,
+    ) -> Vec<u8> {
         let mut data = Vec::new();
         [7u8; 32].as_slice().encode(&mut data).unwrap(); // session identifier
         kind.encode(&mut data).unwrap();
         user.encode(&mut data).unwrap();
         service.encode(&mut data).unwrap();
-        "publickey".encode(&mut data).unwrap();
+        method.encode(&mut data).unwrap();
         1u8.encode(&mut data).unwrap();
         key.algorithm().as_str().encode(&mut data).unwrap();
         let mut blob = Vec::new();

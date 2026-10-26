@@ -61,10 +61,11 @@ In a second terminal, log in with your normal agent but forward only
 ssh -o ForwardAgent="$XDG_RUNTIME_DIR/sudo-agent/agent.sock" <server>
 ```
 
-Don't log in with `SSH_AUTH_SOCK=<agent.sock> ssh -A <server>`. `agent.sock`
-signs only `pam_ssh_agent_auth` challenges, so it refuses the login's
-signature (`Refused …: agent.sock signs only sudo (pam_ssh_agent_auth)
-challenges, not an SSH login as user …`).
+There is an alternative: `SSH_AUTH_SOCK=<agent.sock> ssh -A <server>`.
+It also works, but then the SSH login itself asks `sudo-agent` for a
+signature, so you'll get one approval prompt for the login as well
+(`signing: an SSH login as user …`). Logins onwards from the server
+(`ssh`, `scp`, `git push`) prompt the same way.
 
 Forward `agent.sock` only, never `control.sock`. `ssh` forwards an agent only
 if it has one of its own (`SSH_AUTH_SOCK` or `IdentityAgent` set); without
@@ -346,8 +347,7 @@ against the service: all passed. Cases 36 and 38 are still to be run.
   `sudo-agent` logs nothing**: the login uses your normal agent
   (`SSH_AUTH_SOCK`), not the forwarded one, and that agent doesn't have the
   key decrypted (e.g. it was only added to `sudo-agent`). Add it to your
-  normal agent too: `sudo-agent`'s `agent.sock` doesn't sign logins (see
-  step 1).
+  normal agent too, or log in through `sudo-agent` (see step 1).
 - **`sudo-agent approve` says `refused to send approval requests (too old
   for sudo-agent approve? …)`**: usually the agent running is an older
   version (often the service's `~/.cargo/bin/sudo-agent`): install the new
