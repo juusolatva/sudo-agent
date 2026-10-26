@@ -589,8 +589,8 @@ needs an answer. Design agreed 2026-10-07; open decisions settled
    a restart, a client over SSH into the laptop; the startup lines of
    older cases brought up to date), these checkboxes. To be released as
    0.4.1 (decided 2026-10-21, not 0.5.0), so the docs reach crates.io. Cases 31, 33,
-   34, 35 and 37 passed the same day. Still to run: the server cases
-   (signing and prompting changed) and approve cases 36 and 38.
+   34, 35 and 37 passed the same day. Cases 1, 2, 24 and 36 were re-run
+   and passed on 2026-10-26 (for 0.4.3); approve case 38 is still to run.
 
 Re-run the server cases in `docs/manual-e2e.md` after 1b, 2 and 4: each
 touches signing or prompting.

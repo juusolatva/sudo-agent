@@ -57,8 +57,10 @@ ssh-add ─► control.sock ─┐                         sudo
   are discarded; anything else denies. With no answer anywhere in time, the
   request is denied.
 - **Two sockets.** `agent.sock` is the one you forward: it can only list
-  keys and ask for signatures. `control.sock` is for adding and removing
-  keys (`ssh-add`) and is never forwarded; see [Security
+  keys and ask for signatures, and it signs only `pam_ssh_agent_auth`
+  challenges and SSH logins (so `ssh`, `scp` and `git push` onwards from
+  the server work), nothing else. `control.sock` is for adding and
+  removing keys (`ssh-add`) and is never forwarded; see [Security
   notes](#security-notes).
 - **One request at a time.** Concurrent requests queue, and every approval
   and refusal is logged.
@@ -299,15 +301,17 @@ Then `sudo` on the server makes the approval prompt appear on your machine:
 ```
 Signature request from pid 402599, uid 1000: ssh server
   key: laptop (SHA256:…), 12m30s left
+  signing: a sudo challenge for user excali
 Allow? [y/N] y
-Approved (terminal) signature request from pid 402599, uid 1000: ssh server
+Approved (terminal) signature request for a sudo challenge for user excali with key laptop (SHA256:…) from pid 402599, uid 1000: ssh server
 ```
 
 The popup shows the same text, says when it closes by itself
 (`--pinentry-timeout`), and has Allow and Deny buttons.
 
 The prompt names the local `ssh` process that carries the forwarded
-request. It can't see which command runs on the server.
+request, and the user the challenge is for. It can't see which command
+runs on the server.
 
 **Key types**: Ed25519 is recommended and the one tested end to end.
 ECDSA should work but is untested, and its signing uses `crypto-bigint`
@@ -361,6 +365,15 @@ asking for a password.
   through the forwarded socket, but each one needs your approval, and you
   see it happen. They can't add, remove or lock keys through it: the agent
   refuses that on `agent.sock` and logs the attempt.
+- Every prompt says what is being signed: `a sudo challenge for user …`
+  or `an SSH login as user …`. Read it: a server you're on could send a
+  login to another host in place of the `sudo` you just ran, and the
+  prompt is where that shows. (A `sudo` challenge can't be replayed as a
+  login.)
+- `agent.sock` signs only `pam_ssh_agent_auth` challenges and SSH logins.
+  Anything else, such as an `ssh-keygen -Y sign` (`git`) signature, is
+  refused before you're asked, and logged. `ssh-keygen -Y sign` works
+  against `control.sock`, still only once you approve.
 - `control.sock` must never be forwarded, and the agent makes sure a
   mistake there (say, a copy-pasted `ForwardAgent` line) doesn't hand a
   server control over your keys. It accepts only your own user, and

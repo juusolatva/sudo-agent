@@ -21,7 +21,7 @@ use crate::control::ControlAgent;
 /// The agent's listening sockets.
 pub struct Listeners {
     /// `agent.sock`, the one forwarded: listing and approval-gated signing
-    /// only.
+    /// of `sudo` challenges and SSH logins only.
     pub agent: UnixListener,
     /// `control.sock`, never forwarded: also adding and removing keys, and
     /// `sudo-agent approve`.
@@ -215,6 +215,7 @@ async fn serve_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::testing::{ssh_login, sshsig, sudo_challenge};
     use crate::approve::{self, ApproveClients, Event, Reply};
     use crate::approver;
     use crate::keys::testing::entry;
@@ -240,8 +241,6 @@ mod tests {
     use tokio::sync::oneshot;
     use tokio::task::JoinHandle;
     use tokio::time::timeout;
-
-    const CHALLENGE: &[u8] = b"pam_ssh_agent_auth challenge";
 
     /// A TTL policy for tests that don't look at TTLs.
     const LONG: TtlPolicy = TtlPolicy {
@@ -477,10 +476,15 @@ mod tests {
         }
     }
 
+    /// What `pam_ssh_agent_auth` sends when `sudo` asks for `key`.
     fn sign_request(key: &KeyData) -> SignRequest {
+        signing(key, sudo_challenge(key, "excali"))
+    }
+
+    fn signing(key: &KeyData, data: Vec<u8>) -> SignRequest {
         SignRequest {
             credential: key.clone().into(),
-            data: CHALLENGE.to_vec(),
+            data,
             flags: 0,
         }
     }
@@ -527,14 +531,55 @@ mod tests {
         let prompter = Arc::new(ScriptedPrompter::with_confirms([true]));
         let running = Running::start(vec![key], prompter.clone());
 
-        let signature = running
-            .client()
-            .await
-            .sign(sign_request(&public))
+        let request = sign_request(&public);
+        let challenge = request.data.clone();
+        let signature = running.client().await.sign(request).await.unwrap();
+        public.verify(&challenge, &signature).unwrap();
+        assert_eq!(prompter.asked().len(), 1);
+    }
+
+    /// Through forwarding, a server could otherwise have a `git` signature
+    /// approved as if it were `sudo`. Logins (onward `ssh`, `scp`, `git
+    /// push`) are signed, saying so in the prompt.
+    #[tokio::test]
+    async fn agent_socket_signs_only_sudo_challenges_and_logins() {
+        let key = entry("laptop", Duration::from_secs(60));
+        let public = public(&key);
+        let prompter = Arc::new(ScriptedPrompter::with_confirms([true; 3]));
+        let running = Running::start(vec![key], prompter.clone());
+        let login = ssh_login(&public, "excali");
+        let others = [sshsig("git"), b"anything".to_vec()];
+
+        let mut forwarded = running.client().await;
+        let signature = forwarded
+            .sign(signing(&public, login.clone()))
             .await
             .unwrap();
-        public.verify(CHALLENGE, &signature).unwrap();
+        public.verify(&login, &signature).unwrap();
+        for other in &others {
+            let request = Request::SignRequest(signing(&public, other.clone()));
+            let response = forwarded.handle(request).await;
+            assert!(matches!(response, Ok(Response::Failure)), "{response:?}");
+        }
         assert_eq!(prompter.asked().len(), 1);
+
+        // `control.sock` signs the rest too, once approved.
+        let mut control = running.control().await;
+        for other in &others {
+            let request = signing(&public, other.clone());
+            let signature = control.sign(request).await.unwrap();
+            public.verify(other, &signature).unwrap();
+        }
+        // Every prompt says what it is.
+        let asked = prompter.asked();
+        assert_eq!(asked.len(), 3);
+        for (asked, what) in asked.iter().zip([
+            "an SSH login as user excali",
+            "an ssh-keygen -Y sign signature, namespace git",
+            "unrecognized data",
+        ]) {
+            assert!(asked.contains(&format!("\n  signing: {what}\n")), "{asked}");
+        }
     }
 
     #[tokio::test]
@@ -674,15 +719,12 @@ mod tests {
         assert_eq!(running.listed().await, ["laptop"]);
 
         // Signing works on both sockets, approval-gated on both.
-        let signature = running
-            .client()
-            .await
-            .sign(sign_request(&public))
-            .await
-            .unwrap();
-        public.verify(CHALLENGE, &signature).unwrap();
+        let request = sign_request(&public);
+        let challenge = request.data.clone();
+        let signature = running.client().await.sign(request).await.unwrap();
+        public.verify(&challenge, &signature).unwrap();
         let signature = control.sign(sign_request(&public)).await.unwrap();
-        public.verify(CHALLENGE, &signature).unwrap();
+        public.verify(&challenge, &signature).unwrap();
         assert_eq!(prompter.asked().len(), 2);
     }
 
@@ -1389,5 +1431,30 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(listed.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn undecodable_request_is_logged_escaped() {
+        // A sign request whose key blob names an escape sequence as its
+        // algorithm: the decoding error quotes it.
+        let label = "\x1b[2K\x1b]52;c;aGk=\x07";
+        let mut blob = Vec::new();
+        label.as_bytes().encode(&mut blob).unwrap();
+        let mut body = vec![13]; // SSH_AGENTC_SIGN_REQUEST
+        blob.encode(&mut body).unwrap();
+        let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+        frame.extend(&body);
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        client.write_all(&frame).await.unwrap();
+        let e = read_request(&mut server, &AGENT_LIMITS).await.unwrap_err();
+        assert!(e.to_string().contains(label), "{e}");
+
+        // What `listen` logs for it.
+        let line = crate::logging::line(format_args!("Connection ended: {e}"));
+        assert!(
+            line.contains("\\u{1b}[2K\\u{1b}]52;c;aGk=\\u{7}"),
+            "{line:?}"
+        );
+        assert_eq!(line.matches(char::is_control).collect::<String>(), "\n");
     }
 }
