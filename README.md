@@ -70,6 +70,7 @@ cargo install --locked sudo-agent
 
 `--locked` builds with the dependency versions this release was tested and
 audited with. Or from a checkout: `cargo build --release --locked`.
+Building needs Rust 1.88 or newer.
 
 ## Usage
 

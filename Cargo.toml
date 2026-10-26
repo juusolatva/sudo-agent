@@ -2,6 +2,8 @@
 name = "sudo-agent"
 version = "0.4.2"
 edition = "2024"
+# Let chains need 1.88; CI builds and tests with it (build.yml, msrv job).
+rust-version = "1.88"
 authors = ["Juuso Latva <juuso.latva@gmail.com>"]
 description = "A lightweight, PAM-aware SSH agent daemon for time-bound sudo authentication."
 license = "MIT"

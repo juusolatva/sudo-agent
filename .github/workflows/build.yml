@@ -35,6 +35,27 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
+  # The oldest Rust we support (rust-version in Cargo.toml). Catches a change
+  # or dependency update that needs a newer one.
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    # Something hung (e.g. a test) fails the job instead of running for
+    # GitHub's 6-hour limit.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        run: |
+          msrv=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+          rustup toolchain install "$msrv" --profile minimal --no-self-update
+          rustup default "$msrv"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Run the tests
+        run: cargo test --locked
+
   # Also runs the tests: cargo llvm-cov builds and runs them for coverage.
   sonarqube:
     name: SonarQube
