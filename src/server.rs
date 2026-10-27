@@ -1448,8 +1448,13 @@ mod tests {
     #[tokio::test]
     async fn unread_reply_times_out_and_frees_its_slot() {
         // Listings that together outgrow the socket buffers, so writing them
-        // blocks until the client reads.
-        let (_dir, path) = limited_with(SMALL, &"k".repeat(100 * 1024));
+        // blocks until the client reads. No idle timeout, so only the reply
+        // deadline can free a slot.
+        let limits = Limits {
+            idle: None,
+            ..SMALL
+        };
+        let (_dir, path) = limited_with(limits, &"k".repeat(100 * 1024));
         let mut stalled = Vec::new();
         for _ in 0..SMALL.connections {
             let mut stream = UnixStream::connect(&path).await.unwrap();
