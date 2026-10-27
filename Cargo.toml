@@ -1,6 +1,6 @@
 [package]
 name = "sudo-agent"
-version = "0.4.3"
+version = "0.4.4"
 edition = "2024"
 # Let chains need 1.88; CI builds and tests with it (build.yml, msrv job).
 rust-version = "1.88"
