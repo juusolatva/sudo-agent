@@ -665,6 +665,15 @@ touches signing or prompting.
       add it to the advisory's CVE field and References, as
       GHSA-wwj9-h88v-6483 reuses CVE-2023-49092. Don't request our own CVE:
       the flaw is upstream's.
+- [ ] **Drop the GHSA-qwgh-2vcv-g2f7 ignore** in `osv-scanner.toml`
+      (`block-buffer` 0.10: a caught panic in a hash's compress callback can
+      corrupt the buffer cursor; pulled in by `digest` 0.10, under all of
+      `ssh-key` 0.6's crypto) with the same `ssh-key` 0.7 upgrade (fixed in
+      `block-buffer` 0.12.1). Accepted 2026-10-27 as not reachable: the
+      callbacks are RustCrypto's SHA compression functions, which don't panic,
+      and nothing reuses a hasher after a panic. No RustSec ID yet; if one
+      appears, `cargo audit` (daily in security.yml) starts failing, and the ID
+      goes into `.cargo/audit.toml` with the same reason.
 
 ## Someday (only if bothered — not committed, fine to drop)
 
