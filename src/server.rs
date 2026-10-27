@@ -42,6 +42,9 @@ struct Limits {
     idle: Option<Duration>,
     /// How long the rest of a frame may take once its length has arrived.
     body: Duration,
+    /// How long writing a reply may take, so a client that stops reading
+    /// can't hold its slot.
+    reply: Duration,
 }
 
 /// `agent.sock` is reachable by forwarding, so it gets tight limits.
@@ -50,6 +53,7 @@ const AGENT_LIMITS: Limits = Limits {
     frame: 256 * 1024,
     idle: Some(Duration::from_secs(60)),
     body: Duration::from_secs(10),
+    reply: Duration::from_secs(10),
 };
 
 /// `control.sock` only takes our own uid (see `control.rs`); a client may
@@ -205,7 +209,9 @@ async fn serve_connection(
         response
             .encode(&mut frame)
             .map_err(ssh_agent_lib::proto::ProtoError::SshEncoding)?;
-        stream.write_all(&frame).await?;
+        timeout(limits.reply, stream.write_all(&frame))
+            .await
+            .map_err(|_| timed_out("reply not read"))??;
     }
     Ok(())
 }
@@ -1368,11 +1374,16 @@ mod tests {
 
     /// A bare `agent.sock` served within `limits`.
     fn limited(limits: Limits) -> (tempfile::TempDir, PathBuf) {
+        limited_with(limits, "k")
+    }
+
+    /// As `limited`, with its one key commented `comment`.
+    fn limited_with(limits: Limits, comment: &str) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("agent.sock");
         let (listener, file) = socket::bind(&path).unwrap();
         let agent = SudoAgent::new(
-            Arc::new(Mutex::new(vec![entry("k", LONG.default)])),
+            Arc::new(Mutex::new(vec![entry(comment, LONG.default)])),
             Router::only(Arc::new(ScriptedPrompter::with_confirms([]))),
         );
         tokio::spawn(async move {
@@ -1387,6 +1398,7 @@ mod tests {
         frame: 1024,
         idle: Some(Duration::from_millis(200)),
         body: Duration::from_millis(200),
+        reply: Duration::from_millis(200),
     };
 
     /// True once the daemon has closed `stream`.
@@ -1426,6 +1438,30 @@ mod tests {
         for stream in &mut idle {
             assert!(closed(stream).await);
         }
+        let listed = timeout(Duration::from_secs(2), third.request_identities())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unread_reply_times_out_and_frees_its_slot() {
+        // Listings that together outgrow the socket buffers, so writing them
+        // blocks until the client reads.
+        let (_dir, path) = limited_with(SMALL, &"k".repeat(100 * 1024));
+        let mut stalled = Vec::new();
+        for _ in 0..SMALL.connections {
+            let mut stream = UnixStream::connect(&path).await.unwrap();
+            // SSH_AGENTC_REQUEST_IDENTITIES, the replies never read.
+            stream
+                .write_all(&[0, 0, 0, 1, 11].repeat(20))
+                .await
+                .unwrap();
+            stalled.push(stream);
+        }
+        // Both slots are taken, so this one is not served until one frees.
+        let mut third = Client::new(UnixStream::connect(&path).await.unwrap());
         let listed = timeout(Duration::from_secs(2), third.request_identities())
             .await
             .unwrap()
