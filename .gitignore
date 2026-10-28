@@ -1,2 +1,6 @@
 /target
 /lcov.info
+
+# Local audit notes, not for the repository.
+audit.md
+report.md
