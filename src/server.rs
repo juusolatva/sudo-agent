@@ -484,7 +484,7 @@ mod tests {
 
     /// What `pam_ssh_agent_auth` sends when `sudo` asks for `key`.
     fn sign_request(key: &KeyData) -> SignRequest {
-        signing(key, sudo_challenge(key, "excali"))
+        signing(key, sudo_challenge(key, "alice"))
     }
 
     fn signing(key: &KeyData, data: Vec<u8>) -> SignRequest {
@@ -553,7 +553,7 @@ mod tests {
         let public = public(&key);
         let prompter = Arc::new(ScriptedPrompter::with_confirms([true; 3]));
         let running = Running::start(vec![key], prompter.clone());
-        let login = ssh_login(&public, "excali");
+        let login = ssh_login(&public, "alice");
         let others = [sshsig("git"), b"anything".to_vec()];
 
         let mut forwarded = running.client().await;
@@ -580,7 +580,7 @@ mod tests {
         let asked = prompter.asked();
         assert_eq!(asked.len(), 3);
         for (asked, what) in asked.iter().zip([
-            "an SSH login as user excali",
+            "an SSH login as user alice",
             "an ssh-keygen -Y sign signature, namespace git",
             "unrecognized data",
         ]) {

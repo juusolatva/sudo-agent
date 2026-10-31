@@ -72,7 +72,8 @@ cargo install --locked sudo-agent
 ```
 
 `--locked` builds with the dependency versions this release was tested and
-audited with. Or from a checkout: `cargo build --release --locked`.
+checked with the dependency scanners. Or from a checkout:
+`cargo build --release --locked`.
 Building needs Rust 1.88 or newer.
 
 ## Usage
@@ -146,12 +147,15 @@ Or load keys at startup, with the passphrase asked in the agent's terminal:
 | `--pinentry-timeout <DURATION>` | `15s` | How long a popup waits for an answer |
 | `--no-pinentry` | | No popups: approve at the agent's terminal or with `sudo-agent approve` |
 | `--agent-socket <PATH>` | `$XDG_RUNTIME_DIR/sudo-agent/agent.sock` | The socket to forward. Also `SUDO_AGENT_SOCKET`; the flag wins. `--socket` still works |
-| `--control-socket <PATH>` | `$XDG_RUNTIME_DIR/sudo-agent/control.sock` | The socket for `ssh-add`; never forward it. Also `SUDO_AGENT_CONTROL_SOCKET`; the flag wins |
+| `--control-socket <PATH>` | `$XDG_RUNTIME_DIR/sudo-agent/control.sock` | The socket for `ssh-add` and `sudo-agent approve`; never forward it. Also `SUDO_AGENT_CONTROL_SOCKET`; the flag wins |
 
-Without `$XDG_RUNTIME_DIR`, the sockets go to
-`~/.cache/sudo-agent/agent-<hostname>.sock` and `control-<hostname>.sock`.
-Only one agent runs per user: `serve` refuses to start while another agent
-answers on either socket.
+Each socket path uses its flag first, then its non-empty environment
+variable, then the default. Without an absolute `$XDG_RUNTIME_DIR`, the
+sockets go to `${XDG_CACHE_HOME:-~/.cache}/sudo-agent/agent-<hostname>.sock`
+and `control-<hostname>.sock` (a relative `XDG_CACHE_HOME` is ignored).
+The default directory is private (`0700`) and sockets are owner-only
+(`0600`). `serve` refuses to start while another agent answers on either
+chosen socket; separate socket paths allow separate instances.
 
 `serve` runs in the foreground (or [as a service](#running-in-the-background)),
 and approval prompts appear in its terminal, as popups when there's a
@@ -159,13 +163,15 @@ display, and in every running `sudo-agent approve`. Ctrl-C at a prompt
 denies that request; Ctrl-C otherwise (or twice within two seconds, or
 closing the terminal) stops the agent, drops the keys and removes the
 sockets. A prompt or popup is withdrawn if its client goes away (e.g. the
-SSH connection closes) or its key expires.
+SSH connection closes) or its key expires or is removed. A service or a
+detached agent keeps running when you close the terminal used to start it.
 
 ### Running in the background
 
 As a systemd user service, started with your desktop session and stopped at
-logout. Copy [`contrib/systemd/sudo-agent.service`](contrib/systemd/sudo-agent.service)
-into place and enable it:
+logout. From a repository checkout, copy
+[`contrib/systemd/sudo-agent.service`](contrib/systemd/sudo-agent.service)
+into place and enable it (the unit isn't included in the crate package):
 
 ```sh
 mkdir -p ~/.config/systemd/user
@@ -249,6 +255,7 @@ $ sudo-agent approve
 2026-10-21 03:54:09 Waiting for approval requests from /run/user/1000/sudo-agent/control.sock; Ctrl-C quits
 Signature request from pid 188732, uid 1000: ssh server
   key: laptop (SHA256:…), 3h57m left
+  signing: a sudo challenge for user alice
 Allow? (closes in 2m00s) [y/N] y
 2026-10-21 03:56:15 Allowed
 ```
@@ -301,9 +308,9 @@ Then `sudo` on the server makes the approval prompt appear on your machine:
 ```
 Signature request from pid 402599, uid 1000: ssh server
   key: laptop (SHA256:…), 12m30s left
-  signing: a sudo challenge for user excali
+  signing: a sudo challenge for user alice
 Allow? [y/N] y
-Approved (terminal) signature request for a sudo challenge for user excali with key laptop (SHA256:…) from pid 402599, uid 1000: ssh server
+Approved (terminal) signature request for a sudo challenge for user alice with key laptop (SHA256:…) from pid 402599, uid 1000: ssh server
 ```
 
 The popup shows the same text, says when it closes by itself
@@ -374,6 +381,11 @@ asking for a password.
   Anything else, such as an `ssh-keygen -Y sign` (`git`) signature, is
   refused before you're asked, and logged. `ssh-keygen -Y sign` works
   against `control.sock`, still only once you approve.
+- Connections are bounded: 64 on `agent.sock`, 32 on `control.sock`, with
+  request frames limited to 256 KiB on both. `agent.sock` closes idle
+  connections after 60 seconds; `control.sock` may stay idle. Both allow
+  10 seconds to finish a frame body or write a reply, so a client that
+  stops reading can't hold a connection slot indefinitely.
 - `control.sock` must never be forwarded, and the agent makes sure a
   mistake there (say, a copy-pasted `ForwardAgent` line) doesn't hand a
   server control over your keys. It accepts only your own user, and
@@ -399,6 +411,8 @@ asking for a password.
 Planned, roughly in order:
 
 - `sudo-agent stop`, lock/unlock, and `sudo-agent status`;
+- clearer withdrawal reasons when another backend answers or a request
+  is no longer needed;
 - showing the forwarding chain (which host a request came through) in the
   prompt.
 
