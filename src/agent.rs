@@ -699,7 +699,7 @@ mod tests {
         let key_data = entry.private_key.public_key().key_data();
         SignRequest {
             credential: key_data.clone().into(),
-            data: testing::sudo_challenge(key_data, "excali"),
+            data: testing::sudo_challenge(key_data, "alice"),
             flags: 0,
         }
     }
@@ -729,7 +729,7 @@ mod tests {
         assert_eq!(asked.len(), 1);
         assert!(asked[0].contains("laptop") && asked[0].ends_with("Allow?"));
         assert!(
-            asked[0].contains("\n  signing: a sudo challenge for user excali\n"),
+            asked[0].contains("\n  signing: a sudo challenge for user alice\n"),
             "{asked:?}"
         );
     }
@@ -769,7 +769,7 @@ mod tests {
         let prompter = Arc::new(ScriptedPrompter::with_confirms([true; 4]));
         let mut conn = connect(vec![key], prompter.clone());
 
-        let login = testing::ssh_login(&key_data, "excali");
+        let login = testing::ssh_login(&key_data, "alice");
         let request = SignRequest {
             credential: key_data.clone().into(),
             data: login.clone(),
@@ -780,7 +780,7 @@ mod tests {
         let asked = prompter.asked();
         assert_eq!(asked.len(), 1);
         assert!(
-            asked[0].contains("\n  signing: an SSH login as user excali\n"),
+            asked[0].contains("\n  signing: an SSH login as user alice\n"),
             "{asked:?}"
         );
 
@@ -808,7 +808,7 @@ mod tests {
         let mut conn = connect(vec![key], prompter.clone());
         conn.forwarded = false;
 
-        let login = testing::ssh_login(&key_data, "excali");
+        let login = testing::ssh_login(&key_data, "alice");
         let request = |data: &[u8]| SignRequest {
             credential: key_data.clone().into(),
             data: data.to_vec(),
@@ -825,7 +825,7 @@ mod tests {
         let asked = prompter.asked();
         assert_eq!(asked.len(), 2);
         assert!(
-            asked[0].contains("\n  signing: an SSH login as user excali\n"),
+            asked[0].contains("\n  signing: an SSH login as user alice\n"),
             "{asked:?}"
         );
         assert!(
@@ -839,12 +839,12 @@ mod tests {
         let laptop = entry("laptop", Duration::ZERO);
         let key = laptop.private_key.public_key().key_data();
         let sudo = || Payload::Sudo {
-            user: "excali".into(),
+            user: "alice".into(),
         };
-        let challenge = testing::sudo_challenge(key, "excali");
+        let challenge = testing::sudo_challenge(key, "alice");
         assert_eq!(Payload::of(&challenge), sudo());
         // The standard message type, in case the module uses it.
-        let standard = testing::userauth(USERAUTH_REQUEST, key, "excali", "pam_ssh_agent_auth");
+        let standard = testing::userauth(USERAUTH_REQUEST, key, "alice", "pam_ssh_agent_auth");
         assert_eq!(Payload::of(&standard), sudo());
         // What follows the key blob isn't looked at.
         let mut longer = challenge.clone();
@@ -862,7 +862,7 @@ mod tests {
             "PAM_SSH_AGENT_AUTH",
             "ssh-connection",
         ] {
-            let other = testing::userauth(USERAUTH_TRUST_REQUEST, key, "excali", service);
+            let other = testing::userauth(USERAUTH_TRUST_REQUEST, key, "alice", service);
             assert_eq!(Payload::of(&other), Payload::Unknown, "{service}");
         }
         let at = challenge
@@ -872,19 +872,19 @@ mod tests {
         let mut not_publickey = challenge.clone();
         not_publickey[at + 8] = b'z';
         assert_eq!(Payload::of(&not_publickey), Payload::Unknown);
-        let other_type = testing::userauth(51, key, "excali", "pam_ssh_agent_auth");
+        let other_type = testing::userauth(51, key, "alice", "pam_ssh_agent_auth");
         assert_eq!(Payload::of(&other_type), Payload::Unknown);
 
         let login = || Payload::Login {
-            user: "excali".into(),
+            user: "alice".into(),
         };
-        assert_eq!(Payload::of(&testing::ssh_login(key, "excali")), login());
+        assert_eq!(Payload::of(&testing::ssh_login(key, "alice")), login());
         // OpenSSH 8.9+ logs in with "publickey-hostbound-v00@openssh.com"
         // where the server supports it.
         let hostbound = testing::userauth_with_method(
             USERAUTH_REQUEST,
             key,
-            "excali",
+            "alice",
             "ssh-connection",
             "publickey-hostbound-v00@openssh.com",
         );
@@ -910,8 +910,8 @@ mod tests {
         let label = |data: Vec<u8>| Payload::of(&data).to_string();
 
         assert_eq!(
-            label(testing::sudo_challenge(key, "excali")),
-            "a sudo challenge for user excali"
+            label(testing::sudo_challenge(key, "alice")),
+            "a sudo challenge for user alice"
         );
         assert_eq!(
             label(testing::sudo_challenge(key, "root\x1b[2K\nok")),

@@ -338,11 +338,11 @@ signing only `sudo` challenges and SSH logins, escaped log lines), on
 `server-a` and `server-b`, the service with pinentry popups:
 
 - Case 1 on both servers: the popup said `signing: a sudo challenge for
-  user excali`, and `sudo` succeeded once allowed. So the parser reads real
+  user alice`, and `sudo` succeeded once allowed. So the parser reads real
   0.10.3 and 0.10.4 challenges. Denying (case 2) logged `denied
   (pinentry)`.
 - An onward login from `server-b` through the forwarded `agent.sock`: the
-  popup said `signing: an SSH login as user excali`; allowing let it
+  popup said `signing: an SSH login as user alice`; allowing let it
   through, denying refused it.
 - Case 24, with `ssh-keygen -Y sign` against `control.sock`: headless, it
   was refused only for lack of an approval backend. In the desktop
