@@ -6,6 +6,8 @@ Keep durable project guidance here, the roadmap and design rationale in
 `TODO.md`, user instructions in `README.md`, and manual verification results
 in `docs/manual-e2e.md`. `CLAUDE.md` imports this file.
 
+Use [GLOSSARY.md](GLOSSARY.md) for project terminology.
+
 ## Project Overview
 
 `sudo-agent` is a lightweight, PAM-aware SSH agent daemon written in Rust for time-bound, human-approved `sudo` authentication. Instead of relying on static keys trusted indefinitely or re-typing passwords on every elevation, `sudo` challenges an SSH key held by this agent (via `pam_ssh_agent_auth`). The agent only signs authentication challenges if:
