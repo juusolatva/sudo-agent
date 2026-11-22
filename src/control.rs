@@ -6,6 +6,7 @@
 //! [`ControlConnection::extension`]. Unlike `agent.sock`, it signs any data
 //! (still only once approved), not just `sudo` challenges and SSH logins.
 
+use std::ffi::OsStr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -99,7 +100,7 @@ fn refusal(peer_uid: Option<u32>, own_uid: u32, peer_exe: Option<&Path>) -> Opti
     // as "/usr/bin/ssh (deleted)".
     if peer_exe
         .and_then(Path::file_name)
-        .and_then(|name| name.to_str())
+        .and_then(OsStr::to_str)
         .is_some_and(|name| name.strip_suffix(" (deleted)").unwrap_or(name) == "ssh")
     {
         return Some(

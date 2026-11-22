@@ -206,22 +206,32 @@ impl Prompter for Pinentry {
 }
 
 /// Ends `child` and reaps it: SIGTERM first, so a GUI pinentry can close its
-/// window, then SIGKILL if it hasn't exited within [`TERM_WAIT`]. Both go to
+/// window, then SIGKILL to whatever is left after [`TERM_WAIT`]. Both go to
 /// its whole process group (it leads one, see [`Pinentry::spawn`]), so a
 /// wrapper script that runs the real pinentry without `exec` doesn't leave
-/// the popup behind.
+/// the popup behind, even if the wrapper exits on SIGTERM and the popup
+/// doesn't.
 async fn stop(child: &mut Child) {
     let group = child.id().map(|pid| -(pid as libc::pid_t));
+    // Whether the signal reached any process (0 only checks).
     let signal = |signal| {
-        if let Some(group) = group {
-            // SAFETY: plain kill(2). The group is led by our own child, not
-            // reaped yet, so its id can't have been reused.
-            unsafe { libc::kill(group, signal) };
-        }
+        // SAFETY: plain kill(2). While the group has a member (the leader
+        // counts until reaped), its id can't be reused.
+        group.is_some_and(|group| unsafe { libc::kill(group, signal) } == 0)
     };
     signal(libc::SIGTERM);
-    if tokio::time::timeout(TERM_WAIT, child.wait()).await.is_err() {
+    let deadline = tokio::time::Instant::now() + TERM_WAIT;
+    let leader_gone = tokio::time::timeout_at(deadline, child.wait())
+        .await
+        .is_ok();
+    // The leader exited: give the rest of its group the same time.
+    while leader_gone && signal(0) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    if signal(0) {
         signal(libc::SIGKILL);
+    }
+    if !leader_gone {
         let _ = child.kill().await;
     }
 }
@@ -550,24 +560,48 @@ done"#,
         cancel.cancel();
         let withdrawn = tokio::time::timeout(Duration::from_secs(5), asking).await;
         assert!(withdrawn.expect("withdrawn in time").unwrap().is_err());
-        // Killed, though maybe not reaped yet (its parent, the wrapper, is
-        // gone): a zombie's state in /proc/<pid>/stat is Z.
-        let gone = || {
-            std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
-                stat.rsplit(')')
-                    .next()
-                    .unwrap_or("")
-                    .trim_start()
-                    .starts_with('Z')
-            })
-        };
+        assert!(until_gone(pid).await, "the wrapper's child survived");
+    }
+
+    #[tokio::test]
+    async fn withdrawing_kills_a_popup_that_outlives_its_wrapper() {
+        let fake = Fake::new();
+        // The wrapper exits on SIGTERM; what it started ignores it.
+        let pinentry = fake.pinentry(&format!(
+            "sh -c 'trap \"\" TERM; exec sleep 60' & echo $! > '{}'; wait",
+            fake.path("pid").display()
+        ));
+        let cancel = CancellationToken::new();
+        let asking = tokio::spawn({
+            let cancel = cancel.clone();
+            async move { pinentry.confirm("Allow?", &cancel).await }
+        });
+        let pid = fake.pid().await;
+        cancel.cancel();
+        let withdrawn = tokio::time::timeout(Duration::from_secs(5), asking).await;
+        assert!(withdrawn.expect("withdrawn in time").unwrap().is_err());
+        // Killed (SIGKILL takes effect a moment after kill(2) returns).
+        assert!(until_gone(pid).await, "the popup outlived its wrapper");
+    }
+
+    /// Whether `pid` is gone, or a zombie, within two seconds.
+    async fn until_gone(pid: libc::pid_t) -> bool {
         for _ in 0..200 {
-            if gone() {
-                return;
+            if gone(pid) {
+                return true;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        panic!("the wrapper's child survived");
+        false
+    }
+
+    /// Whether `pid` is gone or a zombie (state Z in /proc/<pid>/stat):
+    /// once its parent, the wrapper, has exited, nobody here reaps it.
+    fn gone(pid: libc::pid_t) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
+            let state = stat.rsplit(')').next().unwrap_or("").trim_start();
+            state.starts_with('Z')
+        })
     }
 
     #[tokio::test]

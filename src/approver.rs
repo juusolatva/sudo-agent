@@ -157,9 +157,8 @@ impl Attending {
                     let id = self.asking.take().map_or(0, |asking| asking.id);
                     match answer {
                         Ok(approved) => {
-                            let sending = self.answer(id, approved);
                             tokio::select! {
-                                () = sending => {}
+                                () = self.answer(id, approved) => {}
                                 // Ctrl-C needn't wait for an agent slow
                                 // to take the answer.
                                 () = shutdown.as_mut() => {
