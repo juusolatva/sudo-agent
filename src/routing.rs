@@ -18,6 +18,9 @@ struct Backend {
     prompter: Arc<dyn Prompter>,
 }
 
+/// Most backend failures remembered as reported (see [`Router::reported`]).
+const MAX_REPORTED: usize = 64;
+
 /// Asks every available backend at once. The first answer (approve or deny)
 /// wins, and the other backends are withdrawn. A backend that gives up (times
 /// out, fails) is no answer, not a denial: the request is only denied once
@@ -35,6 +38,9 @@ pub struct Answer {
     pub approved: bool,
     /// The backend that answered.
     pub by: &'static str,
+    /// Who answered there, if the backend can tell (which `sudo-agent
+    /// approve` client), for the log.
+    pub from: Option<String>,
     /// Failures of other backends while asking (not timeouts), each one only
     /// the first time it happens.
     pub problems: Vec<String>,
@@ -71,7 +77,10 @@ impl Router {
             .backends
             .iter()
             .filter(|backend| backend.prompter.available())
-            .map(|backend| (backend.name, backend.prompter.confirm(message, &withdraw)))
+            .map(|backend| {
+                let question = backend.prompter.confirm_from(message, &withdraw);
+                (backend.name, question)
+            })
             .collect();
         if asking.is_empty() {
             return Err(io::Error::other("no approval backend is available"));
@@ -79,7 +88,7 @@ impl Router {
         let mut gave_up = Vec::new();
         while let Some((name, result)) = next_done(&mut asking).await {
             match result {
-                Ok(approved) => {
+                Ok((approved, from)) => {
                     withdraw.cancel();
                     // Returns once the others are gone, so their lines end
                     // before the log line.
@@ -87,6 +96,7 @@ impl Router {
                     return Ok(Answer {
                         approved,
                         by: name,
+                        from,
                         problems: self.new_problems(&gave_up),
                     });
                 }
@@ -101,23 +111,30 @@ impl Router {
     /// with nobody to ask (`NotConnected`: every `sudo-agent approve` went).
     fn new_problems(&self, gave_up: &[(&'static str, io::Error)]) -> Vec<String> {
         let mut reported = self.reported.lock().unwrap_or_else(PoisonError::into_inner);
-        gave_up
+        let problems: Vec<String> = gave_up
             .iter()
             .filter(|(_, e)| !matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::NotConnected))
             .map(|(name, e)| format!("{name}: {e}"))
-            .filter(|problem| reported.insert(problem.clone()))
-            .collect()
+            .filter(|problem| !reported.contains(problem))
+            .collect();
+        // Bounded, should a backend fail differently every time: forgotten
+        // ones are just logged again.
+        if reported.len() + problems.len() > MAX_REPORTED {
+            reported.clear();
+        }
+        reported.extend(problems.iter().cloned());
+        problems
     }
 }
 
 /// One backend's open question.
-type Asking<'a> = Pin<Box<dyn Future<Output = io::Result<bool>> + Send + 'a>>;
+type Asking<'a> = Pin<Box<dyn Future<Output = io::Result<(bool, Option<String>)>> + Send + 'a>>;
 
 /// Waits for the next backend in `asking` to finish and removes it; `None`
 /// once none is left.
 async fn next_done(
     asking: &mut Vec<(&'static str, Asking<'_>)>,
-) -> Option<(&'static str, io::Result<bool>)> {
+) -> Option<(&'static str, io::Result<(bool, Option<String>)>)> {
     if asking.is_empty() {
         return None;
     }
@@ -185,6 +202,55 @@ mod tests {
             assert_eq!(slow.times_asked(), 1);
             assert_eq!(slow.times_cancelled(), 1);
         }
+    }
+
+    /// Says who answered, as `sudo-agent approve` does.
+    struct Named;
+
+    #[async_trait::async_trait]
+    impl Prompter for Named {
+        async fn passphrase(&self, _: &str) -> io::Result<zeroize::Zeroizing<String>> {
+            unreachable!()
+        }
+
+        async fn confirm(&self, _: &str, _: &CancellationToken) -> io::Result<bool> {
+            unreachable!("routing asks confirm_from")
+        }
+
+        async fn confirm_from(
+            &self,
+            _: &str,
+            _: &CancellationToken,
+        ) -> io::Result<(bool, Option<String>)> {
+            Ok((false, Some("approve client pid 7".to_owned())))
+        }
+    }
+
+    #[tokio::test]
+    async fn the_answer_says_who_gave_it() {
+        let router = route_to(vec![("approve", Arc::new(Named))]);
+        let result = ask(&router).await.unwrap();
+        assert!(!result.approved);
+        assert_eq!(result.from.as_deref(), Some("approve client pid 7"));
+
+        let router = route_to(vec![(
+            "plain",
+            Arc::new(ScriptedPrompter::with_confirms([true])),
+        )]);
+        assert_eq!(ask(&router).await.unwrap().from, None);
+    }
+
+    #[test]
+    fn reported_failures_stay_bounded() {
+        let router = route_to(Vec::new());
+        for i in 0..1000 {
+            let gave_up = [("broken", io::Error::other(format!("failure {i}")))];
+            assert_eq!(router.new_problems(&gave_up).len(), 1);
+            assert!(router.reported.lock().unwrap().len() <= MAX_REPORTED);
+        }
+        // Still reported only once while remembered.
+        let gave_up = [("broken", io::Error::other("failure 999"))];
+        assert!(router.new_problems(&gave_up).is_empty());
     }
 
     #[tokio::test]

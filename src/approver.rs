@@ -39,6 +39,10 @@ const RECONNECT_EVERY: Duration = Duration::from_secs(1);
 /// How long to wait for the agent to take an answer.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long a new connection waits for the agent to refuse it before the
+/// client says it is waiting for requests.
+const SETTLE: Duration = Duration::from_millis(200);
+
 /// Shows the requests of the agent on `path` (its `control.sock`) with
 /// `prompter`, one at a time, and sends the answers, until `shutdown`
 /// resolves. Fails if the agent can't be reached at first, or refuses.
@@ -47,11 +51,15 @@ pub async fn attend(
     prompter: Arc<dyn Prompter>,
     shutdown: impl Future<Output = ()>,
 ) -> io::Result<()> {
+    let mut events = Events::connect(&path).await.map_err(|e| {
+        let message = format!("no sudo-agent answering on {}: {e}", path.display());
+        io::Error::new(e.kind(), message)
+    })?;
+    // A socket that won't send approval requests (`agent.sock`, an older
+    // sudo-agent) refuses at once: say so rather than claim to be waiting.
+    events.settle().await?;
     let mut client = Attending {
-        events: Events::connect(&path).await.map_err(|e| {
-            let message = format!("no sudo-agent answering on {}: {e}", path.display());
-            io::Error::new(e.kind(), message)
-        })?,
+        events,
         path,
         prompter,
         queued: VecDeque::new(),
@@ -148,7 +156,17 @@ impl Attending {
                 answer = prompt(&mut self.asking) => {
                     let id = self.asking.take().map_or(0, |asking| asking.id);
                     match answer {
-                        Ok(approved) => self.answer(id, approved).await,
+                        Ok(approved) => {
+                            tokio::select! {
+                                () = self.answer(id, approved) => {}
+                                // Ctrl-C needn't wait for an agent slow
+                                // to take the answer.
+                                () = shutdown.as_mut() => {
+                                    self.forget().await;
+                                    return Ok(Ended::Shutdown);
+                                }
+                            }
+                        }
                         Err(e) => log!("No answer: {e}"),
                     }
                 }
@@ -246,7 +264,7 @@ async fn reconnect(path: &Path) -> Events {
 /// Answers request `id` over a connection of its own. `Ok(false)`: the
 /// answer didn't decide the request.
 async fn send_answer(path: &Path, id: u64, approved: bool) -> io::Result<bool> {
-    let mut client = Client::new(UnixStream::connect(path).await?);
+    let mut client = Client::new(connect(path).await?);
     let reply = Extension::new_message(Reply { id, approved }).map_err(io::Error::other)?;
     match client.handle(Request::Extension(reply)).await {
         Ok(Response::Success) => Ok(true),
@@ -254,6 +272,26 @@ async fn send_answer(path: &Path, id: u64, approved: bool) -> io::Result<bool> {
         Ok(other) => Err(io::Error::other(format!("unexpected reply {other:?}"))),
         Err(e) => Err(io::Error::other(e)),
     }
+}
+
+/// Connects to the agent on `path`, which must run as this user: anyone
+/// else listening there could show made-up requests.
+async fn connect(path: &Path) -> io::Result<UnixStream> {
+    let stream = UnixStream::connect(path).await?;
+    // SAFETY: geteuid() has no preconditions and cannot fail.
+    let own = unsafe { libc::geteuid() };
+    peer_is(stream.peer_cred()?.uid(), own)?;
+    Ok(stream)
+}
+
+fn peer_is(uid: u32, own: u32) -> io::Result<()> {
+    if uid == own {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        ErrorKind::PermissionDenied,
+        format!("the socket belongs to uid {uid}, not this user ({own})"),
+    ))
 }
 
 /// Why a connection's events ended.
@@ -270,11 +308,13 @@ enum Lost {
 struct Events {
     received: mpsc::Receiver<Result<Event, Lost>>,
     reader: JoinHandle<()>,
+    /// What [`settle`](Self::settle) received, handed out first.
+    early: Option<Result<Event, Lost>>,
 }
 
 impl Events {
     async fn connect(path: &Path) -> io::Result<Self> {
-        let mut client = Client::new(UnixStream::connect(path).await?);
+        let mut client = Client::new(connect(path).await?);
         let (send, received) = mpsc::channel(16);
         let path = path.to_owned();
         let reader = tokio::spawn(async move {
@@ -286,10 +326,30 @@ impl Events {
                 }
             }
         });
-        Ok(Self { received, reader })
+        Ok(Self {
+            received,
+            reader,
+            early: None,
+        })
+    }
+
+    /// Waits [`SETTLE`] for the agent to refuse, which it does at once;
+    /// fails if it did. Anything else received meanwhile is kept for
+    /// [`next`](Self::next).
+    async fn settle(&mut self) -> io::Result<()> {
+        if let Ok(received) = tokio::time::timeout(SETTLE, self.received.recv()).await {
+            match received.unwrap_or(Err(Lost::Gone)) {
+                Err(Lost::Failed(e)) => return Err(e),
+                other => self.early = Some(other),
+            }
+        }
+        Ok(())
     }
 
     async fn next(&mut self) -> Result<Event, Lost> {
+        if let Some(early) = self.early.take() {
+            return early;
+        }
         self.received.recv().await.unwrap_or(Err(Lost::Gone))
     }
 }
@@ -340,6 +400,14 @@ mod tests {
     use async_trait::async_trait;
     use ssh_agent_lib::agent::listen;
     use ssh_agent_lib::error::AgentError;
+
+    #[test]
+    fn only_an_agent_of_this_user_is_trusted() {
+        assert!(peer_is(1000, 1000).is_ok());
+        let e = peer_is(1001, 1000).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::PermissionDenied);
+        assert!(e.to_string().contains("uid 1001"), "{e}");
+    }
     use tokio::sync::Mutex;
 
     /// An agent whose waits return what the test sends, and which refuses

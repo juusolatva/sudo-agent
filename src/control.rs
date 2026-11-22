@@ -6,23 +6,25 @@
 //! [`ControlConnection::extension`]. Unlike `agent.sock`, it signs any data
 //! (still only once approved), not just `sudo` challenges and SSH logins.
 
+use std::ffi::OsStr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use ssh_agent_lib::agent::{Agent, Session};
+use ssh_agent_lib::agent::Session;
 use ssh_agent_lib::error::AgentError;
 use ssh_agent_lib::proto::{
     AddIdentity, AddIdentityConstrained, AddSmartcardKeyConstrained, Extension, Identity,
     KeyConstraint, PrivateCredential, RemoveIdentity, SignRequest, SmartcardKey,
 };
 use ssh_key::{HashAlg, PrivateKey, Signature};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::UnixStream;
 
 use crate::agent::{Connection, SudoAgent, sanitize};
 use crate::approve::{self, ApproveClients, Events, Reply};
 use crate::keys::{self, KeyEntry, TtlPolicy};
+use crate::server::{Gate, Sessions};
 
 /// Sent by OpenSSH (≥ 8.9) on every agent connection it uses for a login or
 /// forwards to a server.
@@ -33,6 +35,7 @@ const RESTRICT_DESTINATION: &str = "restrict-destination-v00@openssh.com";
 
 /// [`listen`](ssh_agent_lib::agent::listen) asks it for a [`ControlConnection`]
 /// per accepted socket.
+#[derive(Clone)]
 pub struct ControlAgent {
     agent: SudoAgent,
     ttl: TtlPolicy,
@@ -51,8 +54,10 @@ impl ControlAgent {
     }
 }
 
-impl Agent<UnixListener> for ControlAgent {
-    fn new_session(&mut self, socket: &UnixStream) -> impl Session {
+impl Sessions for ControlAgent {
+    type Session = ControlConnection;
+
+    fn session(&self, socket: &UnixStream) -> ControlConnection {
         let inner = Connection::control(self.agent.clone(), socket);
         let refused = match socket.peer_cred() {
             Ok(cred) => {
@@ -91,9 +96,12 @@ fn refusal(peer_uid: Option<u32>, own_uid: u32, peer_exe: Option<&Path>) -> Opti
         }
         Some(_) => {}
     }
+    // A running program whose file was replaced since (an upgrade) shows
+    // as "/usr/bin/ssh (deleted)".
     if peer_exe
         .and_then(Path::file_name)
-        .is_some_and(|name| name == "ssh")
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| name.strip_suffix(" (deleted)").unwrap_or(name) == "ssh")
     {
         return Some(
             "it comes from ssh; control.sock must never be forwarded or used for logins".into(),
@@ -123,6 +131,15 @@ struct Attached {
 impl Drop for Attached {
     fn drop(&mut self) {
         log!("Approve client detached: {}", self.peer);
+    }
+}
+
+/// A refused connection is closed at once (or once the reply to
+/// `session-bind` is out), rather than kept failing requests: it could
+/// otherwise idle and hold one of the socket's connection slots for good.
+impl Gate for ControlConnection {
+    fn closing(&self) -> bool {
+        self.refused.is_some()
     }
 }
 
@@ -204,8 +221,10 @@ impl ControlConnection {
         let mut lifetime = None;
         for constraint in constraints {
             match constraint {
+                // Should one come more than once, the shortest counts.
                 KeyConstraint::Lifetime(seconds) => {
-                    lifetime = Some(Duration::from_secs(u64::from(*seconds)));
+                    let asked = Duration::from_secs(u64::from(*seconds));
+                    lifetime = Some(lifetime.map_or(asked, |earlier: Duration| earlier.min(asked)));
                 }
                 KeyConstraint::Confirm => {}
                 KeyConstraint::Extension(Extension { name, .. })
@@ -236,10 +255,10 @@ impl ControlConnection {
             sanitize(private_key.comment()),
             private_key.fingerprint(HashAlg::Sha256)
         );
-        let replaced = self.inner.agent().add(KeyEntry {
-            private_key,
-            expires_at: keys::now() + ttl,
-        });
+        let replaced = self
+            .inner
+            .agent()
+            .add(KeyEntry::new(private_key, keys::now() + ttl));
         let action = if replaced { "Replaced" } else { "Added" };
         let cap = match (capped, lifetime) {
             (true, Some(asked)) => format!(
@@ -378,5 +397,8 @@ mod tests {
         assert!(refused(None, exe("/usr/bin/ssh-add")));
         assert!(refused(Some(me), exe("/usr/bin/ssh")));
         assert!(refused(Some(me), exe("/opt/openssh/bin/ssh")));
+        // Still running after an upgrade replaced its file.
+        assert!(refused(Some(me), exe("/usr/bin/ssh (deleted)")));
+        assert!(!refused(Some(me), exe("/usr/bin/ssh-add (deleted)")));
     }
 }

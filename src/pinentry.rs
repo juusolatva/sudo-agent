@@ -74,7 +74,8 @@ impl Pinentry {
             .kill_on_drop(true);
         let parent = std::process::id();
         // SAFETY: the closure only makes async-signal-safe calls (setsid,
-        // prctl, getppid), as required between fork and exec.
+        // prctl, getppid) and doesn't allocate (its errors are raw OS
+        // errors), as required between fork and exec.
         unsafe {
             command.pre_exec(move || {
                 // Its own session, without a controlling terminal: a curses or
@@ -90,8 +91,9 @@ impl Pinentry {
                     return Err(io::Error::last_os_error());
                 }
                 // The agent may have died before that took effect.
+                // (`io::Error::other` would allocate.)
                 if libc::getppid() as u32 != parent {
-                    return Err(io::Error::other("the agent exited"));
+                    return Err(io::Error::from_raw_os_error(libc::ESRCH));
                 }
                 Ok(())
             });
@@ -191,21 +193,45 @@ impl Prompter for Pinentry {
             answer = self.ask(&mut session, message) => answer,
         };
         drop(session);
-        // Returns once pinentry is gone, so the popup is too.
+        if let Ok(answer) = result {
+            // An answer is handed over at once, so no other backend can
+            // overrule it while pinentry exits; the popup closes meanwhile.
+            tokio::spawn(async move { stop(&mut child).await });
+            return Ok(answer);
+        }
+        // Otherwise returns once pinentry is gone, so the popup is too.
         stop(&mut child).await;
         result
     }
 }
 
 /// Ends `child` and reaps it: SIGTERM first, so a GUI pinentry can close its
-/// window, then SIGKILL if it hasn't exited within [`TERM_WAIT`].
+/// window, then SIGKILL to whatever is left after [`TERM_WAIT`]. Both go to
+/// its whole process group (it leads one, see [`Pinentry::spawn`]), so a
+/// wrapper script that runs the real pinentry without `exec` doesn't leave
+/// the popup behind, even if the wrapper exits on SIGTERM and the popup
+/// doesn't.
 async fn stop(child: &mut Child) {
-    if let Some(pid) = child.id() {
-        // SAFETY: plain kill(2). `pid` is our own child and not reaped yet,
-        // so it can't belong to another process.
-        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    let group = child.id().map(|pid| -(pid as libc::pid_t));
+    // Whether the signal reached any process (0 only checks).
+    let signal = |signal| {
+        // SAFETY: plain kill(2). While the group has a member (the leader
+        // counts until reaped), its id can't be reused.
+        group.is_some_and(|group| unsafe { libc::kill(group, signal) } == 0)
+    };
+    signal(libc::SIGTERM);
+    let deadline = tokio::time::Instant::now() + TERM_WAIT;
+    let leader_gone = tokio::time::timeout_at(deadline, child.wait())
+        .await
+        .is_ok();
+    // The leader exited: give the rest of its group the same time.
+    while leader_gone && signal(0) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    if tokio::time::timeout(TERM_WAIT, child.wait()).await.is_err() {
+    if signal(0) {
+        signal(libc::SIGKILL);
+    }
+    if !leader_gone {
         let _ = child.kill().await;
     }
 }
@@ -262,7 +288,10 @@ impl Session {
                 .take(MAX_LINE as u64)
                 .read_line(&mut line)
                 .await?;
-            let Some(line) = line.strip_suffix('\n') else {
+            let Some(line) = line
+                .strip_suffix('\n')
+                .map(|line| line.strip_suffix('\r').unwrap_or(line))
+            else {
                 return Err(match read {
                     0 => io::Error::new(ErrorKind::UnexpectedEof, "pinentry exited"),
                     _ => io::Error::new(ErrorKind::InvalidData, "garbled reply from pinentry"),
@@ -515,6 +544,84 @@ done"#,
     }
 
     #[tokio::test]
+    async fn withdrawing_kills_what_a_wrapper_started() {
+        let fake = Fake::new();
+        // A wrapper that runs the "real" pinentry without exec.
+        let pinentry = fake.pinentry(&format!(
+            "sleep 60 & echo $! > '{}'; wait",
+            fake.path("pid").display()
+        ));
+        let cancel = CancellationToken::new();
+        let asking = tokio::spawn({
+            let cancel = cancel.clone();
+            async move { pinentry.confirm("Allow?", &cancel).await }
+        });
+        let pid = fake.pid().await;
+        cancel.cancel();
+        let withdrawn = tokio::time::timeout(Duration::from_secs(5), asking).await;
+        assert!(withdrawn.expect("withdrawn in time").unwrap().is_err());
+        assert!(until_gone(pid).await, "the wrapper's child survived");
+    }
+
+    #[tokio::test]
+    async fn withdrawing_kills_a_popup_that_outlives_its_wrapper() {
+        let fake = Fake::new();
+        // The wrapper exits on SIGTERM; what it started ignores it.
+        let pinentry = fake.pinentry(&format!(
+            "sh -c 'trap \"\" TERM; exec sleep 60' & echo $! > '{}'; wait",
+            fake.path("pid").display()
+        ));
+        let cancel = CancellationToken::new();
+        let asking = tokio::spawn({
+            let cancel = cancel.clone();
+            async move { pinentry.confirm("Allow?", &cancel).await }
+        });
+        let pid = fake.pid().await;
+        cancel.cancel();
+        let withdrawn = tokio::time::timeout(Duration::from_secs(5), asking).await;
+        assert!(withdrawn.expect("withdrawn in time").unwrap().is_err());
+        // Killed (SIGKILL takes effect a moment after kill(2) returns).
+        assert!(until_gone(pid).await, "the popup outlived its wrapper");
+    }
+
+    /// Whether `pid` is gone, or a zombie, within two seconds.
+    async fn until_gone(pid: libc::pid_t) -> bool {
+        for _ in 0..200 {
+            if gone(pid) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    /// Whether `pid` is gone or a zombie (state Z in /proc/<pid>/stat):
+    /// once its parent, the wrapper, has exited, nobody here reaps it.
+    fn gone(pid: libc::pid_t) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
+            let state = stat.rsplit(')').next().unwrap_or("").trim_start();
+            state.starts_with('Z')
+        })
+    }
+
+    #[tokio::test]
+    async fn an_answer_is_handed_over_before_pinentry_exits() {
+        let fake = Fake::new();
+        // Denies, then ignores SIGTERM: it takes TERM_WAIT and SIGKILL to go.
+        let deny = "echo 'ERR 83886179 Operation cancelled <Pinentry>'; trap '' TERM; \
+                    sleep 30";
+        let started = std::time::Instant::now();
+        assert!(!fake.confirm(deny).await.unwrap());
+        assert!(started.elapsed() < TERM_WAIT, "{:?}", started.elapsed());
+    }
+
+    #[tokio::test]
+    async fn crlf_replies_are_understood() {
+        let fake = Fake::new();
+        assert!(fake.confirm(r"printf 'OK\r\n'").await.unwrap());
+    }
+
+    #[tokio::test]
     async fn runs_in_its_own_session() {
         let fake = Fake::new();
         let ids = fake.path("ids");
@@ -601,9 +708,9 @@ done"#,
         Pinentry::new(program, Duration::from_secs(30))
     }
 
-    const REAL_MESSAGE: &str = "Signature request from pid 402599, uid 1000: ssh server\n  \
-                                key: laptop (SHA256:LaGG9bgLw3dl0cl0JDUUbOPEl36TgNwNysXvEICHKtU), \
-                                12m30s left\nAllow?";
+    const REAL_MESSAGE: &str = "Signature request\n  signing: a sudo challenge for user alice\n  \
+                                key: SHA256:LaGG9bgLw3dl0cl0JDUUbOPEl36TgNwNysXvEICHKtU (laptop), \
+                                12m30s left\n  from: pid 402599, uid 1000: ssh server\nAllow?";
 
     #[tokio::test]
     #[ignore = "opens a real pinentry popup"]

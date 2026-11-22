@@ -6,7 +6,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ssh_agent_lib::agent::{Agent, Session};
+use ssh_agent_lib::agent::Session;
 use ssh_agent_lib::error::AgentError;
 use ssh_agent_lib::proto::{Request, Response};
 use ssh_agent_lib::ssh_encoding::{Decode, Encode};
@@ -14,9 +14,38 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
+use zeroize::Zeroizing;
 
 use crate::agent::SudoAgent;
 use crate::control::ControlAgent;
+
+/// Makes the session for each connection a socket accepts (our own trait
+/// rather than `ssh-agent-lib`'s `Agent`, whose sessions can't be asked
+/// anything before a request is decoded). Cloned for each connection, so
+/// the session is made on the connection's own task, not the accept loop:
+/// reading the peer's `/proc` entries can block.
+pub trait Sessions: Clone + Send + Sync + 'static {
+    type Session: Session + Gate;
+
+    fn session(&self, socket: &UnixStream) -> Self::Session;
+}
+
+/// What a session decides about a connection outside the agent protocol.
+pub trait Gate {
+    /// Whether a request of `message_type` (its first byte) is decoded and
+    /// handled. `false` refuses it undecoded (the session logs why), so a
+    /// request a socket never serves costs no decoding.
+    fn admit(&mut self, message_type: u8) -> bool {
+        let _ = message_type;
+        true
+    }
+
+    /// Whether the connection is to be closed rather than read on: it was
+    /// refused for good.
+    fn closing(&self) -> bool {
+        false
+    }
+}
 
 /// The agent's listening sockets.
 pub struct Listeners {
@@ -45,6 +74,11 @@ struct Limits {
     /// How long writing a reply may take, so a client that stops reading
     /// can't hold its slot.
     reply: Duration,
+    /// Whether a frame's buffer is reserved whole once its length has
+    /// arrived, so it is never reallocated (leaving copies of a key being
+    /// added behind). Only for trusted clients: otherwise every slow client
+    /// could make us reserve the largest frame.
+    reserve: bool,
 }
 
 /// `agent.sock` is reachable by forwarding, so it gets tight limits.
@@ -54,6 +88,7 @@ const AGENT_LIMITS: Limits = Limits {
     idle: Some(Duration::from_secs(60)),
     body: Duration::from_secs(10),
     reply: Duration::from_secs(10),
+    reserve: false,
 };
 
 /// `control.sock` only takes our own uid (see `control.rs`); a client may
@@ -61,6 +96,7 @@ const AGENT_LIMITS: Limits = Limits {
 const CONTROL_LIMITS: Limits = Limits {
     idle: None,
     connections: 32,
+    reserve: true,
     ..AGENT_LIMITS
 };
 
@@ -86,7 +122,7 @@ pub async fn serve(
 /// the agent.
 async fn listen(
     socket: UnixListener,
-    mut agent: impl Agent<UnixListener>,
+    sessions: impl Sessions,
     limits: Limits,
 ) -> Result<(), AgentError> {
     let slots = Arc::new(Semaphore::new(limits.connections));
@@ -99,8 +135,9 @@ async fn listen(
         match socket.accept().await {
             Ok((stream, _)) => {
                 starved = false;
-                let session = agent.new_session(&stream);
+                let sessions = sessions.clone();
                 tokio::spawn(async move {
+                    let session = sessions.session(&stream);
                     if let Err(e) = serve_connection(session, stream, limits).await {
                         log!("Connection ended: {e}");
                     }
@@ -140,15 +177,17 @@ fn timed_out(what: &str) -> AgentError {
     AgentError::IO(io::Error::new(io::ErrorKind::TimedOut, what.to_string()))
 }
 
-/// Reads one request frame: `Ok(None)` when the client hung up between
-/// frames.
-async fn read_request(
+/// Reads one request frame's body (message type and contents): `Ok(None)`
+/// when the client hung up between frames. Only its first byte may wait
+/// for [`Limits::idle`]; the rest of the frame must follow within
+/// [`Limits::body`].
+async fn read_frame(
     stream: &mut UnixStream,
     limits: &Limits,
-) -> Result<Option<Request>, AgentError> {
+) -> Result<Option<Zeroizing<Vec<u8>>>, AgentError> {
     let mut header = [0u8; 4];
     let first = async {
-        match stream.read_exact(&mut header).await {
+        match stream.read_exact(&mut header[..1]).await {
             Ok(_) => Ok(true),
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
             Err(e) => Err(e),
@@ -163,6 +202,9 @@ async fn read_request(
     if !arrived {
         return Ok(None);
     }
+    timeout(limits.body, stream.read_exact(&mut header[1..]))
+        .await
+        .map_err(|_| timed_out("incomplete request"))??;
     let length = u32::from_be_bytes(header);
     if length > limits.frame {
         return Err(AgentError::IO(io::Error::new(
@@ -173,8 +215,11 @@ async fn read_request(
             ),
         )));
     }
-    // Grown as bytes arrive, not reserved up front.
-    let mut body = Vec::new();
+    // Grown as bytes arrive unless reserved (see `Limits::reserve`).
+    let mut body = Zeroizing::new(match limits.reserve {
+        true => Vec::with_capacity(length as usize),
+        false => Vec::new(),
+    });
     timeout(
         limits.body,
         stream.take(u64::from(length)).read_to_end(&mut body),
@@ -184,36 +229,60 @@ async fn read_request(
     if body.len() != length as usize {
         return Err(AgentError::IO(io::ErrorKind::UnexpectedEof.into()));
     }
-    Ok(Some(Request::decode(&mut body.as_slice())?))
+    Ok(Some(body))
 }
 
-/// Answers requests on `stream` until the client leaves or breaks a limit.
+/// Answers requests on `stream` until the client leaves or breaks a limit,
+/// or the session closes the connection.
 async fn serve_connection(
-    mut session: impl Session,
+    mut session: impl Session + Gate,
     mut stream: UnixStream,
     limits: Limits,
 ) -> Result<(), AgentError> {
-    while let Some(request) = read_request(&mut stream, &limits).await? {
-        let response = match session.handle(request).await {
-            Ok(response) => response,
-            Err(AgentError::ExtensionFailure) => Response::ExtensionFailure,
-            Err(_) => Response::Failure,
+    while !session.closing() {
+        let Some(body) = read_frame(&mut stream, &limits).await? else {
+            break;
         };
+        let admitted = body.first().is_none_or(|&kind| session.admit(kind));
+        let response = if admitted {
+            let request = Request::decode(&mut body.as_slice())?;
+            match session.handle(request).await {
+                Ok(response) => response,
+                Err(AgentError::ExtensionFailure) => Response::ExtensionFailure,
+                Err(_) => Response::Failure,
+            }
+        } else {
+            Response::Failure
+        };
+        drop(body);
         let mut frame = Vec::new();
         let length = response
             .encoded_len()
             .map_err(ssh_agent_lib::proto::ProtoError::SshEncoding)?;
-        (length as u32)
+        u32::try_from(length)
+            .map_err(|_| AgentError::IO(io::Error::other("reply too long")))?
             .encode(&mut frame)
             .map_err(ssh_agent_lib::proto::ProtoError::SshEncoding)?;
         response
             .encode(&mut frame)
             .map_err(ssh_agent_lib::proto::ProtoError::SshEncoding)?;
-        timeout(limits.reply, stream.write_all(&frame))
-            .await
-            .map_err(|_| timed_out("reply not read"))??;
+        match timeout(limits.reply, stream.write_all(&frame)).await {
+            Err(_) => return Err(timed_out("reply not read")),
+            // The client hung up while its request waited (e.g. `sudo`
+            // went, or an `approve` client quit): nothing to report.
+            Ok(Err(e)) if hung_up(&e) => return Ok(()),
+            Ok(result) => result?,
+        }
     }
     Ok(())
+}
+
+/// Whether writing failed because the client had closed the connection.
+fn hung_up(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+    )
 }
 
 /// Socket-level tests: the agent served on a real socket, driven by
@@ -940,10 +1009,7 @@ mod tests {
             keys::testing::security_key("token"),
             keys::testing::opaque_key("opaque"),
         ] {
-            let key = KeyEntry {
-                private_key,
-                expires_at: Duration::ZERO,
-            };
+            let key = KeyEntry::new(private_key, Duration::ZERO);
             for constraints in [Vec::new(), vec![KeyConstraint::Lifetime(60)]] {
                 let response = control.handle(add_request(&key, constraints)).await;
                 assert!(
@@ -979,7 +1045,7 @@ mod tests {
     }
 
     /// What `ssh` sends before forwarding a connection (or using it for a
-    /// login): from then on the connection gets nothing.
+    /// login): the connection is refused and closed.
     #[tokio::test]
     async fn session_bind_refuses_the_control_connection_for_good() {
         let loaded = entry("loaded", Duration::from_secs(60));
@@ -1004,12 +1070,10 @@ mod tests {
             ("add", add_request(&other, vec![])),
             ("remove all", Request::RemoveAllIdentities),
         ];
+        // The connection is closed after the refusal: nothing more is served.
         for (name, request) in requests {
             let response = forwarded.handle(request).await;
-            assert!(
-                matches!(response, Ok(Response::Failure)),
-                "{name} should be refused, got {response:?}"
-            );
+            assert!(response.is_err(), "{name} should fail, got {response:?}");
         }
         assert_eq!(running.listed().await, ["loaded"]);
         assert!(prompter.asked().is_empty());
@@ -1046,11 +1110,10 @@ mod tests {
             else {
                 unreachable!()
             };
-            assert!(
-                message.starts_with("Signature request from pid "),
-                "{message}"
-            );
-            assert!(message.contains("\n  key: laptop (SHA256:"), "{message}");
+            assert!(message.starts_with("Signature request\n"), "{message}");
+            assert!(message.contains("\n  from: pid "), "{message}");
+            assert!(message.contains("\n  key: SHA256:"), "{message}");
+            assert!(message.contains(" (laptop), "), "{message}");
             assert!(closes_in > MINUTE - Duration::from_secs(5) && closes_in <= MINUTE);
 
             assert!(matches!(
@@ -1207,9 +1270,12 @@ mod tests {
         let id = pending_id(&event);
 
         let mut forwarded = running.control().await;
-        for request in [session_bind(), approve_answer(id, true), approve_wait()] {
-            let response = within(forwarded.handle(request)).await.unwrap();
-            assert!(matches!(response, Response::Failure), "{response:?}");
+        let response = within(forwarded.handle(session_bind())).await.unwrap();
+        assert!(matches!(response, Response::Failure), "{response:?}");
+        // Closed after the refusal.
+        for request in [approve_answer(id, true), approve_wait()] {
+            let response = within(forwarded.handle(request)).await;
+            assert!(response.is_err(), "{response:?}");
         }
         assert_eq!(running.approve.attached(), 1);
         // Still pending: denying it over a clean connection works.
@@ -1285,7 +1351,8 @@ mod tests {
         ));
         let asked = prompter.asked();
         assert_eq!(asked.len(), 2);
-        assert!(asked[0].contains("key: laptop"), "{asked:?}");
+        assert!(asked[0].contains("key: SHA256:"), "{asked:?}");
+        assert!(asked[0].contains(" (laptop), "), "{asked:?}");
         assert!(asked[0].contains("Allow? (closes in 1m00s)"), "{asked:?}");
 
         stop.send(()).unwrap();
@@ -1399,6 +1466,7 @@ mod tests {
         idle: Some(Duration::from_millis(200)),
         body: Duration::from_millis(200),
         reply: Duration::from_millis(200),
+        reserve: false,
     };
 
     /// True once the daemon has closed `stream`.
@@ -1416,6 +1484,91 @@ mod tests {
         let mut stream = UnixStream::connect(&path).await.unwrap();
         stream.write_all(&u32::MAX.to_be_bytes()).await.unwrap();
         assert!(closed(&mut stream).await);
+    }
+
+    /// A frame of message type `kind` with `contents`.
+    fn frame(kind: u8, contents: &[u8]) -> Vec<u8> {
+        let mut frame = (contents.len() as u32 + 1).to_be_bytes().to_vec();
+        frame.push(kind);
+        frame.extend_from_slice(contents);
+        frame
+    }
+
+    /// The reply to one frame: its body.
+    async fn reply(stream: &mut UnixStream) -> Vec<u8> {
+        let mut length = [0u8; 4];
+        stream.read_exact(&mut length).await.unwrap();
+        let mut body = vec![0; u32::from_be_bytes(length) as usize];
+        stream.read_exact(&mut body).await.unwrap();
+        body
+    }
+
+    /// Requests `agent.sock` never serves are refused from their message
+    /// type, without decoding them: undecodable ones (which would end the
+    /// connection) are refused just the same, and the connection stays.
+    #[tokio::test]
+    async fn agent_socket_refuses_management_without_decoding_it() {
+        let (_dir, path) = limited(AGENT_LIMITS);
+        let mut stream = UnixStream::connect(&path).await.unwrap();
+        // SSH_AGENTC_ADD_ID_CONSTRAINED with garbage, packed with what would
+        // be thousands of one-byte constraints; then an unknown type.
+        let garbage = [2u8; 200 * 1024];
+        for request in [frame(25, &garbage), frame(17, b"x"), frame(99, b"")] {
+            stream.write_all(&request).await.unwrap();
+            assert_eq!(reply(&mut stream).await, [5]); // SSH_AGENT_FAILURE
+        }
+        let mut client = Client::new(stream);
+        assert_eq!(client.request_identities().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn control_socket_still_decodes_everything() {
+        let running = Running::start(Vec::new(), Arc::new(ScriptedPrompter::default()));
+        let mut stream = UnixStream::connect(&running.control_path).await.unwrap();
+        // Undecodable: the connection ends, as before.
+        stream.write_all(&frame(25, b"x")).await.unwrap();
+        assert!(closed(&mut stream).await);
+    }
+
+    /// Once a frame has started, its header is held to the body deadline,
+    /// not the idle one (which `control.sock` doesn't have).
+    #[tokio::test]
+    async fn unfinished_header_times_out() {
+        let limits = Limits {
+            idle: None,
+            ..SMALL
+        };
+        let (_dir, path) = limited(limits);
+        let mut stream = UnixStream::connect(&path).await.unwrap();
+        stream.write_all(&[0, 0]).await.unwrap();
+        assert!(closed(&mut stream).await);
+    }
+
+    /// A client that hangs up while its request waits isn't an error to
+    /// log ("Broken pipe" on writing the reply).
+    #[tokio::test]
+    async fn hanging_up_while_waiting_ends_quietly() {
+        let key = entry("laptop", Duration::from_secs(60));
+        let public = public(&key);
+        let prompter = Arc::new(ApprovesAfter::new(Duration::from_secs(60)));
+        let agent = SudoAgent::new(
+            Arc::new(Mutex::new(vec![key])),
+            Router::only(prompter.clone()),
+        );
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let session = agent.session(&server);
+        let serving = tokio::spawn(serve_connection(session, server, AGENT_LIMITS));
+        let mut body = Vec::new();
+        Request::SignRequest(sign_request(&public))
+            .encode(&mut body)
+            .unwrap();
+        let mut request = (body.len() as u32).to_be_bytes().to_vec();
+        request.extend(body);
+        client.write_all(&request).await.unwrap();
+        prompter.until_asked(1).await;
+        drop(client);
+        let ended = timeout(Duration::from_secs(5), serving).await.unwrap();
+        assert!(ended.unwrap().is_ok());
     }
 
     #[tokio::test]
@@ -1487,7 +1640,11 @@ mod tests {
         frame.extend(&body);
         let (mut client, mut server) = UnixStream::pair().unwrap();
         client.write_all(&frame).await.unwrap();
-        let e = read_request(&mut server, &AGENT_LIMITS).await.unwrap_err();
+        let body = read_frame(&mut server, &AGENT_LIMITS)
+            .await
+            .unwrap()
+            .unwrap();
+        let e = AgentError::from(Request::decode(&mut body.as_slice()).unwrap_err());
         assert!(e.to_string().contains(label), "{e}");
 
         // What `listen` logs for it.

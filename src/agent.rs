@@ -5,27 +5,44 @@ use std::fs::File;
 use std::future;
 use std::io::Read;
 use std::os::fd::{AsFd, OwnedFd};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use signature::Signer;
-use ssh_agent_lib::agent::{Agent, Session};
+use ssh_agent_lib::agent::Session;
 use ssh_agent_lib::error::AgentError;
 use ssh_agent_lib::proto::message::Identity;
 use ssh_agent_lib::proto::{
     AddIdentity, AddIdentityConstrained, AddSmartcardKeyConstrained, RemoveIdentity, SignRequest,
     SmartcardKey, signature::RSA_SHA2_512,
 };
+use ssh_agent_lib::ssh_encoding::Encode;
 use ssh_key::public::KeyData;
 use ssh_key::{Algorithm, HashAlg, Signature};
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::UnixStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::keys::{self, KeyEntry};
 use crate::routing::Router;
+use crate::server::{Gate, Sessions};
+
+// Message types of the requests a client can send (draft-miller-ssh-agent).
+const REQUEST_IDENTITIES: u8 = 11;
+const SIGN_REQUEST: u8 = 13;
+const ADD_IDENTITY: u8 = 17;
+const REMOVE_IDENTITY: u8 = 18;
+const REMOVE_ALL_IDENTITIES: u8 = 19;
+const ADD_SMARTCARD_KEY: u8 = 20;
+const REMOVE_SMARTCARD_KEY: u8 = 21;
+const LOCK: u8 = 22;
+const UNLOCK: u8 = 23;
+const ADD_ID_CONSTRAINED: u8 = 25;
+const ADD_SMARTCARD_KEY_CONSTRAINED: u8 = 26;
+const EXTENSION: u8 = 27;
 
 /// Longest command line shown in an approval prompt, in characters.
 const MAX_COMMAND_CHARS: usize = 200;
@@ -35,6 +52,20 @@ const MAX_COMMAND_CHARS: usize = 200;
 const MAX_CMDLINE_BYTES: usize = 4096;
 
 const KEY_EXPIRED_WHILE_WAITING: &str = "key expired while waiting for approval";
+const KEY_REMOVED_WHILE_WAITING: &str = "key was removed or replaced while waiting for approval";
+
+/// Longest key comment shown in an approval prompt, in characters (log lines
+/// show it whole).
+const MAX_COMMENT_CHARS: usize = 64;
+
+/// Most `agent.sock` signature requests waiting or being served at once;
+/// more are refused without waiting. Forwarded servers can open many
+/// connections, and each queued request costs the user a prompt.
+const MAX_FORWARDED_REQUESTS: usize = 16;
+
+/// The method name of an OpenSSH 8.9+ login bound to the server's host key:
+/// a [`publickey`] request with the host key appended.
+const HOSTBOUND_METHOD: &[u8] = b"publickey-hostbound-v00@openssh.com";
 
 /// `SSH_MSG_USERAUTH_REQUEST` (RFC 4252).
 const USERAUTH_REQUEST: u8 = 50;
@@ -70,6 +101,56 @@ pub struct SudoAgent {
     /// before the previous outcome is logged, and its details from going
     /// stale while it waits.
     requests: Arc<tokio::sync::Mutex<()>>,
+    /// Held by an `agent.sock` request for as long as
+    /// [`requests`](Self::requests), and taken first, so those requests
+    /// queue among themselves and at most one of them is in `requests` at a
+    /// time: however many a server sends, a request from `control.sock`
+    /// waits for at most two prompts (one before it, one forwarded request
+    /// that got in line first).
+    forwarded_lane: Arc<tokio::sync::Mutex<()>>,
+    /// `agent.sock` signature requests waiting or being served.
+    forwarded_requests: Arc<AtomicUsize>,
+}
+
+/// The key a request was approved for: the entry [`SudoAgent::describe`]
+/// found, so that signing and withdrawing go by that entry, not just its
+/// public key.
+struct Described {
+    /// For the prompt: comment, fingerprint and time left.
+    text: String,
+    id: u64,
+    expires_at: Duration,
+}
+
+impl Described {
+    /// Why the entry can no longer be used, once it can't: expired, or
+    /// removed (or replaced by loading the key again) before then.
+    fn gone(&self, now: Duration) -> &'static str {
+        if now >= self.expires_at {
+            KEY_EXPIRED_WHILE_WAITING
+        } else {
+            KEY_REMOVED_WHILE_WAITING
+        }
+    }
+}
+
+/// Counts one `agent.sock` signature request while it lives.
+struct Counted(Arc<AtomicUsize>);
+
+impl Counted {
+    /// Counts a request in `count`, unless `max` are counted already.
+    fn enter(count: &Arc<AtomicUsize>, max: usize) -> Option<Self> {
+        let before = count.fetch_add(1, Ordering::AcqRel);
+        // Dropped (and so uncounted again) if there are too many.
+        let counted = Self(Arc::clone(count));
+        (before < max).then_some(counted)
+    }
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl SudoAgent {
@@ -78,6 +159,8 @@ impl SudoAgent {
             keys,
             approvals: Arc::new(approvals),
             requests: Arc::default(),
+            forwarded_lane: Arc::default(),
+            forwarded_requests: Arc::default(),
         }
     }
 
@@ -98,43 +181,58 @@ impl SudoAgent {
     /// Describes the requested key for the approval prompt, or says why the
     /// request can't be served. Called before prompting so the user is never
     /// asked to approve something that would fail anyway.
-    fn describe(&self, key_data: &KeyData, flags: u32) -> Result<String, String> {
+    ///
+    /// The fingerprint comes before the comment, which is cut short, so a
+    /// long comment can't push the rest out of a popup.
+    fn describe(&self, key_data: &KeyData, flags: u32) -> Result<Described, String> {
         let keys = self.keys.lock().unwrap();
         let now = keys::now();
         let entry = find(&keys, key_data, now).ok_or("key not loaded or expired")?;
         if let Some(reason) = unsupported(entry.private_key.algorithm(), flags) {
             return Err(reason.to_owned());
         }
-        Ok(format!(
-            "{} ({}), {} left",
-            sanitize(entry.private_key.comment()),
-            entry.private_key.fingerprint(HashAlg::Sha256),
-            keys::format_remaining(entry.expires_at - now)
-        ))
+        let comment = match entry.private_key.comment() {
+            "" => String::new(),
+            comment => format!(" ({})", shown(comment.as_bytes(), MAX_COMMENT_CHARS)),
+        };
+        Ok(Described {
+            text: format!(
+                "{}{comment}, {} left",
+                entry.private_key.fingerprint(HashAlg::Sha256),
+                keys::format_remaining(entry.expires_at - now)
+            ),
+            id: entry.id(),
+            expires_at: entry.expires_at,
+        })
     }
 
-    /// Signs with the key if it is still loaded and unexpired. Looked up again
-    /// (rather than kept from [`describe`](Self::describe)) because the lock
-    /// isn't held while the user decides, and the TTL may run out meanwhile.
-    fn sign_with(&self, key_data: &KeyData, data: &[u8]) -> Result<Signature, String> {
+    /// Signs with the entry `key` was found in, if it is still loaded and
+    /// unexpired. Looked up again because the lock isn't held while the user
+    /// decides, and the TTL may run out meanwhile; by entry, so a key removed
+    /// and loaded again needs a new approval.
+    fn sign_with(&self, key: &Described, data: &[u8]) -> Result<Signature, String> {
         let keys = self.keys.lock().unwrap();
-        let entry = find(&keys, key_data, keys::now()).ok_or(KEY_EXPIRED_WHILE_WAITING)?;
+        let now = keys::now();
+        let entry = keys
+            .iter()
+            .find(|k| k.id() == key.id && !k.is_expired(now))
+            .ok_or_else(|| key.gone(now))?;
         entry
             .private_key
             .try_sign(data)
             .map_err(|e| format!("signing failed: {e}"))
     }
 
-    /// Resolves once the key can no longer be used: expired, or no longer
-    /// loaded.
-    async fn key_gone(&self, key_data: &KeyData) {
+    /// Resolves once the entry `key` was found in can no longer be used,
+    /// with why: expired, or no longer loaded (removed, or replaced).
+    async fn key_gone(&self, key: &Described) -> &'static str {
         loop {
             let left = {
                 let keys = self.keys.lock().unwrap();
                 let now = keys::now();
-                match find(&keys, key_data, now) {
-                    Some(entry) => entry.expires_at - now,
-                    None => return,
+                match keys.iter().find(|k| k.id() == key.id) {
+                    Some(entry) if !entry.is_expired(now) => entry.expires_at - now,
+                    _ => return key.gone(now),
                 }
             };
             // `sleep` runs on CLOCK_MONOTONIC, which stops during suspend;
@@ -175,8 +273,10 @@ impl SudoAgent {
     }
 }
 
-impl Agent<UnixListener> for SudoAgent {
-    fn new_session(&mut self, socket: &UnixStream) -> impl Session {
+impl Sessions for SudoAgent {
+    type Session = Connection;
+
+    fn session(&self, socket: &UnixStream) -> Connection {
         Connection::new(self.clone(), socket)
     }
 }
@@ -250,6 +350,34 @@ impl Connection {
     }
 }
 
+impl Gate for Connection {
+    /// On `agent.sock`, only listing, signing and extensions are decoded:
+    /// anything else is refused (and logged) from its message type, so a
+    /// server can't make us decode, say, a request to add a key with
+    /// thousands of constraints.
+    fn admit(&mut self, message_type: u8) -> bool {
+        if !self.forwarded {
+            return true;
+        }
+        let what = match message_type {
+            REQUEST_IDENTITIES | SIGN_REQUEST | EXTENSION => return true,
+            ADD_IDENTITY | ADD_ID_CONSTRAINED => "adding a key",
+            REMOVE_IDENTITY => "removing a key",
+            REMOVE_ALL_IDENTITIES => "removing all keys",
+            ADD_SMARTCARD_KEY | ADD_SMARTCARD_KEY_CONSTRAINED => "adding a smartcard key",
+            REMOVE_SMARTCARD_KEY => "removing a smartcard key",
+            LOCK => "locking",
+            UNLOCK => "unlocking",
+            other => {
+                log!("Refused request of unknown type {other} from {}", self.peer);
+                return false;
+            }
+        };
+        let _ = self.refuse_management(what);
+        false
+    }
+}
+
 #[async_trait]
 impl Session for Connection {
     // Key management is refused here and logged: on the forwarded socket it
@@ -317,43 +445,72 @@ impl Session for Connection {
     async fn sign(&mut self, request: SignRequest) -> Result<Signature, AgentError> {
         // Named in the prompt; it and the key in every log line about the
         // request.
-        let payload = Payload::of(&request.data);
+        let mut blob = Vec::new();
+        let payload = match request.credential.encode(&mut blob) {
+            Ok(()) => Payload::of(&request.data, &blob),
+            Err(_) => Payload::Unknown,
+        };
         let key_data = request.credential.key_data();
         let subject = format!("{payload} with key {}", self.agent.key_name(key_data));
-        // A client that goes away (e.g. its SSH connection closes) leaves the
-        // queue, or has its prompt withdrawn.
-        let hung_up = hung_up(self.client.as_ref());
-        tokio::pin!(hung_up);
 
-        let _turn = tokio::select! {
-            turn = self.agent.requests.lock() => turn,
-            () = &mut hung_up => return self.refuse(&subject, "client disconnected"),
-        };
-
-        let key = match self.agent.describe(key_data, request.flags) {
-            Ok(key) => key,
-            Err(reason) => return self.refuse(&subject, &reason),
-        };
+        // What would be refused anyway is refused before it queues.
         if self.forwarded && !payload.forwardable() {
             return self.refuse(
                 &subject,
                 "agent.sock signs only sudo (pam_ssh_agent_auth) challenges and SSH logins",
             );
         }
+        if let Err(reason) = self.agent.describe(key_data, request.flags) {
+            return self.refuse(&subject, &reason);
+        }
 
+        // A client that goes away (e.g. its SSH connection closes) leaves the
+        // queue, or has its prompt withdrawn.
+        let hung_up = hung_up(self.client.as_ref());
+        tokio::pin!(hung_up);
+
+        let mut _counted = None;
+        let mut _lane = None;
+        if self.forwarded {
+            let Some(counted) =
+                Counted::enter(&self.agent.forwarded_requests, MAX_FORWARDED_REQUESTS)
+            else {
+                return self.refuse(&subject, "too many agent.sock requests waiting");
+            };
+            _counted = Some(counted);
+            _lane = Some(tokio::select! {
+                lane = self.agent.forwarded_lane.lock() => lane,
+                () = &mut hung_up => return self.refuse(&subject, "client disconnected"),
+            });
+        }
+        let _turn = tokio::select! {
+            turn = self.agent.requests.lock() => turn,
+            () = &mut hung_up => return self.refuse(&subject, "client disconnected"),
+        };
+
+        // Looked up again now that it's this request's turn: the key may
+        // have gone, or been replaced, while it waited.
+        let subject = format!("{payload} with key {}", self.agent.key_name(key_data));
+        let key = match self.agent.describe(key_data, request.flags) {
+            Ok(key) => key,
+            Err(reason) => return self.refuse(&subject, &reason),
+        };
+
+        // What is signed comes first, then the key's fingerprint: a popup that
+        // has to cut the text short cuts the peer's command line instead.
         let message = format!(
-            "Signature request from {}\n  key: {key}\n  signing: {payload}\nAllow?",
-            self.peer
+            "Signature request\n  signing: {payload}\n  key: {}\n  from: {}\nAllow?",
+            key.text, self.peer
         );
         let cancel = CancellationToken::new();
         let confirm = self.agent.approvals.ask(&message, &cancel);
         tokio::pin!(confirm);
-        let key_gone = self.agent.key_gone(key_data);
+        let key_gone = self.agent.key_gone(&key);
         tokio::pin!(key_gone);
         let answer = tokio::select! {
             answer = &mut confirm => Ok(answer),
             () = &mut hung_up => Err("client disconnected"),
-            () = &mut key_gone => Err(KEY_EXPIRED_WHILE_WAITING),
+            reason = &mut key_gone => Err(reason),
         };
         let answer = match answer {
             Ok(answer) => answer,
@@ -372,11 +529,15 @@ impl Session for Connection {
         for problem in &answer.problems {
             log!("Approval backend failed (logged only once): {problem}");
         }
+        if let Some(from) = &answer.from {
+            let verdict = if answer.approved { "Allowed" } else { "Denied" };
+            log!("{verdict} by {from}");
+        }
         if !answer.approved {
             return self.refuse(&subject, &format!("denied ({})", answer.by));
         }
 
-        match self.agent.sign_with(key_data, &request.data) {
+        match self.agent.sign_with(&key, &request.data) {
             Ok(signature) => {
                 log!(
                     "Approved ({}) signature request for {subject} from {}",
@@ -451,12 +612,14 @@ enum Payload {
 }
 
 impl Payload {
-    fn of(data: &[u8]) -> Self {
+    /// What `data` is, to be signed with the key whose blob (the request's
+    /// credential, encoded) is `key`.
+    fn of(data: &[u8], key: &[u8]) -> Self {
         if let Some(mut rest) = data.strip_prefix(SSHSIG_MAGIC) {
-            let namespace = take_string(&mut rest).map(shown);
+            let namespace = take_string(&mut rest).map(|ns| shown(ns, MAX_LABEL_CHARS));
             return Self::Sshsig { namespace };
         }
-        Self::userauth(data).unwrap_or(Self::Unknown)
+        Self::userauth(data, key).unwrap_or(Self::Unknown)
     }
 
     /// Whether `agent.sock` signs it: a `sudo` challenge, or an SSH login
@@ -476,33 +639,37 @@ impl Payload {
     /// byte     message type (the module's: SSH2_MSG_USERAUTH_TRUST_REQUEST)
     /// string   user name
     /// string   service name ("pam_ssh_agent_auth"; a login's: "ssh-connection")
-    /// string   "publickey"
+    /// string   "publickey" (a login's may be "publickey-hostbound-v00@openssh.com")
     /// boolean  TRUE
     /// string   public key algorithm name
     /// string   public key blob
+    /// string   server host key (only after the hostbound method)
     /// ```
     ///
     /// The service name is what makes it safe to sign, so it must match
     /// exactly: an SSH server checks a login signature over this data with
     /// its own service name, "ssh-connection" (OpenSSH treats any other as
     /// an invalid user), so a signature over a challenge can't be replayed
-    /// as a login. The rest is checked only as far as is certain, since
-    /// refusing real challenges would break `sudo`: the message type may be
-    /// 54 (the module's own, as remembered) or 50 (the standard one), the
-    /// method must be "publickey", the flag, algorithm name and key blob
-    /// must be there but may hold anything (no particular name for RSA,
-    /// say), and anything after them is ignored.
-    fn userauth(mut data: &[u8]) -> Option<Self> {
+    /// as a login. The rest must be well formed too, so the prompt never
+    /// names something else: the flag must be TRUE, the key blob the key
+    /// asked to sign with, and nothing may follow. The message type may be
+    /// 54 (the module's own, as remembered) or 50 (the standard one), and the
+    /// algorithm name isn't checked (an RSA key signs as rsa-sha2-512 under
+    /// the name ssh-rsa, say).
+    fn userauth(mut data: &[u8], key: &[u8]) -> Option<Self> {
         take_string(&mut data)?; // session identifier
         let kind = take_byte(&mut data)?;
-        let user = shown(take_string(&mut data)?);
+        let user = shown(take_string(&mut data)?, MAX_LABEL_CHARS);
         let service = take_string(&mut data)?;
         if service == PAM_SERVICE {
             let challenge = matches!(kind, USERAUTH_REQUEST | USERAUTH_TRUST_REQUEST)
-                && publickey(data).is_some();
+                && publickey(data, key, false).is_some();
             return challenge.then_some(Self::Sudo { user });
         }
-        (kind == USERAUTH_REQUEST && service == LOGIN_SERVICE).then_some(Self::Login { user })
+        let login = kind == USERAUTH_REQUEST
+            && service == LOGIN_SERVICE
+            && publickey(data, key, true).is_some();
+        login.then_some(Self::Login { user })
     }
 }
 
@@ -521,14 +688,24 @@ impl fmt::Display for Payload {
 }
 
 /// The rest of a public key user authentication request, after the
-/// service name: the method name, has-signature flag, algorithm name and
-/// key blob.
-fn publickey(mut data: &[u8]) -> Option<()> {
-    (take_string(&mut data)? == b"publickey").then_some(())?;
-    take_byte(&mut data)?;
-    take_string(&mut data)?;
-    take_string(&mut data)?;
-    Some(())
+/// service name: the method name, has-signature flag (TRUE), algorithm name
+/// and the blob of `key`, and with `hostbound` allowed, OpenSSH's
+/// host-bound method, followed by the server's host key. Nothing may
+/// follow.
+fn publickey(mut data: &[u8], key: &[u8], hostbound: bool) -> Option<()> {
+    let method = take_string(&mut data)?;
+    let bound = match method {
+        b"publickey" => false,
+        HOSTBOUND_METHOD if hostbound => true,
+        _ => return None,
+    };
+    (take_byte(&mut data)? != 0).then_some(())?;
+    take_string(&mut data)?; // algorithm name
+    (take_string(&mut data)? == key).then_some(())?;
+    if bound {
+        take_string(&mut data)?; // server host key
+    }
+    data.is_empty().then_some(())
 }
 
 /// Takes an SSH `string` (a big-endian `u32` length, then that many bytes)
@@ -547,11 +724,12 @@ fn take_byte(data: &mut &[u8]) -> Option<u8> {
     Some(byte)
 }
 
-/// Text from a request's data, made safe to print and cut short.
-fn shown(raw: &[u8]) -> String {
+/// Text from a request's data (or a key comment), made safe to print and
+/// cut short at `max` characters.
+fn shown(raw: &[u8], max: usize) -> String {
     let text = String::from_utf8_lossy(raw);
-    if text.chars().count() > MAX_LABEL_CHARS {
-        let truncated: String = text.chars().take(MAX_LABEL_CHARS).collect();
+    if text.chars().count() > max {
+        let truncated: String = text.chars().take(max).collect();
         format!("{}…", sanitize(&truncated))
     } else {
         sanitize(&text)
@@ -631,9 +809,18 @@ fn command_line(pid: i32) -> Option<String> {
 pub fn sanitize(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
+        // Zero-width and bidirectional formatting, line and paragraph
+        // separators (a line break in a popup), invisible operators and
+        // tag characters.
         let disguising = matches!(
             c,
-            '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}'
+            '\u{061C}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{FEFF}'
+                | '\u{E0000}'..='\u{E007F}'
         );
         if c.is_control() || disguising {
             out.extend(c.escape_unicode());
@@ -727,7 +914,7 @@ mod tests {
 
         let asked = prompter.asked();
         assert_eq!(asked.len(), 1);
-        assert!(asked[0].contains("laptop") && asked[0].ends_with("Allow?"));
+        assert!(asked[0].contains("(laptop)") && asked[0].ends_with("Allow?"));
         assert!(
             asked[0].contains("\n  signing: a sudo challenge for user alice\n"),
             "{asked:?}"
@@ -838,22 +1025,24 @@ mod tests {
     fn payload_kinds() {
         let laptop = entry("laptop", Duration::ZERO);
         let key = laptop.private_key.public_key().key_data();
+        let blob = testing::blob(key);
+        let of = |data: &[u8]| Payload::of(data, &blob);
         let sudo = || Payload::Sudo {
             user: "alice".into(),
         };
         let challenge = testing::sudo_challenge(key, "alice");
-        assert_eq!(Payload::of(&challenge), sudo());
+        assert_eq!(of(&challenge), sudo());
         // The standard message type, in case the module uses it.
         let standard = testing::userauth(USERAUTH_REQUEST, key, "alice", "pam_ssh_agent_auth");
-        assert_eq!(Payload::of(&standard), sudo());
-        // What follows the key blob isn't looked at.
+        assert_eq!(of(&standard), sudo());
+        // Nothing may follow the key blob.
         let mut longer = challenge.clone();
         longer.extend_from_slice(b"more");
-        assert_eq!(Payload::of(&longer), sudo());
+        assert_eq!(of(&longer), Payload::Unknown);
 
         // Every field up to the key blob must be there.
         for cut in 0..challenge.len() {
-            assert_ne!(Payload::of(&challenge[..cut]), sudo(), "cut at {cut}");
+            assert_ne!(of(&challenge[..cut]), sudo(), "cut at {cut}");
         }
         // The service name must match exactly, and the method be a public
         // key.
@@ -863,7 +1052,7 @@ mod tests {
             "ssh-connection",
         ] {
             let other = testing::userauth(USERAUTH_TRUST_REQUEST, key, "alice", service);
-            assert_eq!(Payload::of(&other), Payload::Unknown, "{service}");
+            assert_ne!(of(&other), sudo(), "{service}");
         }
         let at = challenge
             .windows(9)
@@ -871,16 +1060,44 @@ mod tests {
             .unwrap();
         let mut not_publickey = challenge.clone();
         not_publickey[at + 8] = b'z';
-        assert_eq!(Payload::of(&not_publickey), Payload::Unknown);
+        assert_eq!(of(&not_publickey), Payload::Unknown);
+        // The flag must be TRUE.
+        let mut no_signature = challenge.clone();
+        no_signature[at + 9] = 0;
+        assert_eq!(of(&no_signature), Payload::Unknown);
         let other_type = testing::userauth(51, key, "alice", "pam_ssh_agent_auth");
-        assert_eq!(Payload::of(&other_type), Payload::Unknown);
+        assert_eq!(of(&other_type), Payload::Unknown);
+        // Only `ssh` logins may be host-bound.
+        let hostbound_sudo = testing::userauth_with_method(
+            USERAUTH_TRUST_REQUEST,
+            key,
+            "alice",
+            "pam_ssh_agent_auth",
+            "publickey-hostbound-v00@openssh.com",
+        );
+        assert_eq!(of(&hostbound_sudo), Payload::Unknown);
+        // The key blob must be the key asked to sign with.
+        let other_key = entry("other", Duration::ZERO);
+        let other_blob = testing::blob(other_key.private_key.public_key().key_data());
+        assert_eq!(Payload::of(&challenge, &other_blob), Payload::Unknown);
+        assert_eq!(
+            Payload::of(&testing::ssh_login(key, "alice"), &other_blob),
+            Payload::Unknown
+        );
 
         let login = || Payload::Login {
             user: "alice".into(),
         };
-        assert_eq!(Payload::of(&testing::ssh_login(key, "alice")), login());
+        let ssh_login = testing::ssh_login(key, "alice");
+        assert_eq!(of(&ssh_login), login());
+        let mut longer = ssh_login.clone();
+        longer.push(0);
+        assert_eq!(of(&longer), Payload::Unknown);
+        for cut in 0..ssh_login.len() {
+            assert_ne!(of(&ssh_login[..cut]), login(), "cut at {cut}");
+        }
         // OpenSSH 8.9+ logs in with "publickey-hostbound-v00@openssh.com"
-        // where the server supports it.
+        // where the server supports it, with the server's host key last.
         let hostbound = testing::userauth_with_method(
             USERAUTH_REQUEST,
             key,
@@ -888,26 +1105,27 @@ mod tests {
             "ssh-connection",
             "publickey-hostbound-v00@openssh.com",
         );
-        assert_eq!(Payload::of(&hostbound), login());
+        assert_eq!(of(&hostbound), login());
+        let mut no_host_key = hostbound.clone();
+        no_host_key.truncate(hostbound.len() - blob.len() - 4);
+        assert_eq!(of(&no_host_key), Payload::Unknown);
         assert_eq!(
-            Payload::of(&testing::sshsig("git")),
+            of(&testing::sshsig("git")),
             Payload::Sshsig {
                 namespace: Some("git".into())
             }
         );
-        assert_eq!(Payload::of(b"SSHSIG"), Payload::Sshsig { namespace: None });
-        assert_eq!(
-            Payload::of(b"pam_ssh_agent_auth challenge"),
-            Payload::Unknown
-        );
-        assert_eq!(Payload::of(&[]), Payload::Unknown);
+        assert_eq!(of(b"SSHSIG"), Payload::Sshsig { namespace: None });
+        assert_eq!(of(b"pam_ssh_agent_auth challenge"), Payload::Unknown);
+        assert_eq!(of(&[]), Payload::Unknown);
     }
 
     #[test]
     fn payload_labels_are_safe_to_show() {
         let laptop = entry("laptop", Duration::ZERO);
         let key = laptop.private_key.public_key().key_data();
-        let label = |data: Vec<u8>| Payload::of(&data).to_string();
+        let blob = testing::blob(key);
+        let label = |data: Vec<u8>| Payload::of(&data, &blob).to_string();
 
         assert_eq!(
             label(testing::sudo_challenge(key, "alice")),
@@ -955,10 +1173,10 @@ mod tests {
     /// Loading refuses such keys; this is the backstop, should one get in.
     #[tokio::test]
     async fn key_that_cannot_sign_is_refused_without_prompting() {
-        let key = KeyEntry {
-            private_key: keys::testing::security_key("token"),
-            expires_at: keys::now() + Duration::from_secs(60),
-        };
+        let key = KeyEntry::new(
+            keys::testing::security_key("token"),
+            keys::now() + Duration::from_secs(60),
+        );
         let mut request = request(&key);
         request.flags = RSA_SHA2_512;
         let prompter = Arc::new(ScriptedPrompter::with_confirms([true]));
@@ -1176,6 +1394,131 @@ mod tests {
         assert_eq!(sanitize("a\x1b[2Kb"), "a\\u{1b}[2Kb");
         assert_eq!(sanitize("x\ny"), "x\\u{a}y");
         assert_eq!(sanitize("evil\u{202E}txt"), "evil\\u{202e}txt");
+        // Line breaks in a popup, invisible operators and tags.
+        assert_eq!(sanitize("a\u{2028}b\u{2029}c"), "a\\u{2028}b\\u{2029}c");
+        assert_eq!(sanitize("a\u{061C}b\u{2060}c"), "a\\u{61c}b\\u{2060}c");
+        assert_eq!(sanitize("a\u{E0041}b"), "a\\u{e0041}b");
+    }
+
+    #[tokio::test]
+    async fn key_loaded_again_needs_a_new_approval() {
+        let key = entry("laptop", Duration::from_secs(60));
+        let again = KeyEntry::new(key.private_key.clone(), key.expires_at);
+        let key_data = key.private_key.public_key().key_data().clone();
+        let request = request(&key);
+        let prompter = Arc::new(ApprovesAfter::new(Duration::from_millis(300)));
+        let agent = SudoAgent::new(
+            Arc::new(Mutex::new(vec![key])),
+            Router::only(prompter.clone()),
+        );
+        let mut conn = Connection {
+            agent: agent.clone(),
+            peer: Peer::default(),
+            client: None,
+            forwarded: true,
+        };
+
+        let sign = tokio::spawn(async move { conn.sign(request).await });
+        prompter.until_asked(1).await;
+        // Removed and loaded again before the prompt is answered.
+        assert!(agent.remove(&key_data).is_some());
+        assert!(!agent.add(again));
+        let result = tokio::time::timeout(Duration::from_secs(5), sign)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(result, Err(AgentError::Failure)));
+    }
+
+    #[test]
+    fn a_gone_key_says_whether_it_expired() {
+        let key = Described {
+            text: String::new(),
+            id: 0,
+            expires_at: Duration::from_secs(100),
+        };
+        assert_eq!(key.gone(Duration::from_secs(99)), KEY_REMOVED_WHILE_WAITING);
+        assert_eq!(
+            key.gone(Duration::from_secs(100)),
+            KEY_EXPIRED_WHILE_WAITING
+        );
+    }
+
+    #[test]
+    fn long_comments_are_cut_after_the_fingerprint() {
+        let key = entry(&"c".repeat(1000), Duration::from_secs(60));
+        let key_data = key.private_key.public_key().key_data().clone();
+        let fingerprint = key.private_key.fingerprint(HashAlg::Sha256).to_string();
+        let agent = SudoAgent::new(
+            Arc::new(Mutex::new(vec![key])),
+            Router::only(Arc::new(ScriptedPrompter::default())),
+        );
+        let text = agent.describe(&key_data, 0).unwrap().text;
+        assert!(text.starts_with(&format!("{fingerprint} (")), "{text}");
+        assert!(
+            text.contains(&format!("({}…), ", "c".repeat(MAX_COMMENT_CHARS))),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn forwarded_requests_are_counted_up_to_a_limit() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let first = Counted::enter(&count, 2).unwrap();
+        let second = Counted::enter(&count, 2).unwrap();
+        assert!(Counted::enter(&count, 2).is_none());
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        drop(first);
+        let third = Counted::enter(&count, 2).unwrap();
+        drop((second, third));
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn forwarded_requests_queue_among_themselves() {
+        let key = entry("laptop", Duration::from_secs(60));
+        let prompter = Arc::new(ApprovesAfter::new(Duration::from_millis(150)));
+        let agent = SudoAgent::new(
+            Arc::new(Mutex::new(vec![key])),
+            Router::only(prompter.clone()),
+        );
+        let key = agent.keys.lock().unwrap()[0].private_key.clone();
+        let entry = KeyEntry::new(key, Duration::MAX);
+        let done = Arc::new(Mutex::new(Vec::new()));
+        let start = |name: &'static str, forwarded: bool| {
+            let mut conn = Connection {
+                agent: agent.clone(),
+                peer: Peer::default(),
+                client: None,
+                forwarded,
+            };
+            let request = request(&entry);
+            let done = Arc::clone(&done);
+            tokio::spawn(async move {
+                assert!(conn.sign(request).await.is_ok(), "{name}");
+                done.lock().unwrap().push(name);
+            })
+        };
+
+        let mut tasks = vec![start("forwarded 1", true)];
+        prompter.until_asked(1).await;
+        for (name, forwarded) in [
+            ("forwarded 2", true),
+            ("forwarded 3", true),
+            ("control", false),
+        ] {
+            tasks.push(start(name, forwarded));
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        // The control request waited only for the open prompt, not for the
+        // forwarded ones queued behind it.
+        assert_eq!(
+            *done.lock().unwrap(),
+            ["forwarded 1", "control", "forwarded 2", "forwarded 3"]
+        );
     }
 
     #[test]
@@ -1194,7 +1537,6 @@ mod tests {
 #[cfg(test)]
 pub mod testing {
     use super::*;
-    use ssh_agent_lib::ssh_encoding::Encode;
 
     /// What `pam_ssh_agent_auth` asks to sign when `user` runs `sudo` with
     /// `key` ([`Payload::userauth`]).
@@ -1233,9 +1575,18 @@ pub mod testing {
         method.encode(&mut data).unwrap();
         1u8.encode(&mut data).unwrap();
         key.algorithm().as_str().encode(&mut data).unwrap();
+        blob(key).encode(&mut data).unwrap();
+        if method == "publickey-hostbound-v00@openssh.com" {
+            // The server's host key; any key will do.
+            blob(key).encode(&mut data).unwrap();
+        }
+        data
+    }
+
+    /// The encoded public key, as in a request's data and credential.
+    pub fn blob(key: &KeyData) -> Vec<u8> {
         let mut blob = Vec::new();
         key.encode(&mut blob).unwrap();
-        blob.encode(&mut data).unwrap();
-        data
+        blob
     }
 }

@@ -106,7 +106,7 @@ every `sudo` authenticates anyway.)
 
 | # | Action | Expected on laptop | Expected on server |
 |---|--------|--------------------|--------------------|
-| 1 | `sudo -k; sudo -v`, answer **y** | Prompt names the `ssh … <server>` process, the key, and time left, and says `signing: a sudo challenge for user <you>`; then `Approved (terminal) signature request …` | Succeeds with **no password prompt** |
+| 1 | `sudo -k; sudo -v`, answer **y** | Prompt starts `Signature request`, then `signing: a sudo challenge for user <you>`, `key: SHA256:… (<comment>), <time> left` and `from: pid …: ssh … <server>`; then `Approved (terminal) signature request …` (since the 2026-11 audit fixes the challenge must be well formed for that key, with nothing after it, so this also checks the module sends exactly that) | Succeeds with **no password prompt** |
 | 2 | `sudo -k; sudo -v`, answer **n** (or Enter) | `Refused signature request …: denied (terminal)` | Falls back to the password prompt (or fails if there's no fallback) |
 | 3 | Restart the agent with `--ttl 1m` (no need to reconnect: the forwarded channel reconnects to the socket path for every request), wait > 1 min, then `sudo -k; sudo -v` | `Key expired and was removed: …`, **no** prompt | `ssh-add -l` shows no identities; sudo falls back to the password |
 | 4 | Two sessions run `sudo -k; sudo -v` at the same time | Prompts appear one after another; each request's `Approved`/`Refused` line comes before the next prompt, nothing interleaved | Each succeeds once approved |
@@ -144,6 +144,11 @@ every `sudo` authenticates anyway.)
 | 37 | A client running: `systemctl --user restart sudo-agent`. Add the key again, `sudo -k; sudo -v`, and with the client's prompt open restart it again; add the key once more and `sudo -k; sudo -v` | Each restart, in the client: `sudo-agent went away; waiting for it to start again (Ctrl-C quits)`, then `sudo-agent is back; waiting for approval requests` (the second time, the prompt line ends first); journal: `Approve client attached` in each new agent. The last `sudo` prompts in the client | With the prompt open: falls back to the password prompt; after re-adding the key, succeeds |
 | 38 | Laptop over SSH: the service runs in the desktop session; from another machine, SSH into the laptop and run `sudo-agent approve` there; `sudo -k; sudo -v` on a server as usual, answer **y** in that SSH session | The request shows in the SSH session (and as the popup on the desktop); `Approved (approve) …` | Succeeds |
 | 39 | Two keys loaded: add a second one with a different lifetime (`ssh-add -t 5m <other key>` against `control.sock`). Best is a dedicated sudo key, listed only in the server's `pam_ssh_agent_auth` keys file (`file=`), next to the key you log in with. `ssh-add -l` on both sides; `sudo -k; sudo -v`, answer **y**; then from the server `ssh <another host>` (or `git push`), answer **y**; wait for the shorter lifetime to run out and repeat both | Two `Added key …` lines. The `sudo` prompt names the key from the `file=` list and says `signing: a sudo challenge …`; the login prompt names the login key and says `signing: an SSH login as user …`. One prompt per operation: a prompt for a key the operation doesn't use means the client (or `pam_ssh_agent_auth`) asks every key in turn, so note it. When the short-lived key expires, only it is removed (`Key expired …`) and the other keeps working | `ssh-add -l` lists both, each with its own time left; `sudo` and the onward login succeed; after the expiry, one key is listed, and whatever uses it still succeeds |
+| 40 | `sudo -k; sudo -v` and, with the prompt open, on the laptop `SSH_AUTH_SOCK=…/control.sock ssh-add -d <key>` and add it again at once | The prompt is withdrawn (within a second) and `Refused …: key was removed or replaced while waiting for approval`; the next `sudo` prompts as usual | Falls back to the password prompt |
+| 41 | Laptop only: `sudo-agent serve --control-socket /tmp/c.sock` (and again with a directory you `chmod 777`) | Refused at startup: `… is unsafe for a socket: /tmp is not owned by the current user` (`… is writable by other users`); nothing is created | — |
+| 42 | Agent in a foreground terminal (popups off) and a `sudo-agent approve` in another; `sudo -k; sudo -v`, answer **y** in the client | The agent's prompt line ends first, then `Allowed by approve client pid …` and `Approved (approve) …`, each on its own line | Succeeds |
+| 43 | Add a key with a long comment (`ssh-keygen -c -C "$(printf 'x%.0s' {1..300})" -f <copy of the key>`, then `ssh-add` it); `sudo -k; sudo -v` with the popup | Popup and terminal show `signing: a sudo challenge …` and the fingerprint before the comment, cut after 64 characters with `…`; log lines keep the whole comment | Succeeds once allowed |
+| 44 | Laptop only: with the agent running, `grep core /proc/$(pgrep -f 'sudo-agent serve')/limits` and `cat /proc/$(pgrep -f 'sudo-agent serve')/environ` | Core file size `0`; reading `environ` is `Permission denied` (not dumpable) | — |
 | 5 | Stop the agent (Ctrl-C with no prompt open), then `sudo -k; sudo -v` | Nothing (agent is gone) | Password prompt: proves `sudo` really authenticates through `sudo-agent`, not some other forwarded agent |
 
 Cases 1, 2 and 6–9 test the terminal prompt: since step 2c, start the agent
@@ -168,7 +173,14 @@ included. The client's own lines go to its terminal; the agent's go to the
 journal.
 
 Case 39 tests several keys at once: each prompt names the right key and
-what it signs, and each key expires on its own.
+what it signs, and each key expires on its own. Since the 2026-11 audit
+fixes it also checks that onward logins (often
+`publickey-hostbound-v00@openssh.com`) still pass the stricter parsing.
+
+Cases 40–44 cover the fixes from the 2026-11-19 security audit: a key
+loaded again needs a new approval, custom socket paths must be private,
+log lines follow the prompt, long comments can't push the purpose out of
+a popup, and no core dumps.
 
 Report: the pam_ssh_agent_auth version, key type, the exact prompt text, and
 any `Refused …` lines from the laptop.

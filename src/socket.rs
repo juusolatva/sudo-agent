@@ -8,10 +8,10 @@
 //! other's sockets.
 
 use std::ffi::OsString;
-use std::fs::{self, DirBuilder, Permissions};
+use std::fs::{self, DirBuilder};
 use std::io::{self, ErrorKind};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
 use socket2::{Domain, SockAddr, Socket, Type};
@@ -50,6 +50,14 @@ pub fn choose_path(
 pub fn default_path(name: &str) -> io::Result<PathBuf> {
     let (dir, file_name) = default_location(name, |var| std::env::var_os(var), hostname)?;
     ensure_private_dir(&dir)?;
+    Ok(dir.join(file_name))
+}
+
+/// The default path of the `name` socket for a client: like
+/// [`default_path`], but creates nothing (no agent has, if the directory is
+/// missing).
+pub fn default_client_path(name: &str) -> io::Result<PathBuf> {
+    let (dir, file_name) = default_location(name, |var| std::env::var_os(var), hostname)?;
     Ok(dir.join(file_name))
 }
 
@@ -103,12 +111,93 @@ pub fn bind(path: &Path) -> io::Result<(UnixListener, SocketFile)> {
         ));
     }
 
+    check_location(path)?;
     remove_stale(path)?;
     let listener = listen_private(path)?;
     let file = SocketFile::new(path)?;
-    // Already so; a cheap check that it stays that way.
-    fs::set_permissions(path, Permissions::from_mode(0o600))?;
+    // Already so; a cheap check (that follows no symlink) that it stays so.
+    let meta = fs::symlink_metadata(path)?;
+    if !meta.file_type().is_socket() || meta.mode() & 0o077 != 0 {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            format!("{} isn't a private socket after binding", path.display()),
+        ));
+    }
     Ok((listener, file))
+}
+
+/// Checks that only we (or root) can change what `path` names: its
+/// directory must be ours and writable by no one else, and every directory
+/// above it owned by us or root and writable by no one else unless sticky
+/// (like `/tmp`, where others can't rename what's ours). Otherwise another
+/// user could put their own socket there, and `ssh-add` would hand it a
+/// key. Applies to every socket path, given or default.
+pub fn check_location(path: &Path) -> io::Result<()> {
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    let dir = fs::canonicalize(dir).map_err(|e| {
+        io::Error::new(e.kind(), format!("socket directory {}: {e}", dir.display()))
+    })?;
+    // SAFETY: geteuid() has no preconditions and cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    for (i, ancestor) in dir.ancestors().enumerate() {
+        let meta = fs::metadata(ancestor)?;
+        let place = if i == 0 { Place::Socket } else { Place::Above };
+        if let Some(reason) = unsafe_dir(place, meta.uid(), meta.mode(), uid) {
+            return Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                format!(
+                    "{} is unsafe for a socket: {} {reason}",
+                    path.display(),
+                    ancestor.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Where a directory is on the way to a socket.
+#[derive(Clone, Copy, PartialEq)]
+enum Place {
+    /// The socket's own directory.
+    Socket,
+    /// One above it.
+    Above,
+}
+
+/// Why a directory (owned by `owner`, with `mode`) at `place` lets someone
+/// other than user `uid` or root replace the socket, if it does.
+fn unsafe_dir(place: Place, owner: u32, mode: u32, uid: u32) -> Option<&'static str> {
+    let writable_by_others = mode & 0o022 != 0;
+    let sticky = mode & libc::S_ISVTX != 0;
+    match place {
+        Place::Socket if owner != uid => Some("is not owned by the current user"),
+        Place::Socket if writable_by_others => Some("is writable by other users"),
+        Place::Above if owner != uid && owner != 0 => Some("is owned by another user"),
+        Place::Above if writable_by_others && !sticky => {
+            Some("is writable by other users (and not sticky)")
+        }
+        _ => None,
+    }
+}
+
+/// Whether `a` and `b` name the same socket, though spelled differently
+/// (`./a.sock` and `a.sock`, or through a symlinked directory).
+pub fn same_path(a: &Path, b: &Path) -> bool {
+    let resolved = |path: &Path| {
+        let dir = match path.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir,
+            _ => Path::new("."),
+        };
+        Some((fs::canonicalize(dir).ok()?, path.file_name()?.to_owned()))
+    };
+    match (resolved(a), resolved(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => a == b,
+    }
 }
 
 /// Listens on a new socket at `path`, created with mode `0600`: Linux gives
@@ -174,14 +263,23 @@ fn remove_stale(path: &Path) -> io::Result<()> {
         Ok(_) => {}
     }
 
-    match std::os::unix::net::UnixStream::connect(path) {
-        Ok(_) => Err(io::Error::new(
-            ErrorKind::AddrInUse,
-            format!("another agent is already listening on {}", path.display()),
-        )),
+    // Non-blocking, so a listener that doesn't accept (stopped, with a full
+    // backlog) can't hang startup: that's an answer too.
+    let probe = Socket::new(Domain::UNIX, Type::STREAM, None)?;
+    probe.set_nonblocking(true)?;
+    match probe.connect(&SockAddr::unix(path)?) {
+        Ok(()) => Err(in_use(path)),
+        Err(e) if e.kind() == ErrorKind::WouldBlock => Err(in_use(path)),
         Err(e) if e.kind() == ErrorKind::ConnectionRefused => fs::remove_file(path),
         Err(e) => Err(e),
     }
+}
+
+fn in_use(path: &Path) -> io::Error {
+    io::Error::new(
+        ErrorKind::AddrInUse,
+        format!("another agent is already listening on {}", path.display()),
+    )
 }
 
 /// Creates `dir` with mode `0700` if missing, then checks that it is a real
@@ -239,6 +337,8 @@ fn usable_hostname(raw: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::Permissions;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn flag_beats_environment_beats_default() {
@@ -292,6 +392,111 @@ mod tests {
 
     fn mode(path: &Path) -> u32 {
         fs::symlink_metadata(path).unwrap().mode() & 0o777
+    }
+
+    #[test]
+    fn unsafe_directories_are_named() {
+        let me = 1000;
+        let ok = |place, owner, mode| unsafe_dir(place, owner, mode, me).is_none();
+        // The socket's own directory: ours, writable only by us.
+        assert!(ok(Place::Socket, me, 0o700));
+        assert!(ok(Place::Socket, me, 0o755));
+        assert!(!ok(Place::Socket, 0, 0o755));
+        assert!(!ok(Place::Socket, 1001, 0o700));
+        assert!(!ok(Place::Socket, me, 0o770));
+        assert!(!ok(Place::Socket, me, 0o1777));
+        // Those above: ours or root's, writable by others only if sticky.
+        assert!(ok(Place::Above, 0, 0o755));
+        assert!(ok(Place::Above, me, 0o700));
+        assert!(ok(Place::Above, 0, 0o1777)); // /tmp
+        assert!(!ok(Place::Above, 0, 0o777));
+        assert!(!ok(Place::Above, me, 0o775));
+        assert!(!ok(Place::Above, 1001, 0o755));
+    }
+
+    #[test]
+    fn sockets_go_only_where_no_one_else_can_replace_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let ours = dir.path().join("ours");
+        fs::create_dir(&ours).unwrap();
+        fs::set_permissions(&ours, Permissions::from_mode(0o755)).unwrap();
+        check_location(&ours.join("agent.sock")).unwrap();
+
+        // Writable by others: refused, whether the socket's directory or
+        // one above it (without the sticky bit).
+        let shared = dir.path().join("shared");
+        fs::create_dir(&shared).unwrap();
+        fs::set_permissions(&shared, Permissions::from_mode(0o777)).unwrap();
+        let below = shared.join("below");
+        fs::create_dir(&below).unwrap();
+        fs::set_permissions(&below, Permissions::from_mode(0o700)).unwrap();
+        for path in [shared.join("agent.sock"), below.join("agent.sock")] {
+            let err = check_location(&path).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                ErrorKind::PermissionDenied,
+                "{}",
+                path.display()
+            );
+            assert!(err.to_string().contains("shared"), "{err}");
+            // bind refuses before touching anything.
+            assert_eq!(
+                bind(&path).err().unwrap().kind(),
+                ErrorKind::PermissionDenied
+            );
+            assert!(!path.exists());
+        }
+        // With the sticky bit, a private directory inside is fine.
+        fs::set_permissions(&shared, Permissions::from_mode(0o1777)).unwrap();
+        check_location(&below.join("agent.sock")).unwrap();
+        // A missing directory is an error of its own kind.
+        let err = check_location(&ours.join("missing").join("agent.sock")).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn same_socket_however_spelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&sub, &link).unwrap();
+        assert!(same_path(&sub.join("a.sock"), &link.join("a.sock")));
+        assert!(same_path(
+            &sub.join("a.sock"),
+            &sub.join(".").join("a.sock")
+        ));
+        assert!(!same_path(&sub.join("a.sock"), &sub.join("b.sock")));
+        assert!(same_path(Path::new("a.sock"), Path::new("./a.sock")));
+    }
+
+    #[test]
+    fn busy_socket_counts_as_live_without_hanging() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.sock");
+        // Listening, never accepting, with the smallest backlog: fill it.
+        let socket = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+        socket.bind(&SockAddr::unix(&path).unwrap()).unwrap();
+        socket.listen(0).unwrap();
+        let mut fillers = Vec::new();
+        loop {
+            let filler = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+            filler.set_nonblocking(true).unwrap();
+            if filler.connect(&SockAddr::unix(&path).unwrap()).is_err() {
+                break;
+            }
+            fillers.push(filler);
+        }
+        // On a thread, so a blocking connect would show as a timeout here.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let probed = path.clone();
+        std::thread::spawn(move || sender.send(remove_stale(&probed)));
+        let err = receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("didn't hang")
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::AddrInUse);
+        assert!(path.exists());
     }
 
     #[test]
