@@ -157,6 +157,14 @@ The default directory is private (`0700`) and sockets are owner-only
 (`0600`). `serve` refuses to start while another agent answers on either
 chosen socket; separate socket paths allow separate instances.
 
+A socket path you choose must be in a directory only you can change: one
+you own and no one else can write to, under directories owned by you or
+root that no one else can write to unless they are sticky (as `/tmp` is).
+`serve` and `sudo-agent approve` refuse any other place, because another
+user could put their own socket there, and `ssh-add` pointed at it would
+hand over your decrypted key. `ssh-add` can't check this itself, so keep
+`SSH_AUTH_SOCK` for it on a path `serve` accepted.
+
 `serve` runs in the foreground (or [as a service](#running-in-the-background)),
 and approval prompts appear in its terminal, as popups when there's a
 display, and in every running `sudo-agent approve`. Ctrl-C at a prompt
@@ -253,16 +261,18 @@ can't see its desktop:
 ```
 $ sudo-agent approve
 2026-10-21 03:54:09 Waiting for approval requests from /run/user/1000/sudo-agent/control.sock; Ctrl-C quits
-Signature request from pid 188732, uid 1000: ssh server
-  key: laptop (SHA256:…), 3h57m left
+Signature request
   signing: a sudo challenge for user alice
+  key: SHA256:… (laptop), 3h57m left
+  from: pid 188732, uid 1000: ssh server
 Allow? (closes in 2m00s) [y/N] y
 2026-10-21 03:56:15 Allowed
 ```
 
 - It runs on the machine with the agent, as the same user. It talks to
   `control.sock`, found like `serve` finds it (`--control-socket`, or
-  `SUDO_AGENT_CONTROL_SOCKET`).
+  `SUDO_AGENT_CONTROL_SOCKET`), and only to an agent running as that same
+  user.
 - The popup, the agent's own terminal and every running `sudo-agent
   approve` are asked at once. The first answer counts, and the others
   close: an `approve` then prints `Withdrawn: …` with the reason, e.g.
@@ -306,15 +316,18 @@ Host server
 Then `sudo` on the server makes the approval prompt appear on your machine:
 
 ```
-Signature request from pid 402599, uid 1000: ssh server
-  key: laptop (SHA256:…), 12m30s left
+Signature request
   signing: a sudo challenge for user alice
+  key: SHA256:… (laptop), 12m30s left
+  from: pid 402599, uid 1000: ssh server
 Allow? [y/N] y
 Approved (terminal) signature request for a sudo challenge for user alice with key laptop (SHA256:…) from pid 402599, uid 1000: ssh server
 ```
 
 The popup shows the same text, says when it closes by itself
-(`--pinentry-timeout`), and has Allow and Deny buttons.
+(`--pinentry-timeout`), and has Allow and Deny buttons. What is signed and
+the key's fingerprint come first, and a long key comment is cut short in
+prompts, so a popup that has to shorten the text loses only the rest.
 
 The prompt names the local `ssh` process that carries the forwarded
 request, and the user the challenge is for. It can't see which command
@@ -405,6 +418,18 @@ asking for a password.
   popup, and you expect one for every `sudo` you run.
 - Peer details in the prompt come from the requesting process and are
   informational. They are escaped so they can't rewrite the prompt.
+- `agent.sock` reads only what it serves: a request to manage keys is
+  refused (and logged) from its type, without being decoded, and a
+  signature request must be a well-formed `sudo` challenge or SSH login
+  for the key it names, with nothing extra. At most 16 of its requests wait
+  at once, and they queue behind each other, so a server sending many
+  can't hold up a request from `control.sock` for more than the prompt
+  already open. An approval holds only for the key as loaded when it was
+  asked: removing the key, or adding it again, withdraws it.
+- `serve` turns off core dumps and makes itself undumpable (as OpenSSH's
+  agent does), so decrypted keys don't end up in a core file and other
+  processes of yours can't read its memory; the systemd unit sets
+  `LimitCORE=0` too.
 
 ## Roadmap
 
