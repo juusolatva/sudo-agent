@@ -34,6 +34,20 @@ pub trait Prompter: Send + Sync {
     /// lands inside it.
     async fn confirm(&self, message: &str, cancel: &CancellationToken) -> io::Result<bool>;
 
+    /// [`confirm`](Self::confirm), with who answered where the backend can
+    /// say more than its name (which `sudo-agent approve` client), for the
+    /// log. Routing asks this, and logs it once the other backends are
+    /// withdrawn: a backend must not log while asking.
+    async fn confirm_from(
+        &self,
+        message: &str,
+        cancel: &CancellationToken,
+    ) -> io::Result<(bool, Option<String>)> {
+        self.confirm(message, cancel)
+            .await
+            .map(|answer| (answer, None))
+    }
+
     /// Whether this backend can ask anything at all, e.g. there is a terminal
     /// to prompt on. Routing skips backends that can't.
     fn available(&self) -> bool {
@@ -212,7 +226,9 @@ fn wait_readable(
             libc::poll(
                 pollfds.as_mut_ptr(),
                 pollfds.len() as libc::nfds_t,
-                slice.as_millis() as libc::c_int,
+                // Rounded up: under a millisecond left would be a 0 ms poll,
+                // spinning until the deadline.
+                slice.as_micros().div_ceil(1000) as libc::c_int,
             )
         };
         match rc {
@@ -261,10 +277,24 @@ fn ask_yes_no(
     // and a second read could block past the deadline. Anything too long for
     // the buffer isn't a "yes"; its remainder is flushed by the next prompt.
     let mut answer = [0; 64];
-    let n = input.read(&mut answer)?;
+    let n = loop {
+        match input.read(&mut answer) {
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => {
+                let _ = output.write_all(b"\n"); // finish the prompt line
+                return Err(e);
+            }
+            Ok(n) => break n,
+        }
+    };
     if n == 0 {
         output.write_all(b"\n")?; // EOF (Ctrl-D): finish the prompt line, deny
         return Ok(Ok(false));
+    }
+    if !answer[..n].ends_with(b"\n") {
+        // Ended with Ctrl-D rather than Enter, or too long for the buffer:
+        // the terminal didn't echo a newline.
+        output.write_all(b"\n")?;
     }
     let answer = String::from_utf8_lossy(&answer[..n]);
     Ok(Ok(matches!(
@@ -303,6 +333,48 @@ mod tests {
             assert!(result.unwrap().is_err());
             assert_eq!(output, b"Allow? [y/N] \n");
         }
+    }
+
+    /// What the prompt wrote for `input`, after the question.
+    fn after_question(input: &mut impl Read) -> (io::Result<bool>, String) {
+        let mut output = Vec::new();
+        let result = ask_yes_no(input, &mut output, "Allow?", || Ok(Ok(())))
+            .map(|answer| answer.expect("answered in time"));
+        let output = String::from_utf8(output).unwrap();
+        let rest = output.strip_prefix("Allow? [y/N] ").unwrap().to_owned();
+        (result, rest)
+    }
+
+    #[test]
+    fn the_line_ends_however_the_answer_does() {
+        // Enter: the terminal echoed the newline.
+        assert_eq!(after_question(&mut Cursor::new("y\n")).1, "");
+        // Ctrl-D after "y", and nothing at all.
+        let (approved, rest) = after_question(&mut Cursor::new("y"));
+        assert!(approved.unwrap());
+        assert_eq!(rest, "\n");
+        assert_eq!(after_question(&mut Cursor::new("")).1, "\n");
+    }
+
+    #[test]
+    fn interrupted_reads_are_retried_and_errors_end_the_line() {
+        /// Fails its first read with `first`, then reads "y\n".
+        struct Flaky(Option<ErrorKind>);
+        impl Read for Flaky {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if let Some(kind) = self.0.take() {
+                    return Err(kind.into());
+                }
+                buf[..2].copy_from_slice(b"y\n");
+                Ok(2)
+            }
+        }
+        let (approved, rest) = after_question(&mut Flaky(Some(ErrorKind::Interrupted)));
+        assert!(approved.unwrap());
+        assert_eq!(rest, "");
+        let (failed, rest) = after_question(&mut Flaky(Some(ErrorKind::BrokenPipe)));
+        assert!(failed.is_err());
+        assert_eq!(rest, "\n");
     }
 
     #[test]

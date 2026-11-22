@@ -65,7 +65,30 @@ fn spawn_expiry_reaper(store: Arc<Mutex<Vec<KeyEntry>>>) {
     });
 }
 
+/// Keeps decrypted keys out of core dumps (which systemd-coredump would
+/// keep on disk) and out of reach of debuggers running as the same user, as
+/// OpenSSH's agent does: no core file size, and not dumpable (which also
+/// makes `/proc/<pid>/mem` and `ptrace` root-only).
+fn no_core_dumps() -> io::Result<()> {
+    let none = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: plain setrlimit(2) with a valid struct.
+    if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &none) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: plain prctl(2); PR_SET_DUMPABLE takes no pointers.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 async fn run(args: ServeArgs) -> Result<(), AgentError> {
+    // Before any key is in memory.
+    no_core_dumps()
+        .map_err(|e| io::Error::new(e.kind(), format!("can't disable core dumps: {e}")))?;
     let agent_path = socket::choose_path(
         args.agent_socket,
         env::var_os(socket::AGENT_SOCKET_ENV),
@@ -76,7 +99,7 @@ async fn run(args: ServeArgs) -> Result<(), AgentError> {
         env::var_os(socket::CONTROL_SOCKET_ENV),
         || socket::default_path("control"),
     )?;
-    if agent_path == control_path {
+    if socket::same_path(&agent_path, &control_path) {
         let message = format!(
             "the agent and control sockets must differ, both are {}",
             agent_path.display()
@@ -195,8 +218,15 @@ async fn approve(args: ApproveArgs) -> io::Result<()> {
     let path = socket::choose_path(
         args.control_socket,
         env::var_os(socket::CONTROL_SOCKET_ENV),
-        || socket::default_path("control"),
+        || socket::default_client_path("control"),
     )?;
+    // Answers go only to an agent in a place no one else can take over
+    // (approver.rs checks the agent's uid too). A missing directory just
+    // means no agent yet; `attend` says so.
+    match socket::check_location(&path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        result => result?,
+    }
     let terminal = Arc::new(TerminalPrompter::new(approver::NO_TIMEOUT));
     if !terminal.available() {
         let message = "approve asks at a terminal, and there is none";

@@ -284,9 +284,20 @@ impl Prompter for ApproveClients {
         ))
     }
 
-    /// Asks the attached clients. If they all detach meanwhile, it waits
-    /// [`GRACE`] for one to attach again, then gives up.
     async fn confirm(&self, message: &str, cancel: &CancellationToken) -> io::Result<bool> {
+        self.confirm_from(message, cancel)
+            .await
+            .map(|(approved, _)| approved)
+    }
+
+    /// Asks the attached clients. If they all detach meanwhile, it waits
+    /// [`GRACE`] for one to attach again, then gives up. Says which client
+    /// answered.
+    async fn confirm_from(
+        &self,
+        message: &str,
+        cancel: &CancellationToken,
+    ) -> io::Result<(bool, Option<String>)> {
         if cancel.is_cancelled() {
             return Err(io::Error::other("cancelled"));
         }
@@ -307,20 +318,15 @@ impl Prompter for ApproveClients {
             answer = answered => answer.map_err(|_| io::Error::other("answer lost")),
         };
         let reason = match &result {
-            Ok(answer) => {
-                // Only an answer that is used is logged, before the
-                // request's outcome.
-                let verdict = if answer.approved { "Allowed" } else { "Denied" };
-                log!("{verdict} by approve client {}", answer.from);
-                format!("answered by approve client {}", answer.from)
-            }
+            Ok(answer) => format!("answered by approve client {}", answer.from),
             Err(e) if e.kind() == ErrorKind::TimedOut => e.to_string(),
             Err(_) => WITHDRAWN.to_owned(),
         };
         opened.close(&reason);
         result.map(|answer| {
             let _ = answer.decided.send(());
-            answer.approved
+            let from = format!("approve client {}", answer.from);
+            (answer.approved, Some(from))
         })
     }
 

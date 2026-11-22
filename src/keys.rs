@@ -3,22 +3,45 @@
 use std::io::{self, ErrorKind};
 use std::path::Path;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use ssh_key::{Algorithm, PrivateKey};
+use zeroize::Zeroizing;
 
 use crate::prompt::Prompter;
 
 const PASSPHRASE_ATTEMPTS: usize = 3;
+
+/// Longest duration [`parse_duration`] accepts: about 68 years, the most
+/// pinentry's `SETTIMEOUT` (a C `int`) can take, and far from overflowing a
+/// deadline on the [`now`] clock.
+pub const MAX_DURATION: Duration = Duration::from_secs(i32::MAX as u64);
 
 pub struct KeyEntry {
     /// Decrypted at load time; `ssh-key` zeroizes the key material on drop.
     pub private_key: PrivateKey,
     /// Deadline on the [`now`] clock.
     pub expires_at: Duration,
+    /// Unique to this entry: a key removed and loaded again (or replaced) is
+    /// a new entry, so a request approved for the old one can't sign with it.
+    id: u64,
 }
 
 impl KeyEntry {
+    pub fn new(private_key: PrivateKey, expires_at: Duration) -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        Self {
+            private_key,
+            expires_at,
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
     pub fn is_expired(&self, now: Duration) -> bool {
         now >= self.expires_at
     }
@@ -108,10 +131,13 @@ pub fn unsignable(algorithm: &Algorithm) -> Option<&'static str> {
 /// Reads an OpenSSH private key, asking for its passphrase if it is
 /// encrypted. The TTL starts once the key is decrypted.
 pub async fn load(path: &Path, ttl: Duration, prompter: &dyn Prompter) -> io::Result<KeyEntry> {
-    let pem = tokio::fs::read(path)
-        .await
-        .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
-    let key = PrivateKey::from_openssh(pem).map_err(|e| key_error(path, e))?;
+    // An unencrypted key file is the private key itself.
+    let pem = Zeroizing::new(
+        tokio::fs::read(path)
+            .await
+            .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?,
+    );
+    let key = PrivateKey::from_openssh(&*pem).map_err(|e| key_error(path, e))?;
     // The algorithm is in the clear, so this is known before the passphrase.
     if let Some(reason) = unsignable(&key.algorithm()) {
         return Err(io::Error::new(
@@ -125,10 +151,7 @@ pub async fn load(path: &Path, ttl: Duration, prompter: &dyn Prompter) -> io::Re
         log!("warning: {} is not passphrase-protected", path.display());
         key
     };
-    Ok(KeyEntry {
-        private_key,
-        expires_at: now() + ttl,
-    })
+    Ok(KeyEntry::new(private_key, now() + ttl))
 }
 
 async fn decrypt(key: &PrivateKey, path: &Path, prompter: &dyn Prompter) -> io::Result<PrivateKey> {
@@ -166,7 +189,8 @@ fn key_error(path: &Path, error: ssh_key::Error) -> io::Error {
     )
 }
 
-/// Parses a duration like `90s`, `15m` or `8h` (TTLs, timeouts).
+/// Parses a duration like `90s`, `15m` or `8h` (TTLs, timeouts), at most
+/// [`MAX_DURATION`].
 pub fn parse_duration(s: &str) -> Result<Duration, String> {
     let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
     let (number, unit) = s.split_at(split);
@@ -174,21 +198,26 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
         .parse()
         .map_err(|_| format!("invalid duration {s:?}: expected e.g. 90s, 15m or 8h"))?;
     let seconds = match unit {
-        "s" => number,
-        "m" => number.saturating_mul(60),
-        "h" => number.saturating_mul(60 * 60),
+        "s" => Some(number),
+        "m" => number.checked_mul(60),
+        "h" => number.checked_mul(60 * 60),
         _ => return Err(format!("invalid duration unit in {s:?}: use s, m or h")),
     };
-    if seconds == 0 {
-        return Err("duration must be greater than zero".to_owned());
+    match seconds.map(Duration::from_secs) {
+        Some(Duration::ZERO) => Err("duration must be greater than zero".to_owned()),
+        Some(duration) if duration <= MAX_DURATION => Ok(duration),
+        _ => Err(format!(
+            "duration {s:?} is too long (at most {})",
+            format_duration(MAX_DURATION)
+        )),
     }
-    Ok(Duration::from_secs(seconds))
 }
 
 /// Formats a duration the way [`parse_duration`] accepts it, in the largest
 /// exact unit.
 pub fn format_duration(ttl: Duration) -> String {
     match ttl.as_secs() {
+        0 => "0s".to_owned(),
         s if s % 3600 == 0 => format!("{}h", s / 3600),
         s if s % 60 == 0 => format!("{}m", s / 60),
         s => format!("{s}s"),
@@ -397,6 +426,40 @@ mod tests {
     }
 
     #[test]
+    fn huge_durations_are_rejected_not_saturated() {
+        let max = MAX_DURATION.as_secs();
+        assert_eq!(parse_duration(&format!("{max}s")), Ok(MAX_DURATION));
+        for bad in [
+            format!("{}s", max + 1),
+            "999999999999999999h".to_owned(),
+            format!("{}s", u64::MAX),
+            format!("{}m", u64::MAX),
+            "99999999999999999999999s".to_owned(),
+        ] {
+            let e = parse_duration(&bad).unwrap_err();
+            assert!(
+                e.contains("too long") || e.contains("invalid"),
+                "{bad}: {e}"
+            );
+        }
+        // Whatever is accepted can be added to the clock.
+        assert!(now().checked_add(MAX_DURATION).is_some());
+    }
+
+    #[test]
+    fn zero_formats_in_seconds() {
+        assert_eq!(format_duration(Duration::ZERO), "0s");
+        assert_eq!(format_duration(Duration::from_millis(300)), "0s");
+    }
+
+    #[test]
+    fn every_entry_has_its_own_id() {
+        let a = testing::entry("a", TTL);
+        let b = testing::entry("a", TTL);
+        assert_ne!(a.id(), b.id());
+    }
+
+    #[test]
     fn remaining_formatting() {
         let secs = Duration::from_secs;
         assert_eq!(format_remaining(Duration::from_millis(900)), "0s");
@@ -431,10 +494,7 @@ pub mod testing {
     pub fn entry(comment: &str, ttl: Duration) -> KeyEntry {
         let mut private_key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
         private_key.set_comment(comment);
-        KeyEntry {
-            private_key,
-            expires_at: now() + ttl,
-        }
+        KeyEntry::new(private_key, now() + ttl)
     }
 
     /// What `ssh-keygen -t ed25519-sk` writes: a public key and a handle

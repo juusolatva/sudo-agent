@@ -26,6 +26,11 @@ PartOf=graphical-session.target
 Type=exec
 ExecStart=%h/.cargo/bin/sudo-agent serve
 Restart=on-failure
+# The agent turns off its own core dumps too; this keeps decrypted keys out
+# of systemd-coredump even before it starts.
+LimitCORE=0
+# Files it creates (its socket directory) are private.
+UMask=0077
 
 [Install]
 WantedBy=graphical-session.target
